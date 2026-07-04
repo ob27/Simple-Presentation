@@ -1,0 +1,76 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background: #EEF0F5;
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+}
+
+::-webkit-scrollbar {
+  width: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.25);
+}
+
+@keyframes sd-flow-dash {
+  to { stroke-dashoffset: -24; }
+}
+.sd-flow-dash {
+  stroke-dasharray: 8 6;
+  animation: sd-flow-dash 0.6s linear infinite;
+}
+
+/* Shape fx: "float" gently oscillates as if drifting, "glow" pulses like a
+   real analogue light source rather than sitting at a fixed intensity.
+   --sd-rot carries the shape's own rotation so the animation's transform
+   doesn't clobber it; --sd-glow-color carries the shape's stroke color. */
+@keyframes sd-float {
+  0%, 100% { transform: rotate(var(--sd-rot, 0deg)) translateY(0); }
+  50% { transform: rotate(var(--sd-rot, 0deg)) translateY(-3px); }
+}
+.sd-effect-float {
+  animation: sd-float 3.6s ease-in-out infinite;
+}
+
+@keyframes sd-glow-box {
+  0%, 100% { box-shadow: 0 0 7px 1px var(--sd-glow-color, #7C93E8); }
+  50% { box-shadow: 0 0 13px 3px var(--sd-glow-color, #7C93E8); }
+}
+.sd-effect-glow-box {
+  animation: sd-glow-box 3s ease-in-out infinite;
+}
+
+@keyframes sd-glow-filter {
+  0%, 100% { filter: drop-shadow(0 0 4px var(--sd-glow-color, #7C93E8)); }
+  50% { filter: drop-shadow(0 0 8px var(--sd-glow-color, #7C93E8)); }
+}
+.sd-effect-glow-filter {
+  animation: sd-glow-filter 3s ease-in-out infinite;
+}
+
+/* React Flow's own `.react-flow__node { cursor: default; }` always wins for
+   the page frame (it's a node, not the pane) since it's an explicit rule,
+   not an inherited one — so grabbing/dragging the page never showed the same
+   grab/grabbing cursor the background canvas gets from `.react-flow__pane`'s
+   own dynamic classes, even though dragging the page pans the camera exactly
+   the same way. Mirror the pane's state onto the page frame directly. */
+.react-flow:has(.react-flow__pane.draggable) .react-flow__node-pageFrame {
+  cursor: grab;
+}
+.react-flow:has(.react-flow__pane.dragging) .react-flow__node-pageFrame {
+  cursor: grabbing;
+}

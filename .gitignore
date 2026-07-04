@@ -1,0 +1,23 @@
+# Dependencies — never commit these
+node_modules/
+
+# Build output — regenerate with npm run build
+dist/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.log
+
+# Local env files
+.env
+.env.local
+.env.*.local
+
+# Vite cache
+.vite/
+vite.config.ts.timestamp*
+
+# Firebase
+.firebase/
+firebase-debug.log
