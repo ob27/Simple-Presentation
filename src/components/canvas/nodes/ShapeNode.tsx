@@ -1,25 +1,96 @@
 import { memo, useState } from 'react';
 import { NodeResizer, useReactFlow, type NodeProps } from '@xyflow/react';
 import { LinkOutlined } from '@ant-design/icons';
-import type { ShapeNodeData } from '../../../types/shapes';
+import type { ShapeNodeData, PieSegment } from '../../../types/shapes';
 import type { ResolvedStyle } from '../../../utils/shapeStyleResolver';
+import { getAntdIconComponent } from '../../../utils/iconRegistry';
+import { DEFAULT_PIE_SEGMENTS } from '../../../utils/pieDefaults';
+import { BrushStamps } from '../BrushStamps';
 import { useRotateHandle } from './useRotateHandle';
 import { RotateHandle } from './RotateHandle';
 import { ConnectionHandles } from './ConnectionHandles';
+import { EdgeResizeHandles } from './EdgeResizeHandles';
 
 // Kinds whose outline can't be drawn with a plain CSS border — clip-path
 // cuts the box down to the polygon shape, which clips the rectangular border
 // away to invisible slivers at the few points where the polygon touches the
 // original box edge. These render as an SVG <polygon> instead (below), which
 // can carry a real fill AND stroke along its actual visible edge.
-const POLYGON_KINDS = new Set<ShapeNodeData['kind']>(['diamond', 'triangle', 'parallelogram', 'hexagon']);
+const POLYGON_KINDS = new Set<ShapeNodeData['kind']>(['diamond', 'triangle', 'parallelogram', 'hexagon', 'cross', 'star']);
 
 const POLYGON_POINTS: Record<string, string> = {
   diamond: '50,0 100,50 50,100 0,50',
   triangle: '50,0 100,100 0,100',
   parallelogram: '20,0 100,0 80,100 0,100',
   hexagon: '25,0 75,0 100,50 75,100 25,100 0,50',
+  cross: '35,0 65,0 65,35 100,35 100,65 65,65 65,100 35,100 35,65 0,65 0,35 35,35',
+  star: '50,0 61,35 98,35 68,57 79,91 50,70 21,91 32,57 2,35 39,35',
 };
+
+// Kinds whose outline needs a curve, not just straight polygon edges — drawn
+// as a single SVG <path> instead of a <polygon>, same rationale as above.
+const CURVED_KINDS = new Set<ShapeNodeData['kind']>(['cylinder', 'cloud', 'document']);
+
+const CURVED_PATHS: Record<string, string> = {
+  cylinder: 'M0,10 C0,4 100,4 100,10 L100,90 C100,96 0,96 0,90 Z',
+  cloud: 'M22,82 C6,82 6,54 22,50 C22,20 56,16 68,34 C90,20 108,40 96,58 C114,60 110,82 90,82 Z',
+  document: 'M0,0 L100,0 L100,82 L50,100 L0,82 Z',
+};
+
+// A stray ellipse companion path for the cylinder's top rim — drawn as a
+// second, separate <ellipse> so the rim reads as an ellipse crossing in
+// front of the barrel outline, not just a flat top edge.
+const CYLINDER_RIM = { cx: 50, cy: 10, rx: 50, ry: 8 };
+
+const ARCHIMATE_LAYER_COLORS: Record<string, string> = {
+  business: '#FFD97A',
+  application: '#8CD9A8',
+  technology: '#8CC6E8',
+};
+
+function archimateFamily(type?: string): 'actor' | 'behavior' | 'object' | 'infra' {
+  if (type && /Actor|Role/.test(type)) return 'actor';
+  if (type && /Process|Function|Service/.test(type)) return 'behavior';
+  if (type && /Object|Data/.test(type)) return 'object';
+  return 'infra';
+}
+
+// A small badge glyph in the corner distinguishes the 4 coarse ArchiMate
+// element families at a glance without needing a bespoke pictogram for each
+// of the 12 curated element types individually.
+function ArchimateBadge({ family, stroke }: { family: 'actor' | 'behavior' | 'object' | 'infra'; stroke: string }) {
+  const common = { position: 'absolute' as const, top: 4, left: 4, pointerEvents: 'none' as const };
+  if (family === 'actor') {
+    return (
+      <svg width="14" height="14" viewBox="0 0 14 14" style={common}>
+        <circle cx="7" cy="4" r="2.5" fill="none" stroke={stroke} strokeWidth="1.2" />
+        <path d="M2,13 L2,10 C2,8 12,8 12,10 L12,13" fill="none" stroke={stroke} strokeWidth="1.2" />
+      </svg>
+    );
+  }
+  if (family === 'behavior') {
+    return (
+      <svg width="14" height="14" viewBox="0 0 14 14" style={common}>
+        <path d="M1,3 L8,3 L8,0 L13,7 L8,14 L8,11 L1,11 Z" fill={stroke} opacity="0.85" />
+      </svg>
+    );
+  }
+  if (family === 'object') {
+    return (
+      <svg width="14" height="14" viewBox="0 0 14 14" style={common}>
+        <rect x="1" y="1" width="12" height="12" fill="none" stroke={stroke} strokeWidth="1.2" />
+        <line x1="1" y1="5" x2="13" y2="5" stroke={stroke} strokeWidth="1.2" />
+      </svg>
+    );
+  }
+  return (
+    <svg width="14" height="14" viewBox="0 0 14 14" style={common}>
+      <path d="M7,0 L14,4 L7,8 L0,4 Z" fill="none" stroke={stroke} strokeWidth="1.2" />
+      <path d="M0,4 L0,10 L7,14 L7,8 Z" fill="none" stroke={stroke} strokeWidth="1.2" />
+      <path d="M14,4 L14,10 L7,14 L7,8 Z" fill="none" stroke={stroke} strokeWidth="1.2" />
+    </svg>
+  );
+}
 
 function strokeDasharrayFor(strokeStyle: ShapeNodeData['strokeStyle'], strokeWidth: number): string | undefined {
   if (strokeStyle === 'dashed') return `${strokeWidth * 3} ${strokeWidth * 2}`;
@@ -68,11 +139,15 @@ function shapeClipStyle(kind: ShapeNodeData['kind'], cornerRadius: number): Reac
 
 function defaultFill(kind: ShapeNodeData['kind']): string {
   if (kind === 'stickyNote') return '#FFF3B0';
-  if (kind === 'text') return 'transparent';
+  if (kind === 'text' || kind === 'icon' || kind === 'pieChart') return 'transparent';
+  // Containers only ever paint this when their theme is 'filled' (plain/
+  // header/swimlane force background:transparent regardless of fill), so a
+  // normal visible default here doesn't leak into the other three themes.
   return '#E3EAFD';
 }
 
-const JUSTIFY_BY_ALIGN: Record<string, string> = { left: 'flex-start', center: 'center', right: 'flex-end' };
+const JUSTIFY_BY_ALIGN: Record<string, string> = { left: 'flex-start', center: 'center', right: 'flex-end', justify: 'flex-start' };
+const ALIGN_ITEMS_BY_VERTICAL: Record<string, string> = { top: 'flex-start', middle: 'center', bottom: 'flex-end' };
 
 // Extra, non-persisted fields injected by Canvas.tsx at render time so this
 // leaf component can trigger a Firestore write / start a connector drag
@@ -83,6 +158,7 @@ export interface ShapeNodeRuntimeData {
   onStartConnect?: (id: string, e: React.MouseEvent) => void;
   connectMode?: boolean;
   readOnly?: boolean;
+  directSelectMode?: boolean;
 }
 
 function ActorFigure({ stroke, strokeWidth }: { stroke: string; strokeWidth: number }) {
@@ -98,7 +174,92 @@ function ActorFigure({ stroke, strokeWidth }: { stroke: string; strokeWidth: num
   );
 }
 
-function ShapeNodeImpl({ id, data, selected }: NodeProps) {
+// Evenly-spaced divider lines across a container's swimlane theme, plus
+// optional per-lane labels. `pointerEvents: 'none'` throughout — this is a
+// decoration layer painted on top of the container's own box but underneath
+// any child shapes dragged onto it, and must never intercept a click meant
+// for either.
+function SwimlaneOverlay({
+  laneCount, orientation, labels, stroke, accentColor,
+}: { laneCount: number; orientation: 'vertical' | 'horizontal'; labels?: string[]; stroke: string; accentColor?: string }) {
+  const dividerCount = Math.max(0, laneCount - 1);
+  const dividers = Array.from({ length: dividerCount }, (_, i) => ((i + 1) / laneCount) * 100);
+  return (
+    <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', overflow: 'hidden' }}>
+      {dividers.map((pct, i) => (
+        <div
+          key={i}
+          style={orientation === 'vertical'
+            ? { position: 'absolute', top: 0, bottom: 0, left: `${pct}%`, width: 1, background: stroke, opacity: 0.6 }
+            : { position: 'absolute', left: 0, right: 0, top: `${pct}%`, height: 1, background: stroke, opacity: 0.6 }}
+        />
+      ))}
+      {labels && labels.some(Boolean) && Array.from({ length: laneCount }, (_, i) => {
+        const label = labels[i];
+        if (!label) return null;
+        const startPct = (i / laneCount) * 100, sizePct = (1 / laneCount) * 100;
+        return (
+          <div
+            key={i}
+            style={orientation === 'vertical'
+              ? { position: 'absolute', top: 4, left: `${startPct}%`, width: `${sizePct}%`, textAlign: 'center', fontSize: 11, color: accentColor ?? '#555', fontWeight: 600 }
+              : { position: 'absolute', left: 4, top: `${startPct}%`, height: `${sizePct}%`, display: 'flex', alignItems: 'center', fontSize: 11, color: accentColor ?? '#555', fontWeight: 600 }}
+          >
+            {label}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function polarToCartesian(cx: number, cy: number, r: number, angleDeg: number) {
+  const rad = ((angleDeg - 90) * Math.PI) / 180;
+  return { x: cx + r * Math.cos(rad), y: cy + r * Math.sin(rad) };
+}
+
+// Segments default to an evenly-split 3-wedge placeholder so a freshly
+// placed pie chart never renders blank before the user has entered any data.
+function PieChartSvg({ segments, innerRadiusFrac }: { segments?: PieSegment[]; innerRadiusFrac?: number }) {
+  const data = segments && segments.length > 0 ? segments : DEFAULT_PIE_SEGMENTS;
+  const total = data.reduce((sum, s) => sum + Math.max(0, s.value), 0) || 1;
+  const cx = 50, cy = 50, r = 48;
+  const innerR = Math.max(0, Math.min(0.85, innerRadiusFrac ?? 0)) * r;
+  let angle = 0;
+  const slices = data.map(seg => {
+    const sweep = (Math.max(0, seg.value) / total) * 360;
+    const start = angle;
+    angle += sweep;
+    return { seg, start, end: angle };
+  });
+  return (
+    <svg width="100%" height="100%" viewBox="0 0 100 100" style={{ position: 'absolute', inset: 0 }}>
+      {slices.map(({ seg, start, end }, i) => {
+        if (end - start >= 359.99) {
+          return innerR > 0 ? (
+            <g key={seg.id ?? i}>
+              <circle cx={cx} cy={cy} r={r} fill={seg.color} />
+              <circle cx={cx} cy={cy} r={innerR} fill="#fff" />
+            </g>
+          ) : <circle key={seg.id ?? i} cx={cx} cy={cy} r={r} fill={seg.color} />;
+        }
+        const outerStart = polarToCartesian(cx, cy, r, start);
+        const outerEnd = polarToCartesian(cx, cy, r, end);
+        const largeArc = end - start > 180 ? 1 : 0;
+        if (innerR <= 0) {
+          const d = `M${cx},${cy} L${outerStart.x},${outerStart.y} A${r},${r} 0 ${largeArc} 1 ${outerEnd.x},${outerEnd.y} Z`;
+          return <path key={seg.id ?? i} d={d} fill={seg.color} stroke="#fff" strokeWidth={0.5} />;
+        }
+        const innerStart = polarToCartesian(cx, cy, innerR, end);
+        const innerEnd = polarToCartesian(cx, cy, innerR, start);
+        const d = `M${outerStart.x},${outerStart.y} A${r},${r} 0 ${largeArc} 1 ${outerEnd.x},${outerEnd.y} L${innerStart.x},${innerStart.y} A${innerR},${innerR} 0 ${largeArc} 0 ${innerEnd.x},${innerEnd.y} Z`;
+        return <path key={seg.id ?? i} d={d} fill={seg.color} stroke="#fff" strokeWidth={0.5} />;
+      })}
+    </svg>
+  );
+}
+
+function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
   const shapeData = data as unknown as ShapeNodeData & ShapeNodeRuntimeData & {
     __resolvedStyle?: ResolvedStyle; __dimmed?: boolean; __hidden?: boolean;
   };
@@ -106,18 +267,38 @@ function ShapeNodeImpl({ id, data, selected }: NodeProps) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(shapeData.label ?? '');
 
+  const isArchimateElement = shapeData.kind === 'archimateElement';
   const resolved = shapeData.__resolvedStyle;
-  const fill = resolved?.fill ?? shapeData.fillColor ?? defaultFill(shapeData.kind);
+  const fill = resolved?.fill ?? shapeData.fillColor
+    ?? (isArchimateElement ? ARCHIMATE_LAYER_COLORS[shapeData.archimateLayer ?? 'application'] : defaultFill(shapeData.kind));
   const stroke = resolved?.strokeColor ?? shapeData.strokeColor ?? '#7C93E8';
   const strokeWidth = resolved?.strokeWidth ?? shapeData.strokeWidth ?? (shapeData.kind === 'text' ? 0 : 1.5);
   const opacity = shapeData.__hidden ? 0 : shapeData.__dimmed ? 0.2 : (resolved?.opacity ?? 1);
   const rotation = shapeData.rotation ?? 0;
-  const cornerRadius = shapeData.cornerRadius ?? 4;
+  const isSharpCorneredByDefault = ['umlClass', 'umlPackage', 'umlComponent', 'umlNote', 'archimateElement'].includes(shapeData.kind);
+  const cornerRadius = shapeData.cornerRadius ?? (isSharpCorneredByDefault ? 0 : 4);
   const isText = shapeData.kind === 'text';
   const isImage = shapeData.kind === 'image';
+  const isVideo = shapeData.kind === 'video';
   const isHotspot = shapeData.kind === 'hotspot';
   const isActor = shapeData.kind === 'umlActor';
   const isStickyNote = shapeData.kind === 'stickyNote';
+  const isContainer = shapeData.kind === 'container';
+  const isUmlClass = shapeData.kind === 'umlClass';
+  const isUmlPackage = shapeData.kind === 'umlPackage';
+  const isUmlComponent = shapeData.kind === 'umlComponent';
+  const isUmlNote = shapeData.kind === 'umlNote';
+  const isIcon = shapeData.kind === 'icon';
+  const isPieChart = shapeData.kind === 'pieChart';
+  const isBrushStroke = shapeData.kind === 'brushStroke';
+  const isCurved = CURVED_KINDS.has(shapeData.kind);
+  const IconComponent = isIcon && shapeData.iconName ? getAntdIconComponent(shapeData.iconName) : undefined;
+  // Kinds whose visual identity comes entirely from custom content (an icon
+  // glyph, a pie's own slices, a vector outline) rather than the generic
+  // rect fill/border — the plain box underneath must stay invisible so it
+  // doesn't show through as a stray rectangle behind/around that content.
+  const noBoxDecoration = isText || isIcon || isPieChart || POLYGON_KINDS.has(shapeData.kind) || isCurved;
+  const containerTheme = shapeData.containerTheme ?? 'plain';
   const isPolygon = POLYGON_KINDS.has(shapeData.kind);
   const locked = !!shapeData.locked;
   const effect = shapeData.effect ?? (isStickyNote ? 'shadow' : 'none');
@@ -144,6 +325,10 @@ function ShapeNodeImpl({ id, data, selected }: NodeProps) {
     color: shapeData.fontColor ?? '#1a1a2e',
     fontWeight: shapeData.fontWeight ?? 'normal',
     fontFamily: shapeData.fontFamily ?? 'inherit',
+    fontStyle: shapeData.fontStyle ?? 'normal',
+    textDecoration: shapeData.textDecoration ?? 'none',
+    letterSpacing: shapeData.letterSpacing ?? 0,
+    lineHeight: shapeData.lineHeight ?? 1.3,
   };
 
   // While the Arrow tool is active, the whole shape body is a connect
@@ -161,6 +346,7 @@ function ShapeNodeImpl({ id, data, selected }: NodeProps) {
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative' }} onMouseDown={handleMouseDown}>
       <NodeResizer isVisible={selected && !locked} minWidth={24} minHeight={24} lineStyle={{ borderColor: '#1677ff' }} handleStyle={{ width: 8, height: 8, borderRadius: 2 }} />
+      {selected && !locked && <EdgeResizeHandles minWidth={24} minHeight={24} />}
 
       {selected && !locked && <RotateHandle onMouseDown={onRotateStart} />}
 
@@ -191,6 +377,31 @@ function ShapeNodeImpl({ id, data, selected }: NodeProps) {
             <div style={{ width: '100%', height: '100%', background: '#f0f1f5', border: '1px dashed #c4c9d6', borderRadius: 4 }} />
           )}
         </div>
+      ) : isVideo ? (
+        <div style={{ width: '100%', height: '100%', transform: `rotate(${rotation}deg)`, opacity, transition: 'opacity 0.3s' }}>
+          {shapeData.videoUrl ? (
+            <video
+              src={shapeData.videoUrl}
+              poster={shapeData.posterUrl}
+              // Authoring: a static, draggable node (no controls, no pointer
+              // events) — <video controls> otherwise captures mouse events in
+              // a way that fights node dragging. Presenting (readOnly): the
+              // real playback experience, node dragging is irrelevant there.
+              controls={!!shapeData.readOnly && (shapeData.videoControls ?? true)}
+              autoPlay={!!shapeData.readOnly && !!shapeData.videoAutoplay}
+              loop={!!shapeData.videoLoop}
+              muted={shapeData.videoMuted ?? true}
+              playsInline
+              draggable={false}
+              style={{
+                width: '100%', height: '100%', objectFit: 'contain', borderRadius: 4,
+                pointerEvents: shapeData.readOnly ? 'auto' : 'none',
+              }}
+            />
+          ) : (
+            <div style={{ width: '100%', height: '100%', background: '#f0f1f5', border: '1px dashed #c4c9d6', borderRadius: 4 }} />
+          )}
+        </div>
       ) : isActor ? (
         <div
           style={{
@@ -214,6 +425,82 @@ function ShapeNodeImpl({ id, data, selected }: NodeProps) {
             shapeData.label && <span style={{ fontSize: 12, color: '#1a1a2e', userSelect: 'none' }}>{shapeData.label}</span>
           )}
         </div>
+      ) : isBrushStroke ? (
+        <svg
+          width="100%" height="100%" preserveAspectRatio="none"
+          viewBox={`0 0 ${shapeData.brushViewBoxWidth ?? 100} ${shapeData.brushViewBoxHeight ?? 100}`}
+          style={{ display: 'block', opacity, transition: 'opacity 0.3s' }}
+        >
+          <BrushStamps
+            points={shapeData.brushPoints ?? []}
+            style={shapeData.brushStyle ?? 'pencil'}
+            baseWidth={shapeData.brushBaseWidth ?? 6}
+            color={stroke}
+          />
+        </svg>
+      ) : isContainer ? (
+        <div
+          style={{
+            width: '100%', height: '100%', opacity, transition: 'opacity 0.3s, background 0.3s',
+            transform: `rotate(${rotation}deg)`,
+            boxSizing: 'border-box', position: 'relative',
+            borderRadius: cornerRadius,
+            border: `${strokeWidth}px solid ${stroke}`,
+            borderStyle: borderStyleFor(shapeData.strokeStyle),
+            background: containerTheme === 'filled' ? fill : 'transparent',
+            boxShadow: effectShadow,
+          }}
+          onDoubleClick={() => { if (shapeData.readOnly || locked) return; setDraft(shapeData.label ?? ''); setEditing(true); }}
+        >
+          {containerTheme === 'header' ? (
+            <div
+              style={{
+                position: 'absolute', top: 0, left: 0, right: 0, height: 28,
+                background: shapeData.containerAccentColor ?? stroke,
+                borderTopLeftRadius: cornerRadius, borderTopRightRadius: cornerRadius,
+                display: 'flex', alignItems: 'center', padding: '0 8px', boxSizing: 'border-box',
+                pointerEvents: editing ? 'auto' : 'none',
+              }}
+            >
+              {editing ? (
+                <input
+                  autoFocus
+                  value={draft}
+                  onChange={e => setDraft(e.target.value)}
+                  onBlur={commitLabel}
+                  onKeyDown={e => { if (e.key === 'Enter') commitLabel(); if (e.key === 'Escape') setEditing(false); }}
+                  style={{ width: '100%', border: 'none', outline: 'none', background: 'transparent', color: '#fff', fontSize: 12, fontWeight: 600 }}
+                />
+              ) : (
+                <span style={{ color: '#fff', fontSize: 12, fontWeight: 600, userSelect: 'none' }}>{shapeData.label}</span>
+              )}
+            </div>
+          ) : (
+            <div style={{ position: 'absolute', top: -20, left: 2, fontSize: 12, color: '#555', pointerEvents: editing ? 'auto' : 'none' }}>
+              {editing ? (
+                <input
+                  autoFocus
+                  value={draft}
+                  onChange={e => setDraft(e.target.value)}
+                  onBlur={commitLabel}
+                  onKeyDown={e => { if (e.key === 'Enter') commitLabel(); if (e.key === 'Escape') setEditing(false); }}
+                  style={{ border: 'none', outline: 'none', background: 'transparent', color: '#555', fontSize: 12 }}
+                />
+              ) : (
+                shapeData.label && <span style={{ userSelect: 'none' }}>{shapeData.label}</span>
+              )}
+            </div>
+          )}
+          {containerTheme === 'swimlane' && (
+            <SwimlaneOverlay
+              laneCount={shapeData.laneCount ?? 3}
+              orientation={shapeData.laneOrientation ?? 'vertical'}
+              labels={shapeData.laneLabels}
+              stroke={stroke}
+              accentColor={shapeData.containerAccentColor}
+            />
+          )}
+        </div>
       ) : (
         <div
           // Rotation always lives on this outer div (it also carries the
@@ -223,23 +510,25 @@ function ShapeNodeImpl({ id, data, selected }: NodeProps) {
           // --sd-rot so the two don't fight over the same CSS property;
           // "glow" only touches box-shadow, so it composes with a plain
           // static rotate() with no conflict.
-          className={effect === 'float' ? 'sd-effect-float' : effect === 'glow' && !isPolygon ? 'sd-effect-glow-box' : undefined}
+          className={effect === 'float' ? 'sd-effect-float' : effect === 'glow' && !isPolygon && !isCurved ? 'sd-effect-glow-box' : undefined}
           style={{
             width: '100%', height: '100%',
             transform: effect === 'float' ? undefined : `rotate(${rotation}deg)`,
             transition: 'background 0.3s, opacity 0.3s',
             opacity,
-            display: 'flex', alignItems: 'center', justifyContent: isText ? (JUSTIFY_BY_ALIGN[shapeData.textAlign ?? 'center']) : 'center',
-            background: isPolygon ? 'transparent' : fill,
-            border: isText || isPolygon ? 'none' : `${strokeWidth}px solid ${stroke}`,
-            borderStyle: isText || isPolygon ? undefined : borderStyleFor(shapeData.strokeStyle),
-            boxShadow: isPolygon ? undefined : effectShadow,
+            display: 'flex',
+            alignItems: isUmlClass ? 'flex-start' : isText ? (ALIGN_ITEMS_BY_VERTICAL[shapeData.verticalAlign ?? 'middle']) : 'center',
+            justifyContent: isText ? (JUSTIFY_BY_ALIGN[shapeData.textAlign ?? 'center']) : 'center',
+            background: noBoxDecoration ? 'transparent' : fill,
+            border: noBoxDecoration ? 'none' : `${strokeWidth}px solid ${stroke}`,
+            borderStyle: noBoxDecoration ? undefined : borderStyleFor(shapeData.strokeStyle),
+            boxShadow: noBoxDecoration ? undefined : effectShadow,
             boxSizing: 'border-box',
-            padding: 6,
+            padding: isUmlClass ? '8px 6px 6px' : isIcon || isPieChart ? 0 : 6,
             position: 'relative',
-            ...(isPolygon ? {} : shapeClipStyle(shapeData.kind, cornerRadius)),
+            ...(isPolygon || isCurved ? {} : shapeClipStyle(shapeData.kind, cornerRadius)),
             ...(effect === 'float' ? { ['--sd-rot' as string]: `${rotation}deg` } as React.CSSProperties : {}),
-            ...(isPolygon ? {} : effect === 'glow' ? glowCssVars : {}),
+            ...(isPolygon || isCurved ? {} : effect === 'glow' ? glowCssVars : {}),
           }}
           onDoubleClick={() => { if (shapeData.readOnly || locked) return; setDraft(shapeData.label ?? ''); setEditing(true); }}
         >
@@ -260,6 +549,38 @@ function ShapeNodeImpl({ id, data, selected }: NodeProps) {
               />
             </svg>
           )}
+          {isCurved && (
+            <svg
+              className={effect === 'glow' ? 'sd-effect-glow-filter' : undefined}
+              width="100%" height="100%" viewBox="0 0 100 100" preserveAspectRatio="none"
+              style={{
+                position: 'absolute', inset: 0,
+                filter: effectDropShadowFilter(effect),
+                ...(effect === 'glow' ? glowCssVars : {}),
+              }}
+            >
+              <path
+                d={CURVED_PATHS[shapeData.kind]} fill={fill} stroke={stroke} strokeWidth={strokeWidth}
+                strokeDasharray={strokeDasharrayFor(shapeData.strokeStyle, strokeWidth)}
+                vectorEffect="non-scaling-stroke"
+              />
+              {shapeData.kind === 'cylinder' && (
+                <ellipse
+                  cx={CYLINDER_RIM.cx} cy={CYLINDER_RIM.cy} rx={CYLINDER_RIM.rx} ry={CYLINDER_RIM.ry}
+                  fill="none" stroke={stroke} strokeWidth={strokeWidth} vectorEffect="non-scaling-stroke"
+                />
+              )}
+            </svg>
+          )}
+          {isPieChart && (
+            <PieChartSvg segments={shapeData.pieSegments} innerRadiusFrac={shapeData.pieInnerRadius} />
+          )}
+          {isIcon && (
+            IconComponent
+              ? <IconComponent style={{ fontSize: Math.max(12, Math.min(width ?? 64, height ?? 64) * 0.6), color: stroke, pointerEvents: 'none' }} />
+              : <span style={{ fontSize: 11, color: '#b0b6c8', pointerEvents: 'none' }}>Icon</span>
+          )}
+          {isArchimateElement && <ArchimateBadge family={archimateFamily(shapeData.archimateType)} stroke="#3a3a3a" />}
           {isStickyNote && (
             // A folded-corner "peel" — same fill, darkened, clipped to a
             // triangle at the bottom-right — is what actually reads as
@@ -270,6 +591,42 @@ function ShapeNodeImpl({ id, data, selected }: NodeProps) {
               clipPath: 'polygon(100% 0, 0% 100%, 100% 100%)',
               borderBottomRightRadius: cornerRadius,
             }} />
+          )}
+          {isUmlClass && (
+            // Name/attributes/operations compartments — v1 only divides the
+            // box; attribute/operation text entry is a natural fast-follow,
+            // not needed for the shape to already read as "UML class."
+            <>
+              <div style={{ position: 'absolute', left: 0, right: 0, top: '33%', borderTop: `${strokeWidth}px solid ${stroke}`, pointerEvents: 'none' }} />
+              <div style={{ position: 'absolute', left: 0, right: 0, top: '66%', borderTop: `${strokeWidth}px solid ${stroke}`, pointerEvents: 'none' }} />
+            </>
+          )}
+          {isUmlPackage && (
+            // The small tab folder-icon shapes get, sitting flush against
+            // the box's own top edge (border-bottom:none so the two read as
+            // one continuous outline rather than two stacked boxes).
+            <div style={{
+              position: 'absolute', top: -10, left: 0, width: '45%', height: 10,
+              background: fill, border: `${strokeWidth}px solid ${stroke}`, borderBottom: 'none',
+              borderTopLeftRadius: 2, borderTopRightRadius: 2, pointerEvents: 'none',
+            }} />
+          )}
+          {isUmlComponent && (
+            // Two small notch rectangles straddling the left edge — the
+            // standard UML component "plug" glyph.
+            <>
+              <div style={{ position: 'absolute', left: -8, top: '22%', width: 16, height: 10, background: fill, border: `${strokeWidth}px solid ${stroke}`, pointerEvents: 'none' }} />
+              <div style={{ position: 'absolute', left: -8, top: '60%', width: 16, height: 10, background: fill, border: `${strokeWidth}px solid ${stroke}`, pointerEvents: 'none' }} />
+            </>
+          )}
+          {isUmlNote && (
+            // Folded top-right corner, undyed (same fill as the shape,
+            // unlike the sticky note's darkened peel) — the classic
+            // UML note/comment "dog-ear."
+            <svg width="16" height="16" viewBox="0 0 16 16" style={{ position: 'absolute', top: -1, right: -1, pointerEvents: 'none' }}>
+              <path d="M0,0 L16,0 L16,16 Z" fill={fill} stroke={stroke} strokeWidth={strokeWidth} strokeLinejoin="round" />
+              <path d="M0,0 L16,16" stroke={stroke} strokeWidth={strokeWidth} />
+            </svg>
           )}
           {editing ? (
             <input

@@ -6,6 +6,7 @@ import type { ShapeNodeRuntimeData } from './ShapeNode';
 import { useRotateHandle } from './useRotateHandle';
 import { RotateHandle } from './RotateHandle';
 import { ConnectionHandles } from './ConnectionHandles';
+import { EdgeResizeHandles } from './EdgeResizeHandles';
 import { buildPathD, computePathViewBox } from '../../../utils/pathAnchorGeometry';
 
 function PathNodeImpl({ id, data, selected }: NodeProps) {
@@ -33,10 +34,13 @@ function PathNodeImpl({ id, data, selected }: NodeProps) {
     }
   }
 
+  const isDirectSelecting = !!shapeData.directSelectMode;
+
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative' }} onMouseDown={handleMouseDown}>
-      <NodeResizer isVisible={!!selected && !locked} minWidth={8} minHeight={8} lineStyle={{ borderColor: '#1677ff' }} handleStyle={{ width: 8, height: 8, borderRadius: 2 }} />
-      {selected && !locked && <RotateHandle onMouseDown={onRotateStart} />}
+      <NodeResizer isVisible={!!selected && !locked && !isDirectSelecting} minWidth={8} minHeight={8} lineStyle={{ borderColor: '#1677ff' }} handleStyle={{ width: 8, height: 8, borderRadius: 2 }} />
+      {!!selected && !locked && !isDirectSelecting && <EdgeResizeHandles minWidth={8} minHeight={8} />}
+      {selected && !locked && !isDirectSelecting && <RotateHandle onMouseDown={onRotateStart} />}
 
       <svg
         width="100%" height="100%" viewBox={`0 0 ${vbW} ${vbH}`} preserveAspectRatio="none"

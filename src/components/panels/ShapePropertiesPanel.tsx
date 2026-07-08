@@ -1,17 +1,29 @@
 import { useState } from 'react';
-import { Tabs, ColorPicker, InputNumber, Select, Radio, Button, Tooltip } from 'antd';
-import { LinkOutlined, CloseOutlined, DatabaseOutlined, DeleteOutlined, PlusOutlined, FontSizeOutlined } from '@ant-design/icons';
+import { Tabs, ColorPicker, InputNumber, Select, Radio, Button, Tooltip, Switch } from 'antd';
+import {
+  LinkOutlined, CloseOutlined, DatabaseOutlined, DeleteOutlined, PlusOutlined, FontSizeOutlined, VideoCameraOutlined,
+  BoldOutlined, ItalicOutlined, UnderlineOutlined, StrikethroughOutlined, LineHeightOutlined,
+  AlignLeftOutlined, AlignCenterOutlined, AlignRightOutlined, MenuOutlined,
+  VerticalAlignTopOutlined, VerticalAlignMiddleOutlined, VerticalAlignBottomOutlined, HighlightOutlined,
+} from '@ant-design/icons';
 import type { Node, Edge } from '@xyflow/react';
 import type { ShapeNodeData } from '../../types/shapes';
 import type { DiagramPage } from '../../types/document';
 import type { ShapeLink } from '../../types/links';
 import type { DiagramVariable, StyleRule, StyleRuleOp } from '../../types/variables';
+import { DEFAULT_PIE_SEGMENTS } from '../../utils/pieDefaults';
 
 const OP_OPTIONS: { value: StyleRuleOp; label: string }[] = [
   { value: '<', label: '<' }, { value: '<=', label: '≤' },
   { value: '>', label: '>' }, { value: '>=', label: '≥' },
   { value: '==', label: '=' }, { value: 'between', label: 'between' },
 ];
+
+// The diagram's px unit is a 96dpi-equivalent unit (matching how page paper
+// sizes are defined in utils/paperSizes.ts, e.g. A4 = 794x1123 px for
+// 210x297mm) — this is the exact 96px/inch conversion, not derived from a
+// rounded preset, so it doesn't compound rounding error.
+const PX_PER_MM = 96 / 25.4;
 
 interface Props {
   node: Node;
@@ -20,12 +32,23 @@ interface Props {
   variables: DiagramVariable[];
   connectorEdges: Edge[];
   onChange: (patch: Partial<ShapeNodeData>) => void;
+  onResize: (width: number, height: number) => void;
   onDeleteEdge: (id: string) => void;
   onClose: () => void;
 }
 
-export function ShapePropertiesPanel({ node, pages, allShapes, variables, connectorEdges, onChange, onDeleteEdge, onClose }: Props) {
+export function ShapePropertiesPanel({ node, pages, allShapes, variables, connectorEdges, onChange, onResize, onDeleteEdge, onClose }: Props) {
   const data = node.data as ShapeNodeData;
+  const widthMm = Math.round(((node.width ?? 100) / PX_PER_MM) * 10) / 10;
+  const heightMm = Math.round(((node.height ?? 70) / PX_PER_MM) * 10) / 10;
+  function handleWidthMmChange(mm: number | null) {
+    if (mm === null || mm <= 0) return;
+    onResize(mm * PX_PER_MM, node.height ?? 70);
+  }
+  function handleHeightMmChange(mm: number | null) {
+    if (mm === null || mm <= 0) return;
+    onResize(node.width ?? 100, mm * PX_PER_MM);
+  }
   const [linkType, setLinkType] = useState<'page' | 'shape' | 'none'>(
     data.link?.type === 'shape' ? 'shape' : data.link?.type === 'page' ? 'page' : 'none',
   );
@@ -112,6 +135,22 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
             label: 'Style',
             children: (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 14, paddingTop: 8 }}>
+                <div style={{ display: 'flex', gap: 10 }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Width (mm)</div>
+                    <InputNumber
+                      min={1} step={0.1} value={widthMm} style={{ width: '100%' }}
+                      onChange={handleWidthMmChange}
+                    />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Height (mm)</div>
+                    <InputNumber
+                      min={1} step={0.1} value={heightMm} style={{ width: '100%' }}
+                      onChange={handleHeightMmChange}
+                    />
+                  </div>
+                </div>
                 <div>
                   <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Fill</div>
                   <ColorPicker
@@ -135,7 +174,7 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
                     onChange={v => onChange({ strokeWidth: v ?? 0 })}
                   />
                 </div>
-                {(data.kind === 'rectangle' || data.kind === 'stickyNote') && (
+                {(data.kind === 'rectangle' || data.kind === 'stickyNote' || data.kind === 'container') && (
                   <div>
                     <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Corner radius</div>
                     <InputNumber
@@ -173,6 +212,123 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
                     />
                   </div>
                 )}
+                {data.kind === 'container' && (
+                  <div>
+                    <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Theme</div>
+                    <Select
+                      style={{ width: '100%' }}
+                      value={data.containerTheme ?? 'plain'}
+                      options={[
+                        { value: 'plain', label: 'Plain outline' },
+                        { value: 'filled', label: 'Filled panel' },
+                        { value: 'header', label: 'Header band' },
+                        { value: 'swimlane', label: 'Swimlane' },
+                      ]}
+                      onChange={v => onChange({ containerTheme: v })}
+                    />
+                  </div>
+                )}
+                {data.kind === 'container' && (data.containerTheme === 'header' || data.containerTheme === 'swimlane') && (
+                  <div>
+                    <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Accent color</div>
+                    <ColorPicker
+                      value={data.containerAccentColor ?? '#7C93E8'}
+                      onChangeComplete={c => onChange({ containerAccentColor: c.toHexString() })}
+                      showText
+                    />
+                  </div>
+                )}
+                {data.kind === 'container' && data.containerTheme === 'swimlane' && (
+                  <>
+                    <div>
+                      <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Lane count</div>
+                      <InputNumber
+                        min={2} max={8} value={data.laneCount ?? 3} style={{ width: '100%' }}
+                        onChange={v => onChange({ laneCount: v ?? 3 })}
+                      />
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Lane orientation</div>
+                      <Radio.Group
+                        size="small" value={data.laneOrientation ?? 'vertical'}
+                        onChange={e => onChange({ laneOrientation: e.target.value })}
+                      >
+                        <Radio.Button value="vertical">Vertical</Radio.Button>
+                        <Radio.Button value="horizontal">Horizontal</Radio.Button>
+                      </Radio.Group>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Lane labels (comma-separated)</div>
+                      <input
+                        value={(data.laneLabels ?? []).join(', ')}
+                        onChange={e => onChange({ laneLabels: e.target.value.split(',').map(s => s.trim()) })}
+                        style={{ width: '100%', padding: '4px 8px', border: '1px solid #d9d9d9', borderRadius: 4, fontSize: 13, boxSizing: 'border-box' }}
+                      />
+                    </div>
+                  </>
+                )}
+                {data.kind === 'pieChart' && (
+                  <>
+                    <div>
+                      <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Donut hole (0-85%)</div>
+                      <InputNumber
+                        min={0} max={85} value={Math.round((data.pieInnerRadius ?? 0) * 100)} style={{ width: '100%' }}
+                        onChange={v => onChange({ pieInnerRadius: (v ?? 0) / 100 })}
+                      />
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Segments</div>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                        {(data.pieSegments ?? DEFAULT_PIE_SEGMENTS).map((seg, i) => {
+                          const segments = data.pieSegments ?? DEFAULT_PIE_SEGMENTS;
+                          return (
+                            <div key={seg.id} style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                              <ColorPicker
+                                value={seg.color}
+                                onChangeComplete={c => {
+                                  const next = [...segments];
+                                  next[i] = { ...next[i], color: c.toHexString() };
+                                  onChange({ pieSegments: next });
+                                }}
+                              />
+                              <input
+                                value={seg.label}
+                                placeholder="Label"
+                                onChange={e => {
+                                  const next = [...segments];
+                                  next[i] = { ...next[i], label: e.target.value };
+                                  onChange({ pieSegments: next });
+                                }}
+                                style={{ flex: 1, minWidth: 0, padding: '4px 8px', border: '1px solid #d9d9d9', borderRadius: 4, fontSize: 12, boxSizing: 'border-box' }}
+                              />
+                              <InputNumber
+                                min={0} value={seg.value} style={{ width: 64 }}
+                                onChange={v => {
+                                  const next = [...segments];
+                                  next[i] = { ...next[i], value: v ?? 0 };
+                                  onChange({ pieSegments: next });
+                                }}
+                              />
+                              <Button
+                                size="small" icon={<DeleteOutlined />} danger
+                                onClick={() => onChange({ pieSegments: segments.filter((_, idx) => idx !== i) })}
+                              />
+                            </div>
+                          );
+                        })}
+                        <Button
+                          size="small" icon={<PlusOutlined />}
+                          onClick={() => {
+                            const segments = data.pieSegments ?? DEFAULT_PIE_SEGMENTS;
+                            onChange({ pieSegments: [...segments, { id: crypto.randomUUID(), label: 'New', value: 1, color: '#8CA3E8' }] });
+                          }}
+                        >
+                          Add segment
+                        </Button>
+                      </div>
+                    </div>
+                  </>
+                )}
               </div>
             ),
           },
@@ -180,51 +336,156 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
             key: 'text',
             label: <span><FontSizeOutlined /> Text</span>,
             children: (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 16, paddingTop: 8 }}>
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: '#999', letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 8 }}>
+                    Character
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    <Select
+                      style={{ width: '100%' }}
+                      value={data.fontFamily ?? 'inherit'}
+                      options={[
+                        { value: 'inherit', label: 'Default' },
+                        { value: "'Arial', sans-serif", label: 'Sans-serif' },
+                        { value: "'Georgia', serif", label: 'Serif' },
+                        { value: "'Courier New', monospace", label: 'Monospace' },
+                        { value: "'Segoe Print', 'Bradley Hand', cursive", label: 'Handwriting' },
+                      ]}
+                      onChange={v => onChange({ fontFamily: v })}
+                    />
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <Tooltip title="Font size">
+                        <InputNumber
+                          min={8} max={96} value={data.fontSize ?? 13} style={{ width: '100%' }}
+                          prefix={<FontSizeOutlined style={{ color: '#bbb' }} />}
+                          onChange={v => onChange({ fontSize: v ?? 13 })}
+                        />
+                      </Tooltip>
+                      <Tooltip title="Line height">
+                        <InputNumber
+                          min={0.8} max={3} step={0.1} value={data.lineHeight ?? 1.3} style={{ width: '100%' }}
+                          prefix={<LineHeightOutlined style={{ color: '#bbb' }} />}
+                          onChange={v => onChange({ lineHeight: v ?? 1.3 })}
+                        />
+                      </Tooltip>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Tracking</div>
+                      <InputNumber
+                        min={-5} max={40} value={data.letterSpacing ?? 0} style={{ width: '100%' }}
+                        onChange={v => onChange({ letterSpacing: v ?? 0 })}
+                      />
+                    </div>
+                    <div style={{ display: 'flex', gap: 4 }}>
+                      <Button
+                        size="small" type={data.fontWeight === 'bold' ? 'primary' : 'default'} icon={<BoldOutlined />}
+                        onClick={() => onChange({ fontWeight: data.fontWeight === 'bold' ? 'normal' : 'bold' })}
+                      />
+                      <Button
+                        size="small" type={data.fontStyle === 'italic' ? 'primary' : 'default'} icon={<ItalicOutlined />}
+                        onClick={() => onChange({ fontStyle: data.fontStyle === 'italic' ? 'normal' : 'italic' })}
+                      />
+                      <Button
+                        size="small" type={data.textDecoration === 'underline' ? 'primary' : 'default'} icon={<UnderlineOutlined />}
+                        onClick={() => onChange({ textDecoration: data.textDecoration === 'underline' ? 'none' : 'underline' })}
+                      />
+                      <Button
+                        size="small" type={data.textDecoration === 'line-through' ? 'primary' : 'default'} icon={<StrikethroughOutlined />}
+                        onClick={() => onChange({ textDecoration: data.textDecoration === 'line-through' ? 'none' : 'line-through' })}
+                      />
+                    </div>
+                    <ColorPicker
+                      value={data.fontColor ?? '#1a1a2e'}
+                      onChangeComplete={c => onChange({ fontColor: c.toHexString() })}
+                      showText
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: '#999', letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 8 }}>
+                    Paragraph
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    <div>
+                      <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Alignment</div>
+                      <Radio.Group size="small" value={data.textAlign ?? 'center'} onChange={e => onChange({ textAlign: e.target.value })}>
+                        <Radio.Button value="left"><AlignLeftOutlined /></Radio.Button>
+                        <Radio.Button value="center"><AlignCenterOutlined /></Radio.Button>
+                        <Radio.Button value="right"><AlignRightOutlined /></Radio.Button>
+                        <Radio.Button value="justify"><MenuOutlined /></Radio.Button>
+                      </Radio.Group>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Vertical alignment</div>
+                      <Radio.Group size="small" value={data.verticalAlign ?? 'middle'} onChange={e => onChange({ verticalAlign: e.target.value })}>
+                        <Radio.Button value="top"><VerticalAlignTopOutlined /></Radio.Button>
+                        <Radio.Button value="middle"><VerticalAlignMiddleOutlined /></Radio.Button>
+                        <Radio.Button value="bottom"><VerticalAlignBottomOutlined /></Radio.Button>
+                      </Radio.Group>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ),
+          }] : []),
+          ...(data.kind === 'video' ? [{
+            key: 'video',
+            label: <span><VideoCameraOutlined /> Video</span>,
+            children: (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 14, paddingTop: 8 }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <span style={{ fontSize: 12, color: '#888' }}>Autoplay (in presentation)</span>
+                  <Switch size="small" checked={data.videoAutoplay ?? false} onChange={v => onChange({ videoAutoplay: v })} />
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <span style={{ fontSize: 12, color: '#888' }}>Loop</span>
+                  <Switch size="small" checked={data.videoLoop ?? false} onChange={v => onChange({ videoLoop: v })} />
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <span style={{ fontSize: 12, color: '#888' }}>Muted</span>
+                  <Switch size="small" checked={data.videoMuted ?? true} onChange={v => onChange({ videoMuted: v })} />
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <span style={{ fontSize: 12, color: '#888' }}>Show controls (in presentation)</span>
+                  <Switch size="small" checked={data.videoControls ?? true} onChange={v => onChange({ videoControls: v })} />
+                </div>
+              </div>
+            ),
+          }] : []),
+          ...(data.kind === 'brushStroke' ? [{
+            key: 'brush',
+            label: <span><HighlightOutlined /> Brush</span>,
+            children: (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 14, paddingTop: 8 }}>
                 <div>
-                  <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Font size</div>
-                  <InputNumber
-                    min={8} max={96} value={data.fontSize ?? 13} style={{ width: '100%' }}
-                    onChange={v => onChange({ fontSize: v ?? 13 })}
-                  />
-                </div>
-                <div>
-                  <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Font color</div>
-                  <ColorPicker
-                    value={data.fontColor ?? '#1a1a2e'}
-                    onChangeComplete={c => onChange({ fontColor: c.toHexString() })}
-                    showText
-                  />
-                </div>
-                <div>
-                  <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Font family</div>
+                  <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Style</div>
                   <Select
                     style={{ width: '100%' }}
-                    value={data.fontFamily ?? 'inherit'}
+                    value={data.brushStyle ?? 'pencil'}
                     options={[
-                      { value: 'inherit', label: 'Default' },
-                      { value: "'Arial', sans-serif", label: 'Sans-serif' },
-                      { value: "'Georgia', serif", label: 'Serif' },
-                      { value: "'Courier New', monospace", label: 'Monospace' },
-                      { value: "'Segoe Print', 'Bradley Hand', cursive", label: 'Handwriting' },
+                      { value: 'pencil', label: 'Pencil' },
+                      { value: 'marker', label: 'Marker' },
+                      { value: 'calligraphy', label: 'Calligraphy' },
                     ]}
-                    onChange={v => onChange({ fontFamily: v })}
+                    onChange={v => onChange({ brushStyle: v })}
                   />
                 </div>
                 <div>
-                  <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Weight</div>
-                  <Radio.Group size="small" value={data.fontWeight ?? 'normal'} onChange={e => onChange({ fontWeight: e.target.value })}>
-                    <Radio.Button value="normal">Normal</Radio.Button>
-                    <Radio.Button value="bold">Bold</Radio.Button>
-                  </Radio.Group>
+                  <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Width</div>
+                  <InputNumber
+                    min={1} max={40} value={data.brushBaseWidth ?? 6} style={{ width: '100%' }}
+                    onChange={v => onChange({ brushBaseWidth: v ?? 6 })}
+                  />
                 </div>
                 <div>
-                  <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Align</div>
-                  <Radio.Group size="small" value={data.textAlign ?? 'center'} onChange={e => onChange({ textAlign: e.target.value })}>
-                    <Radio.Button value="left">Left</Radio.Button>
-                    <Radio.Button value="center">Center</Radio.Button>
-                    <Radio.Button value="right">Right</Radio.Button>
-                  </Radio.Group>
+                  <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Color</div>
+                  <ColorPicker
+                    value={data.strokeColor ?? '#1a1a2e'}
+                    onChangeComplete={c => onChange({ strokeColor: c.toHexString() })}
+                    showText
+                  />
                 </div>
               </div>
             ),

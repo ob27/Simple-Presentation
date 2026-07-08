@@ -7,12 +7,12 @@ import {
 import { Button, Tooltip, Select, Popover, Switch, ColorPicker } from 'antd';
 import {
   DeleteOutlined, VerticalAlignTopOutlined, VerticalAlignBottomOutlined,
-  GroupOutlined, UngroupOutlined,
+  GroupOutlined, UngroupOutlined, BorderOuterOutlined,
   CloseCircleOutlined, LeftOutlined, RightOutlined,
   FullscreenOutlined, FullscreenExitOutlined, SettingOutlined, BorderOutlined,
 } from '@ant-design/icons';
 import type { DiagramPage, PresentationSettings } from '../../types/document';
-import type { ShapeKind, DiagramNode, ShapeNodeData, PathAnchor } from '../../types/shapes';
+import type { ShapeKind, DiagramNode, ShapeNodeData, PathAnchor, BrushPoint } from '../../types/shapes';
 import type { DiagramEdge, SmartEdgeData } from '../../types/edges';
 import { getPageDimensions } from '../../utils/paperSizes';
 import { PAGE_GAP, PAGE_X } from '../../constants';
@@ -20,6 +20,8 @@ import { PageFrameNode } from './nodes/PageFrameNode';
 import { ShapeNode } from './nodes/ShapeNode';
 import { GroupNode } from './nodes/GroupNode';
 import { PathNode } from './nodes/PathNode';
+import { CommentPinNode } from './nodes/CommentPinNode';
+import { CommentThreadPanel } from '../panels/CommentThreadPanel';
 import { SmartEdge } from './edges/SmartEdge';
 import { PageNavigatorRail } from './PageNavigatorRail';
 import { Toolbar } from './Toolbar';
@@ -28,9 +30,13 @@ import { ShapeStampCursor } from './ShapeStampCursor';
 import { useActivePageId } from './useActivePageId';
 import { AlignmentGuidesOverlay } from './AlignmentGuidesOverlay';
 import { PenDrawingOverlay } from './PenDrawingOverlay';
+import { BrushDrawingOverlay } from './BrushDrawingOverlay';
 import { ConnectorDrawingOverlay } from './ConnectorDrawingOverlay';
 import { AnchorEditOverlay, type AnchorPart } from './AnchorEditOverlay';
-import { computePathViewBox, absoluteToAnchorLocal, anchorToAbsolute, normalizePathAnchors } from '../../utils/pathAnchorGeometry';
+import {
+  computePathViewBox, absoluteToAnchorLocal, anchorToAbsolute, normalizePathAnchors,
+  subdivideBezierAt, synthesizeSmoothHandles,
+} from '../../utils/pathAnchorGeometry';
 import { computeAlignmentGuides, type GuideLines } from './alignmentGuides';
 import { ShapePropertiesPanel } from '../panels/ShapePropertiesPanel';
 import { DataPanel } from '../panels/DataPanel';
@@ -43,12 +49,14 @@ import { usePresence } from '../../hooks/usePresence';
 import { resolveStyle } from '../../utils/shapeStyleResolver';
 import { computeDownstream } from '../../utils/graphTraversal';
 import { computePresentationLayout, DEFAULT_PRESENTATION_SETTINGS } from '../../utils/presentationFrame';
-import { uploadDiagramImage, getImageDimensions } from '../../utils/imageUpload';
+import { uploadDiagramImage, uploadDiagramMedia, getImageDimensions, getVideoDimensions } from '../../utils/imageUpload';
 import type { DiagramVariable } from '../../types/variables';
 import {
   subscribeShapes, subscribeConnectors, saveShape, deleteShape, saveConnector, deleteConnector,
   subscribeVariables, upsertVariable, deleteVariable, updatePage,
+  subscribeComments, saveComment, deleteComment,
 } from '../../store';
+import type { DiagramComment } from '../../types/comments';
 import { useAuth } from '../../AuthContext';
 
 const nodeTypes: NodeTypes = {
@@ -56,12 +64,23 @@ const nodeTypes: NodeTypes = {
   shape: ShapeNode,
   group: GroupNode,
   path: PathNode,
+  comment: CommentPinNode,
 };
 const edgeTypes: EdgeTypes = {
   smart: SmartEdge,
 };
 
 const GROUP_PADDING = 24;
+
+// Shared by every global keydown effect (WASD-pan, direct-select shortcut,
+// anchor nudge, clipboard) so none of them fire while the user is typing in
+// a shape label, a page-rename field, or any other text input.
+function isTypingTarget(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el) return false;
+  const tag = el.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+}
 
 interface Props {
   diagramId: string;
@@ -81,12 +100,20 @@ export function Canvas({
   const { screenToFlowPosition, setCenter, getZoom, getInternalNode, fitBounds, getViewport, setViewport, updateNodeData } = useReactFlow();
   const isPresent = mode === 'present';
   const { peers, updateCursor, updateDragPreview } = usePresence(diagramId, user);
+  // Measures the actual on-screen container size so fitToPage can reserve
+  // space for the properties drawer (an absolutely-positioned overlay that
+  // doesn't shrink this element's own measured size) — fitBounds's own
+  // padding option is a single percentage with no way to reserve an
+  // asymmetric region for it.
+  const wrapperRef = useRef<HTMLDivElement>(null);
 
   const [shapeNodes, setShapeNodes] = useState<Node[]>([]);
   const [connectorEdges, setConnectorEdges] = useState<Edge[]>([]);
+  const [comments, setComments] = useState<DiagramComment[]>([]);
 
   const shapesSlices = useRef<Map<string, Map<string, DiagramNode>>>(new Map());
   const connectorsSlices = useRef<Map<string, Map<string, DiagramEdge>>>(new Map());
+  const commentsSlices = useRef<Map<string, Map<string, DiagramComment>>>(new Map());
 
   // "Latest" refs — functions embedded into node.data (onCommit, onNavigateLink)
   // get baked in inside a Firestore onSnapshot callback whose closure is pinned
@@ -123,11 +150,34 @@ export function Canvas({
   // replacing the old "whole document" fitView and "keep whatever zoom was
   // already active" goToPage. fitBounds already contains RF's own
   // fit-and-clamp-to-min/maxZoom math, so there's no need to hand-roll it.
-  function fitToPage(pageId: string, opts: { duration: number }) {
+  function fitToPage(pageId: string, opts: { duration: number }, reservedRightPx = 0) {
     const { pageOrigins: origins, pageDimensions: dims } = pageGeomRef.current;
     const origin = origins.get(pageId) ?? 0;
     const dims_ = dims.get(pageId) ?? { width: 794, height: 1123 };
-    fitBounds({ x: PAGE_X, y: origin, width: dims_.width, height: dims_.height }, { padding: 0.1, duration: opts.duration });
+    const rect = { x: PAGE_X, y: origin, width: dims_.width, height: dims_.height };
+    const container = wrapperRef.current?.getBoundingClientRect();
+    if (!container || reservedRightPx <= 0) {
+      fitBounds(rect, { padding: 0.1, duration: opts.duration });
+      return;
+    }
+    // A properties drawer is currently covering the right side of the
+    // container — fit against the narrowed available width/height instead
+    // of the full container, and center within that available region (not
+    // the full container), so the page lands fully visible beside the
+    // drawer rather than partly hidden underneath it.
+    const availableWidth = Math.max(100, container.width - reservedRightPx);
+    const availableHeight = container.height;
+    const PADDING_FRACTION = 0.1;
+    const zoom = Math.min(
+      (availableWidth * (1 - PADDING_FRACTION)) / rect.width,
+      (availableHeight * (1 - PADDING_FRACTION)) / rect.height,
+    );
+    const rectCenterX = rect.x + rect.width / 2;
+    const rectCenterY = rect.y + rect.height / 2;
+    setViewport(
+      { x: availableWidth / 2 - rectCenterX * zoom, y: availableHeight / 2 - rectCenterY * zoom, zoom },
+      { duration: opts.duration },
+    );
   }
 
   // Gated on BOTH pages having loaded AND React Flow's own onInit — calling
@@ -191,9 +241,14 @@ export function Canvas({
       connectorsSlices.current.set(page.id, new Map(edges.map(e => [e.id, e])));
       rebuildConnectors();
     }));
+    const commentUnsubs = pages.map(page => subscribeComments(diagramId, page.id, list => {
+      commentsSlices.current.set(page.id, new Map(list.map(c => [c.id, c])));
+      rebuildComments();
+    }));
     return () => {
       shapeUnsubs.forEach(u => u());
       connectorUnsubs.forEach(u => u());
+      commentUnsubs.forEach(u => u());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [diagramId, pages.map(p => p.id).join(',')]);
@@ -304,6 +359,14 @@ export function Canvas({
     });
   }
 
+  function rebuildComments() {
+    const merged: DiagramComment[] = [];
+    for (const slice of commentsSlices.current.values()) {
+      for (const c of slice.values()) merged.push(c);
+    }
+    setComments(merged);
+  }
+
   const onEdgeCommit = useCallback((id: string, patch: Partial<SmartEdgeData>) => {
     for (const slice of connectorsSlices.current.values()) {
       const existing = slice.get(id);
@@ -331,10 +394,35 @@ export function Canvas({
     }
   }, [diagramId]);
 
+  // Precise numeric resize (e.g. the properties panel's mm-based width/
+  // height inputs) — width/height live on the node itself, not `.data`, so
+  // this can't go through onCommit above.
+  const handleResizeShape = useCallback((id: string, width: number, height: number) => {
+    for (const slice of shapesSlices.current.values()) {
+      const existing = slice.get(id);
+      if (existing) {
+        const updated: DiagramNode = { ...existing, width, height };
+        slice.set(id, updated);
+        saveShape(diagramId, existing.data.pageId, updated);
+        rebuildShapes();
+        return;
+      }
+    }
+  }, [diagramId]);
+
   const [penMode, setPenMode] = useState(false);
   const [draftAnchors, setDraftAnchors] = useState<PathAnchor[]>([]);
   const [penDrag, setPenDrag] = useState<{ start: { x: number; y: number }; current: { x: number; y: number } } | null>(null);
   const lastPenClickRef = useRef<{ time: number; x: number; y: number } | null>(null);
+
+  // Freehand brush tool. Style/color are chosen from the properties panel
+  // AFTER a stroke is placed (like every other shape) — while drawing, only
+  // raw geometry (points + simulated/real pressure) is captured, since the
+  // stamp-rendering function that turns points into a look is shared and
+  // style-agnostic, so nothing about the captured data depends on which
+  // brush look gets picked.
+  const [brushMode, setBrushMode] = useState(false);
+  const [brushDraft, setBrushDraft] = useState<BrushPoint[] | null>(null);
 
   // Click-to-place: picking a shape (from the gallery or the quick Hotspot
   // button) no longer creates it immediately — it arms this, and the next
@@ -343,11 +431,25 @@ export function Canvas({
   // fresh gallery pick to place another.
   const [shapeGalleryOpen, setShapeGalleryOpen] = useState(false);
   const [placingShapeKind, setPlacingShapeKind] = useState<ShapeKind | null>(null);
-  const [pendingImagePlacement, setPendingImagePlacement] = useState<{ imageUrl: string; width: number; height: number } | null>(null);
+  const [pendingMediaPlacement, setPendingMediaPlacement] = useState<{ kind: 'image' | 'video'; url: string; width: number; height: number } | null>(null);
+  // Carries per-placement data the gallery can't express via `kind` alone —
+  // e.g. which icon glyph or ArchiMate element type was picked.
+  const [pendingShapeExtraData, setPendingShapeExtraData] = useState<Partial<ShapeNodeData> | null>(null);
   // Raw screen coordinates (not flow-space) for the ShapeStampCursor overlay —
   // only tracked while a shape is armed, so normal mousemoves outside
   // placing mode don't pay for an extra re-render.
   const [stampScreenPos, setStampScreenPos] = useState<{ x: number; y: number } | null>(null);
+
+  // Comment placement + thread panel state. A comment pin is only ever
+  // persisted once its first message is actually posted — clicking to place
+  // one just opens the panel in "compose" mode against a not-yet-saved
+  // {pageId,x,y}, so closing the panel without typing anything leaves no
+  // orphan pin behind.
+  const [placingComment, setPlacingComment] = useState(false);
+  const [draftComment, setDraftComment] = useState<{ pageId: string; x: number; y: number } | null>(null);
+  const [activeCommentId, setActiveCommentId] = useState<string | null>(null);
+  // Screen-space rect for the drag-select marquee overlay, while active.
+  const [marqueeRect, setMarqueeRect] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
 
   // Arrow/connector tool — click-drag from anywhere on a shape's body to
   // another shape, rather than needing to grab the tiny edge handle. Stays
@@ -365,7 +467,17 @@ export function Canvas({
     return selectedPaths.length === 1 ? selectedPaths[0].id : null;
   })();
 
-  const toolActive = penMode || connectMode || !!placingShapeKind;
+  // Direct Selection — a real, explicit tool (Illustrator's "A" key) layered
+  // on top of the always-visible anchor overlay above. Selecting a path
+  // still passively shows its points (editingPathId, unchanged); this mode
+  // gates whether those points are actually INTERACTIVE (draggable,
+  // insertable, deletable, nudgeable) vs. the shape's body/NodeResizer being
+  // the thing that responds to clicks. Without this split, a click could
+  // ambiguously mean "move the whole shape" or "move this one point."
+  const [directSelectMode, setDirectSelectMode] = useState(false);
+  const [activeAnchorIndex, setActiveAnchorIndex] = useState<number | null>(null);
+
+  const toolActive = penMode || connectMode || directSelectMode || !!placingShapeKind;
 
   function clearOtherTools() {
     // Finalize (not discard) an in-progress pen path when switching tools —
@@ -376,9 +488,24 @@ export function Canvas({
     }
     setPenMode(false); lastPenClickRef.current = null;
     setConnectMode(false); setConnectDrag(null);
-    setPlacingShapeKind(null); setPendingImagePlacement(null);
+    setPlacingShapeKind(null); setPendingMediaPlacement(null);
     setHighlightMode(false); setHighlighted(null);
+    setDirectSelectMode(false); setActiveAnchorIndex(null);
+    setPlacingComment(false);
+    setBrushMode(false);
   }
+
+  function handleToggleDirectSelect() {
+    const wasOn = directSelectMode;
+    clearOtherTools();
+    if (!wasOn) setDirectSelectMode(true);
+  }
+
+  // Reset anchor focus whenever the edited path changes (including becoming
+  // null) so a stale index never survives onto a different path's anchors.
+  useEffect(() => {
+    setActiveAnchorIndex(null);
+  }, [editingPathId]);
 
   const [highlightMode, setHighlightMode] = useState(false);
   const [highlighted, setHighlighted] = useState<{ nodeIds: Set<string>; edgeIds: Set<string> } | null>(null);
@@ -490,7 +617,9 @@ export function Canvas({
       // connectMode/onStartConnect are always injected (unlike the other
       // conditional `extra` fields below) so every shape's ConnectionHandles
       // picks up live tool state and can report a connect-drag start.
-      const extra: Record<string, unknown> = { connectMode, onStartConnect: handleStartConnect };
+      // directSelectMode is injected the same way so PathNode can hide its
+      // NodeResizer while anchor points are the interactive thing instead.
+      const extra: Record<string, unknown> = { connectMode, onStartConnect: handleStartConnect, directSelectMode };
       if (shapeData.dataBinding) {
         const resolved = resolveStyle(shapeData.dataBinding, variables);
         if (resolved) extra.__resolvedStyle = resolved;
@@ -513,8 +642,38 @@ export function Canvas({
         connectable: !locked,
       };
     });
-    return [...frameNodes, ...styled];
-  }, [frameNodes, shapeNodes, variables, highlighted, animationPanelOpen, revealStep, isPresent, presentPage, presentThresholdOrder, connectMode, toolActive]);
+    // Comment pins are an authoring/collaboration affordance, not part of
+    // the diagram's actual content — hidden while presenting, same as the
+    // page navigator rail and other editor-only chrome.
+    const commentNodes: Node[] = isPresent ? [] : comments.map(c => ({
+      id: c.id,
+      type: 'comment',
+      position: { x: c.x - 13, y: c.y - 13 },
+      width: 26,
+      height: 26,
+      draggable: false,
+      selectable: false,
+      zIndex: 20,
+      data: { resolved: c.resolved, replyCount: c.replies.length, active: c.id === activeCommentId, onOpen: (id: string) => { setDraftComment(null); setActiveCommentId(id); } },
+    }));
+    // A not-yet-saved draft still gets a visible marker at its drop point —
+    // otherwise clicking with the comment tool would open the compose panel
+    // with no on-canvas indication of where the pin is actually landing.
+    if (!isPresent && draftComment) {
+      commentNodes.push({
+        id: '__draft-comment__',
+        type: 'comment',
+        position: { x: draftComment.x - 13, y: draftComment.y - 13 },
+        width: 26,
+        height: 26,
+        draggable: false,
+        selectable: false,
+        zIndex: 20,
+        data: { resolved: false, replyCount: 0, active: true, onOpen: () => {} },
+      });
+    }
+    return [...frameNodes, ...styled, ...commentNodes];
+  }, [frameNodes, shapeNodes, variables, highlighted, animationPanelOpen, revealStep, isPresent, presentPage, presentThresholdOrder, connectMode, toolActive, directSelectMode, comments, activeCommentId, draftComment]);
 
   const edges = useMemo(() => connectorEdges.map(e => {
     const edgeData = e.data as SmartEdgeData | undefined;
@@ -640,6 +799,15 @@ export function Canvas({
   // already owns Space/Arrow for step navigation above). viewport.x/y are
   // already screen-space, so a constant pixel delta pans a constant on-screen
   // distance regardless of zoom — no zoom-based conversion needed here.
+  //
+  // The Direct Selection shortcut ('A', no modifiers) is folded into this
+  // SAME handler rather than a second window listener — WASD-pan's own KeyA
+  // already means "pan left," so a separate listener would double-fire on
+  // every 'A' press (both listeners see the same native event; only
+  // stopImmediatePropagation prevents a later-registered listener from
+  // running, and that's a fragile ordering dependency to rely on). Deciding
+  // both in one place avoids the conflict outright: 'A' toggles Direct
+  // Selection only when there's a path to edit, otherwise it still pans.
   useEffect(() => {
     if (isPresent) return;
     const PAN_STEP_SCREEN_PX = 60;
@@ -647,16 +815,15 @@ export function Canvas({
       ArrowUp: { x: 0, y: -1 }, ArrowDown: { x: 0, y: 1 }, ArrowLeft: { x: -1, y: 0 }, ArrowRight: { x: 1, y: 0 },
       KeyW: { x: 0, y: -1 }, KeyS: { x: 0, y: 1 }, KeyA: { x: -1, y: 0 }, KeyD: { x: 1, y: 0 },
     };
-    function isTypingTarget(target: EventTarget | null): boolean {
-      const el = target as HTMLElement | null;
-      if (!el) return false;
-      const tag = el.tagName;
-      return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
-    }
     function onKeyDown(e: KeyboardEvent) {
-      if (toolActive) return; // don't fight an in-progress path/connector/shape-placement drag
       if (isTypingTarget(e.target)) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.code === 'KeyA' && !e.shiftKey && (editingPathId || directSelectMode)) {
+        e.preventDefault();
+        handleToggleDirectSelect();
+        return;
+      }
+      if (toolActive) return; // don't fight an in-progress path/connector/shape-placement drag
       const dir = PAN_KEYS[e.code];
       if (!dir) return;
       e.preventDefault();
@@ -666,7 +833,7 @@ export function Canvas({
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isPresent, toolActive]);
+  }, [isPresent, toolActive, editingPathId, directSelectMode]);
 
   // Accepts undefined so callers deriving `node` from a `.find()` (e.g. an
   // edge's source/target shape) don't need an unsafe cast — an edge left
@@ -710,8 +877,36 @@ export function Canvas({
       fontWeight: d.fontWeight,
       fontFamily: d.fontFamily,
       textAlign: d.textAlign,
+      fontStyle: d.fontStyle,
+      textDecoration: d.textDecoration,
+      letterSpacing: d.letterSpacing,
+      lineHeight: d.lineHeight,
+      verticalAlign: d.verticalAlign,
       strokeStyle: d.strokeStyle,
       effect: d.effect,
+      containerTheme: d.containerTheme,
+      containerAccentColor: d.containerAccentColor,
+      laneCount: d.laneCount,
+      laneOrientation: d.laneOrientation,
+      laneLabels: d.laneLabels,
+      videoUrl: d.videoUrl,
+      posterUrl: d.posterUrl,
+      videoAutoplay: d.videoAutoplay,
+      videoLoop: d.videoLoop,
+      videoMuted: d.videoMuted,
+      videoControls: d.videoControls,
+      iconName: d.iconName,
+      archimateLayer: d.archimateLayer,
+      archimateType: d.archimateType,
+      starPoints: d.starPoints,
+      starInnerRadius: d.starInnerRadius,
+      pieSegments: d.pieSegments,
+      pieInnerRadius: d.pieInnerRadius,
+      brushPoints: d.brushPoints,
+      brushStyle: d.brushStyle,
+      brushBaseWidth: d.brushBaseWidth,
+      brushViewBoxWidth: d.brushViewBoxWidth,
+      brushViewBoxHeight: d.brushViewBoxHeight,
     };
     return {
       id: node.id,
@@ -726,7 +921,66 @@ export function Canvas({
     } as DiagramNode;
   }
 
-  const onNodesChange = useCallback((changes: NodeChange[]) => {
+  // Keeps a dragged shape (or a dragged multi-selection, as one rigid unit)
+  // inside the page it was drawn on. Runs on every drag frame, not just
+  // drag-stop, since RF calls onNodesChange continuously while dragging and
+  // renders straight from whatever position we hand back — clamping here is
+  // what makes the shape visually stop at the edge instead of snapping back
+  // only once the drag ends. Group children are skipped: their position is
+  // already relative to the parent group (extent:'parent'), so only the
+  // group node itself gets boundary-clamped.
+  function clampDragChanges(changes: NodeChange[]): NodeChange[] {
+    type PosChange = NodeChange & { type: 'position'; position: { x: number; y: number } };
+    const posChanges = changes.filter((c): c is PosChange => c.type === 'position' && !!c.position);
+    if (posChanges.length === 0) return changes;
+
+    const byPage = new Map<string, PosChange[]>();
+    for (const c of posChanges) {
+      const node = shapeNodes.find(n => n.id === c.id);
+      if (!node || node.parentId) continue;
+      const pageId = findPageIdFor(node);
+      if (!pageId) continue;
+      const list = byPage.get(pageId) ?? [];
+      list.push(c);
+      byPage.set(pageId, list);
+    }
+    if (byPage.size === 0) return changes;
+
+    const corrections = new Map<string, { dx: number; dy: number }>();
+    const { pageOrigins: origins, pageDimensions: dims } = pageGeomRef.current;
+    for (const [pageId, list] of byPage) {
+      const origin = origins.get(pageId);
+      const pageDims = dims.get(pageId);
+      if (origin === undefined || !pageDims) continue;
+
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const c of list) {
+        const node = shapeNodes.find(n => n.id === c.id)!;
+        const w = node.width ?? 100, h = node.height ?? 100;
+        minX = Math.min(minX, c.position.x);
+        minY = Math.min(minY, c.position.y);
+        maxX = Math.max(maxX, c.position.x + w);
+        maxY = Math.max(maxY, c.position.y + h);
+      }
+      const bboxW = maxX - minX, bboxH = maxY - minY;
+      const clampedMinX = bboxW >= pageDims.width ? PAGE_X : Math.min(Math.max(minX, PAGE_X), PAGE_X + pageDims.width - bboxW);
+      const clampedMinY = bboxH >= pageDims.height ? origin : Math.min(Math.max(minY, origin), origin + pageDims.height - bboxH);
+      const dx = clampedMinX - minX, dy = clampedMinY - minY;
+      if (dx !== 0 || dy !== 0) {
+        for (const c of list) corrections.set(c.id, { dx, dy });
+      }
+    }
+    if (corrections.size === 0) return changes;
+
+    return changes.map(c => {
+      if (c.type !== 'position' || !c.position) return c;
+      const corr = corrections.get(c.id);
+      return corr ? { ...c, position: { x: c.position.x + corr.dx, y: c.position.y + corr.dy } } : c;
+    });
+  }
+
+  const onNodesChange = useCallback((rawChanges: NodeChange[]) => {
+    const changes = clampDragChanges(rawChanges);
     setShapeNodes(prev => applyNodeChanges(changes, [...frameNodes, ...prev]).filter(n => n.type !== 'pageFrame'));
 
     for (const change of changes) {
@@ -812,45 +1066,134 @@ export function Canvas({
   // composed into the wrapper's onMouseDown below) creates the shape exactly
   // there, instead of always at the viewport center. Mutually exclusive with
   // the other tool modes.
-  function beginPlacingShape(kind: ShapeKind) {
+  function beginPlacingShape(kind: ShapeKind, extraData?: Partial<ShapeNodeData>) {
     clearOtherTools();
     setPlacingShapeKind(kind);
+    setPendingShapeExtraData(extraData ?? null);
+  }
+
+  function beginPlacingComment() {
+    clearOtherTools();
+    setPlacingComment(true);
+  }
+
+  function handleCommentPlaceMouseDown(e: React.MouseEvent) {
+    if (!placingComment) return;
+    e.preventDefault();
+    const flowPoint = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+    const pageId = getPageIdForFlowPoint(flowPoint);
+    if (!pageId) return;
+    setActiveCommentId(null);
+    setDraftComment({ pageId, x: flowPoint.x, y: flowPoint.y });
+    setPlacingComment(false);
+  }
+
+  function handlePostComment(text: string) {
+    if (!draftComment || !user) return;
+    const comment: DiagramComment = {
+      id: crypto.randomUUID(),
+      pageId: draftComment.pageId,
+      x: draftComment.x,
+      y: draftComment.y,
+      authorId: user.uid,
+      authorName: user.displayName ?? user.email ?? 'Anonymous',
+      text,
+      createdAt: Date.now(),
+      resolved: false,
+      replies: [],
+    };
+    saveComment(diagramId, draftComment.pageId, comment);
+    setDraftComment(null);
+    setActiveCommentId(comment.id);
+  }
+
+  function findComment(id: string): DiagramComment | undefined {
+    return comments.find(c => c.id === id);
+  }
+
+  function handleReplyToComment(text: string) {
+    if (!activeCommentId || !user) return;
+    const comment = findComment(activeCommentId);
+    if (!comment) return;
+    const reply = { id: crypto.randomUUID(), authorId: user.uid, authorName: user.displayName ?? user.email ?? 'Anonymous', text, createdAt: Date.now() };
+    saveComment(diagramId, comment.pageId, { ...comment, replies: [...comment.replies, reply] });
+  }
+
+  function handleEditActiveComment(text: string) {
+    if (!activeCommentId) return;
+    const comment = findComment(activeCommentId);
+    if (!comment) return;
+    saveComment(diagramId, comment.pageId, { ...comment, text });
+  }
+
+  function handleEditActiveReply(replyId: string, text: string) {
+    if (!activeCommentId) return;
+    const comment = findComment(activeCommentId);
+    if (!comment) return;
+    saveComment(diagramId, comment.pageId, { ...comment, replies: comment.replies.map(r => r.id === replyId ? { ...r, text } : r) });
+  }
+
+  function handleDeleteActiveReply(replyId: string) {
+    if (!activeCommentId) return;
+    const comment = findComment(activeCommentId);
+    if (!comment) return;
+    saveComment(diagramId, comment.pageId, { ...comment, replies: comment.replies.filter(r => r.id !== replyId) });
+  }
+
+  function handleToggleActiveResolved() {
+    if (!activeCommentId) return;
+    const comment = findComment(activeCommentId);
+    if (!comment) return;
+    saveComment(diagramId, comment.pageId, { ...comment, resolved: !comment.resolved });
+  }
+
+  function handleDeleteActiveThread() {
+    if (!activeCommentId) return;
+    const comment = findComment(activeCommentId);
+    if (!comment) return;
+    deleteComment(diagramId, comment.pageId, comment.id);
+    setActiveCommentId(null);
   }
 
   function commitPlaceShape(kind: ShapeKind, flowPoint: { x: number; y: number }) {
     const pageId = getPageIdForFlowPoint(flowPoint);
     if (!pageId) return;
-    if (kind === 'image') {
-      if (!pendingImagePlacement) return;
-      const { imageUrl, width, height } = pendingImagePlacement;
+    if (kind === 'image' || kind === 'video') {
+      if (!pendingMediaPlacement) return;
+      const { url, width, height } = pendingMediaPlacement;
       const node: DiagramNode = {
         id: crypto.randomUUID(),
         type: 'shape',
         position: { x: flowPoint.x - width / 2, y: flowPoint.y - height / 2 },
         width, height,
-        data: { kind: 'image', pageId, imageUrl },
+        data: kind === 'image'
+          ? { kind: 'image', pageId, imageUrl: url }
+          : { kind: 'video', pageId, videoUrl: url, videoMuted: true, videoControls: true },
       };
       setShapeNodes(prev => [...prev, { ...node, data: { ...node.data, onCommit, onNavigateLink: navigateToLink } }]);
       saveShape(diagramId, pageId, node);
-      // Image placement is single-use — the uploaded file backing
-      // pendingImagePlacement can't be reused for a second copy.
+      // Media placement is single-use — the uploaded file backing
+      // pendingMediaPlacement can't be reused for a second copy.
       setPlacingShapeKind(null);
-      setPendingImagePlacement(null);
+      setPendingMediaPlacement(null);
+      setPendingShapeExtraData(null);
       return;
     }
-    const width = kind === 'text' ? 120 : kind === 'hotspot' ? 140 : 100;
-    const height = kind === 'text' ? 32 : kind === 'hotspot' ? 90 : 70;
+    const isSquareIconLike = kind === 'icon' || kind === 'archimateElement' || kind === 'cross' || kind === 'star';
+    const width = kind === 'text' ? 120 : kind === 'hotspot' ? 140 : isSquareIconLike ? 64 : kind === 'pieChart' ? 120 : 100;
+    const height = kind === 'text' ? 32 : kind === 'hotspot' ? 90 : isSquareIconLike ? 64 : kind === 'pieChart' ? 120 : 70;
     const node: DiagramNode = {
       id: crypto.randomUUID(),
       type: 'shape',
       position: { x: flowPoint.x - width / 2, y: flowPoint.y - height / 2 },
       width,
       height,
-      data: { kind, pageId, label: kind === 'text' ? 'Text' : '' },
+      data: { kind, pageId, label: kind === 'text' ? 'Text' : '', ...pendingShapeExtraData },
     };
     setShapeNodes(prev => [...prev, { ...node, data: { ...node.data, onCommit, onNavigateLink: navigateToLink } }]);
     saveShape(diagramId, pageId, node);
     setPlacingShapeKind(null);
+    setPendingShapeExtraData(null);
   }
 
   function handleShapePlaceMouseDown(e: React.MouseEvent) {
@@ -860,31 +1203,97 @@ export function Canvas({
     commitPlaceShape(placingShapeKind, flowPoint);
   }
 
+  // Custom drag-to-select marquee. React Flow's own built-in selectionOnDrag
+  // only activates when the mousedown target is the pane element itself
+  // (see @xyflow/system's Pane: `isSelectionActive = (selectionOnDrag &&
+  // eventTargetIsContainer) || selectionKeyPressed`) — a drag starting on
+  // ANY node, including the page background (PageFrameNode is a real node
+  // spanning the whole page), never counts as "the container" and is
+  // silently ignored. Since the page frame covers the entire visible page,
+  // that means a plain drag starting anywhere inside a page could never
+  // start a selection box at all. This reimplements just enough of that
+  // gesture, scoped specifically to drags starting on a page's own
+  // background, so RF's native pane-background case (already working) is
+  // left untouched.
+  function handleMarqueeMouseDown(e: React.MouseEvent) {
+    if (toolActive || e.button !== 0) return;
+    const target = e.target as HTMLElement;
+    if (!target.closest('.react-flow__node-pageFrame')) return;
+    const startScreen = { x: e.clientX, y: e.clientY };
+    const additive = e.shiftKey || e.metaKey || e.ctrlKey;
+    const preSelectedIds = additive ? new Set(selectedShapeIds) : new Set<string>();
+    let dragStarted = false;
+
+    // Selection is only computed and committed on mouseup, not on every
+    // mousemove — committing it live would select a shape mid-drag, which
+    // opens the properties drawer and triggers its drawer-aware re-fit
+    // (below) WHILE the drag is still in progress, animating the viewport
+    // out from under the very screen coordinates this drag is tracking.
+    let lastRect = { x: 0, y: 0, width: 0, height: 0 };
+    function onMove(ev: MouseEvent) {
+      const dist = Math.hypot(ev.clientX - startScreen.x, ev.clientY - startScreen.y);
+      if (!dragStarted && dist < 4) return;
+      dragStarted = true;
+      lastRect = {
+        x: Math.min(startScreen.x, ev.clientX), y: Math.min(startScreen.y, ev.clientY),
+        width: Math.abs(ev.clientX - startScreen.x), height: Math.abs(ev.clientY - startScreen.y),
+      };
+      setMarqueeRect(lastRect);
+    }
+    function onUp() {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      setMarqueeRect(null);
+      if (!dragStarted) return;
+
+      const flowA = screenToFlowPosition({ x: lastRect.x, y: lastRect.y });
+      const flowB = screenToFlowPosition({ x: lastRect.x + lastRect.width, y: lastRect.y + lastRect.height });
+      const minX = Math.min(flowA.x, flowB.x), maxX = Math.max(flowA.x, flowB.x);
+      const minY = Math.min(flowA.y, flowB.y), maxY = Math.max(flowA.y, flowB.y);
+
+      const intersecting = new Set<string>();
+      for (const n of shapeNodesRef.current) {
+        if (n.type !== 'shape' && n.type !== 'path') continue;
+        const r = getAbsoluteRect(n.id);
+        if (r && r.x < maxX && r.x + r.width > minX && r.y < maxY && r.y + r.height > minY) intersecting.add(n.id);
+      }
+      const finalSet = new Set([...preSelectedIds, ...intersecting]);
+      onNodesChange(
+        shapeNodesRef.current
+          .filter(n => n.type === 'shape' || n.type === 'path')
+          .map(n => ({ type: 'select' as const, id: n.id, selected: finalSet.has(n.id) })),
+      );
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }
+
   useEffect(() => {
     if (!placingShapeKind) return;
     function onKeyDown(e: KeyboardEvent) {
-      if (e.key === 'Escape') { setPlacingShapeKind(null); setPendingImagePlacement(null); }
+      if (e.key === 'Escape') { setPlacingShapeKind(null); setPendingMediaPlacement(null); }
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [placingShapeKind]);
 
-  async function handleUploadImage(file: File) {
-    const [dims, imageUrl] = await Promise.all([
-      getImageDimensions(file),
-      uploadDiagramImage(diagramId, file),
+  async function handleUploadMedia(file: File) {
+    const isVideo = file.type.startsWith('video/');
+    const [dims, url] = await Promise.all([
+      isVideo ? getVideoDimensions(file) : getImageDimensions(file),
+      isVideo ? uploadDiagramMedia(diagramId, file, 'diagramVideos') : uploadDiagramImage(diagramId, file),
     ]);
     const maxDim = 320;
     const scale = Math.min(1, maxDim / Math.max(dims.width, dims.height));
     const width = Math.round(dims.width * scale);
     const height = Math.round(dims.height * scale);
     // Don't route through beginPlacingShape here — it calls clearOtherTools(),
-    // which would also null out the pendingImagePlacement we're about to set
+    // which would also null out the pendingMediaPlacement we're about to set
     // (both setState calls batch together since neither is separated by an
     // await, so the clear would silently win over the set).
     clearOtherTools();
-    setPendingImagePlacement({ imageUrl, width, height });
-    setPlacingShapeKind('image');
+    setPendingMediaPlacement({ kind: isVideo ? 'video' : 'image', url, width, height });
+    setPlacingShapeKind(isVideo ? 'video' : 'image');
   }
 
   // Arrow/connector tool — bypasses React Flow's own Handle-based connection
@@ -1000,6 +1409,81 @@ export function Canvas({
     clearOtherTools();
     if (!wasOn) setPenMode(true);
   }
+  function handleToggleBrush() {
+    const wasOn = brushMode;
+    clearOtherTools();
+    if (!wasOn) setBrushMode(true);
+  }
+
+  function finalizeBrushStroke(points: BrushPoint[]) {
+    setBrushDraft(null);
+    if (points.length < 2) return;
+    const pageId = getPageIdForFlowPoint(points[0]);
+    if (!pageId) return;
+    const PAD = 12;
+    const minX = Math.min(...points.map(p => p.x)) - PAD;
+    const minY = Math.min(...points.map(p => p.y)) - PAD;
+    const maxX = Math.max(...points.map(p => p.x)) + PAD;
+    const maxY = Math.max(...points.map(p => p.y)) + PAD;
+    const width = maxX - minX, height = maxY - minY;
+    const localPoints: BrushPoint[] = points.map(p => ({ x: p.x - minX, y: p.y - minY, pressure: p.pressure }));
+    const node: DiagramNode = {
+      id: crypto.randomUUID(),
+      type: 'shape',
+      position: { x: minX, y: minY },
+      width, height,
+      data: {
+        kind: 'brushStroke', pageId,
+        brushPoints: localPoints, brushStyle: 'pencil', brushBaseWidth: 6,
+        brushViewBoxWidth: width, brushViewBoxHeight: height,
+        strokeColor: '#1a1a2e',
+      },
+    };
+    setShapeNodes(prev => [...prev, { ...node, data: { ...node.data, onCommit, onNavigateLink: navigateToLink } }]);
+    saveShape(diagramId, pageId, node);
+  }
+
+  // Raw window pointermove/pointerup (not React's onMouseMove) so a real
+  // stylus's `.pressure` is available on every sample — React's synthetic
+  // mouse events don't carry it. Mouse/touch input (pointerType !== 'pen')
+  // has no meaningful pressure signal at all (browsers report a flat 0.5),
+  // so its "pressure" is simulated from movement speed instead: drawing
+  // fast thins the stroke, slowing down thickens it, which reads as a much
+  // more natural brush feel than a constant width ever does with a mouse.
+  function handleBrushMouseDown(e: React.MouseEvent) {
+    if (!brushMode || e.button !== 0) return;
+    e.preventDefault();
+    const startFlow = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+    const native = e.nativeEvent as PointerEvent;
+    const isRealPen = native.pointerType === 'pen';
+    const points: BrushPoint[] = [{ x: startFlow.x, y: startFlow.y, pressure: isRealPen ? (native.pressure || 0.5) : 0.6 }];
+    setBrushDraft([...points]);
+    let last = { x: startFlow.x, y: startFlow.y, t: Date.now() };
+
+    function onMove(ev: PointerEvent) {
+      const flow = screenToFlowPosition({ x: ev.clientX, y: ev.clientY });
+      const now = Date.now();
+      let pressure: number;
+      if (isRealPen) {
+        pressure = ev.pressure || 0.5;
+      } else {
+        const dt = Math.max(1, now - last.t);
+        const dist = Math.hypot(flow.x - last.x, flow.y - last.y);
+        const speed = dist / dt;
+        pressure = Math.max(0.15, Math.min(1, 1 - speed * 4));
+      }
+      last = { x: flow.x, y: flow.y, t: now };
+      points.push({ x: flow.x, y: flow.y, pressure });
+      setBrushDraft([...points]);
+    }
+    function onUp() {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      finalizeBrushStroke(points);
+    }
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }
   function handleToggleConnect() {
     const wasOn = connectMode;
     clearOtherTools();
@@ -1102,14 +1586,27 @@ export function Canvas({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [penMode, draftAnchors]);
 
+  useEffect(() => {
+    if (!brushMode) return;
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === 'Escape') setBrushMode(false);
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [brushMode]);
+
   // Post-creation anchor editing — selecting a path shows its anchors
-  // immediately (see editingPathId above); dragging a marker updates
-  // pathAnchors live via updateNodeData (fast visual feedback, no Firestore
-  // write per pixel) and only persists on mouseup.
+  // passively (see editingPathId above); they only become interactive while
+  // Direct Selection is on. Dragging a marker updates pathAnchors live via
+  // updateNodeData (fast visual feedback, no Firestore write per pixel) and
+  // only persists on mouseup. A click WITHOUT a drag (under the same
+  // dragDist>3/zoom threshold the pen tool itself uses to distinguish a
+  // smooth-point drag from a plain click) instead focuses the anchor for
+  // keyboard nudge/delete, rather than moving it.
   function handleAnchorMarkerMouseDown(anchorIndex: number, part: AnchorPart, e: React.MouseEvent) {
     e.stopPropagation();
     e.preventDefault();
-    if (!editingPathId) return;
+    if (!editingPathId || !directSelectMode) return;
     const pathId = editingPathId;
     const node = shapeNodesRef.current.find(n => n.id === pathId);
     const rect = getAbsoluteRect(pathId);
@@ -1118,8 +1615,13 @@ export function Canvas({
     const rotationDeg = data.rotation ?? 0;
     const { width: vbW, height: vbH } = computePathViewBox(data.pathAnchors ?? []);
     let liveAnchors = [...(data.pathAnchors ?? [])];
+    const startClientX = e.clientX, startClientY = e.clientY;
+    const dragThresholdPx = 3;
+    let dragStarted = false;
 
     function onMove(ev: MouseEvent) {
+      if (!dragStarted && Math.hypot(ev.clientX - startClientX, ev.clientY - startClientY) < dragThresholdPx) return;
+      dragStarted = true;
       const abs = screenToFlowPosition({ x: ev.clientX, y: ev.clientY });
       const local = absoluteToAnchorLocal(abs, rect!, vbW, vbH, rotationDeg);
       const next = [...liveAnchors];
@@ -1144,6 +1646,11 @@ export function Canvas({
     function onUp() {
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
+      if (!dragStarted) {
+        // Pure click: focus this anchor for keyboard nudge/delete rather than moving it.
+        setActiveAnchorIndex(anchorIndex);
+        return;
+      }
       const pageId = findPageIdFor(node);
       if (!pageId) return;
       const normalized = normalizePathAnchors(liveAnchors, rect!, vbW, vbH);
@@ -1161,14 +1668,169 @@ export function Canvas({
     window.addEventListener('mouseup', onUp);
   }
 
-  useEffect(() => {
+  // Persists a full anchors-array replacement through the same
+  // normalize→toPersistableShape→saveShape pipeline the drag handler above
+  // uses, for the discrete (non-drag) mutations below: insert, delete,
+  // smooth/corner toggle, and (debounced) keyboard nudge.
+  function commitPathAnchors(pathId: string, nextAnchors: PathAnchor[], prevVbW: number, prevVbH: number) {
+    const node = shapeNodesRef.current.find(n => n.id === pathId);
+    const rect = getAbsoluteRect(pathId);
+    const pageId = node && findPageIdFor(node);
+    if (!node || !rect || !pageId) return;
+    const data = node.data as ShapeNodeData;
+    const normalized = normalizePathAnchors(nextAnchors, rect, prevVbW, prevVbH);
+    const persisted = toPersistableShape({
+      ...node,
+      position: normalized.position, width: normalized.width, height: normalized.height,
+      data: { ...data, pathAnchors: normalized.anchors },
+    });
+    setShapeNodes(prev => prev.map(n => n.id === pathId
+      ? { ...n, position: normalized.position, width: normalized.width, height: normalized.height, data: { ...n.data, pathAnchors: normalized.anchors } }
+      : n));
+    saveShape(diagramId, pageId, persisted);
+  }
+
+  // Click on a curve/line segment (while Direct Selection is on) inserts a
+  // new anchor there via exact De Casteljau subdivision — the split curve is
+  // geometrically identical to the original, so there's no visible kink.
+  function handleInsertAnchor(segmentIndex: number, t: number) {
     if (!editingPathId) return;
+    const pathId = editingPathId;
+    const node = shapeNodesRef.current.find(n => n.id === pathId);
+    const data = node?.data as ShapeNodeData | undefined;
+    const anchors = data?.pathAnchors ?? [];
+    if (!node || anchors.length < 2) return;
+    const a = anchors[segmentIndex];
+    const b = anchors[(segmentIndex + 1) % anchors.length];
+    const { width: vbW, height: vbH } = computePathViewBox(anchors);
+    let newAnchor: PathAnchor;
+    const next = [...anchors];
+    if (a.handleOut || b.handleIn) {
+      const c1 = a.handleOut ? { x: a.x + a.handleOut.x, y: a.y + a.handleOut.y } : a;
+      const c2 = b.handleIn ? { x: b.x + b.handleIn.x, y: b.y + b.handleIn.y } : b;
+      const split = subdivideBezierAt(a, c1, c2, b, t);
+      newAnchor = {
+        x: split.point.x, y: split.point.y,
+        handleIn: a.handleOut ? { x: split.c2Left.x - split.point.x, y: split.c2Left.y - split.point.y } : undefined,
+        handleOut: b.handleIn ? { x: split.c1Right.x - split.point.x, y: split.c1Right.y - split.point.y } : undefined,
+      };
+      if (a.handleOut) next[segmentIndex] = { ...a, handleOut: { x: split.c1Left.x - a.x, y: split.c1Left.y - a.y } };
+      if (b.handleIn) next[(segmentIndex + 1) % anchors.length] = { ...b, handleIn: { x: split.c2Right.x - b.x, y: split.c2Right.y - b.y } };
+    } else {
+      newAnchor = { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+    }
+    next.splice(segmentIndex + 1, 0, newAnchor);
+    commitPathAnchors(pathId, next, vbW, vbH);
+    setActiveAnchorIndex(segmentIndex + 1);
+  }
+
+  // Delete/Backspace with a focused anchor removes it — fewer than 2 anchors
+  // can't describe a visible path at all, so that deletes the whole shape.
+  function handleDeleteActiveAnchor() {
+    if (!editingPathId || activeAnchorIndex === null) return;
+    const pathId = editingPathId;
+    const node = shapeNodesRef.current.find(n => n.id === pathId);
+    const data = node?.data as ShapeNodeData | undefined;
+    const anchors = data?.pathAnchors ?? [];
+    if (!node || anchors.length === 0) return;
+    const remaining = anchors.filter((_, i) => i !== activeAnchorIndex);
+    setActiveAnchorIndex(null);
+    if (remaining.length < 2) {
+      const pageId = findPageIdFor(node);
+      if (!pageId) return;
+      deleteShape(diagramId, pageId, pathId);
+      setShapeNodes(prev => prev.filter(n => n.id !== pathId));
+      return;
+    }
+    const { width: vbW, height: vbH } = computePathViewBox(anchors);
+    commitPathAnchors(pathId, remaining, vbW, vbH);
+  }
+
+  // Double-click an anchor to toggle smooth (mirrored handles) <-> corner
+  // (no handles). Corner->smooth synthesizes new handles from the neighbors'
+  // direction, since a corner point has no existing tangent to preserve.
+  function handleToggleAnchorSmooth(index: number) {
+    if (!editingPathId) return;
+    const pathId = editingPathId;
+    const node = shapeNodesRef.current.find(n => n.id === pathId);
+    const data = node?.data as ShapeNodeData | undefined;
+    const anchors = data?.pathAnchors ?? [];
+    if (!node || index >= anchors.length) return;
+    const { width: vbW, height: vbH } = computePathViewBox(anchors);
+    const anchor = anchors[index];
+    const next = [...anchors];
+    if (anchor.handleIn || anchor.handleOut) {
+      const { handleIn, handleOut, ...rest } = anchor;
+      next[index] = rest;
+    } else {
+      next[index] = { ...anchor, ...synthesizeSmoothHandles(anchors, index, !!data!.pathClosed) };
+    }
+    commitPathAnchors(pathId, next, vbW, vbH);
+  }
+
+  // Arrow-key nudge for the focused anchor — moves it by a fixed amount in
+  // path-local/viewBox units (not screen pixels), so the nudge distance is
+  // independent of zoom, matching how the underlying data is actually
+  // stored. Live-updates via updateNodeData immediately, but debounces the
+  // actual Firestore write so holding a key down doesn't write-storm.
+  const nudgeCommitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (!directSelectMode || !editingPathId || activeAnchorIndex === null) return;
+    const pathId = editingPathId;
+    const anchorIndex = activeAnchorIndex;
     function onKeyDown(e: KeyboardEvent) {
-      if (e.key === 'Escape') deselectAll();
+      if (isTypingTarget(e.target)) return;
+      const dir = ({ ArrowUp: { x: 0, y: -1 }, ArrowDown: { x: 0, y: 1 }, ArrowLeft: { x: -1, y: 0 }, ArrowRight: { x: 1, y: 0 } } as Record<string, { x: number; y: number }>)[e.key];
+      if (!dir) return;
+      e.preventDefault();
+      const node = shapeNodesRef.current.find(n => n.id === pathId);
+      const data = node?.data as ShapeNodeData | undefined;
+      const anchors = data?.pathAnchors ?? [];
+      if (!node || anchorIndex >= anchors.length) return;
+      const step = e.shiftKey ? 10 : 1;
+      const { width: vbW, height: vbH } = computePathViewBox(anchors);
+      const nextAnchors = anchors.map((a, i) => i === anchorIndex ? { ...a, x: a.x + dir.x * step, y: a.y + dir.y * step } : a);
+      updateNodeData(pathId, { pathAnchors: nextAnchors });
+      if (nudgeCommitTimerRef.current) clearTimeout(nudgeCommitTimerRef.current);
+      nudgeCommitTimerRef.current = setTimeout(() => commitPathAnchors(pathId, nextAnchors, vbW, vbH), 400);
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [editingPathId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [directSelectMode, editingPathId, activeAnchorIndex]);
+
+  // Delete/Backspace deletes the focused anchor while Direct Selection is
+  // active — must suppress RF's own deleteKeyCode-driven whole-node delete
+  // at the <ReactFlow> prop level (below) to avoid both firing on one press.
+  useEffect(() => {
+    if (!directSelectMode || !editingPathId || activeAnchorIndex === null) return;
+    function onKeyDown(e: KeyboardEvent) {
+      if (isTypingTarget(e.target)) return;
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        e.preventDefault();
+        handleDeleteActiveAnchor();
+      }
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [directSelectMode, editingPathId, activeAnchorIndex]);
+
+  // Two-stage Escape: clear anchor focus first, then Direct Selection mode,
+  // and only fall through to a full deselect on a fresh Escape press once
+  // neither of those "nested" focus levels is active.
+  useEffect(() => {
+    if (!editingPathId) return;
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key !== 'Escape') return;
+      if (activeAnchorIndex !== null) setActiveAnchorIndex(null);
+      else if (directSelectMode) setDirectSelectMode(false);
+      else deselectAll();
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editingPathId, activeAnchorIndex, directSelectMode]);
 
   // Path shapes are their own RF node type (not 'shape'), but they're still
   // a regular shape from the properties-panel's point of view — excluding
@@ -1190,7 +1852,13 @@ export function Canvas({
     return !!(shapeNodes.find(n => n.id === id)?.data as ShapeNodeData | undefined)?.locked;
   }
 
-  async function handleGroup() {
+  // Shared by "Group" (plain, unstyled — `type: 'group'`, routes to
+  // GroupNode.tsx) and "Container" (styled, themeable — `type: 'shape'` with
+  // `data.kind: 'container'`, routes to ShapeNode.tsx). Containment mechanics
+  // (parentId + extent:'parent') aren't tied to either node type, so both
+  // share the exact same bounding-box + reparent math; only the resulting
+  // node's type/data differ.
+  async function wrapSelectedIn(kind: 'group' | 'container') {
     const selected = shapeNodes.filter(n => selectedShapeIds.includes(n.id) && !isLocked(n.id));
     if (selected.length < 2) return;
     const pageId = findPageIdFor(selected[0]);
@@ -1212,14 +1880,16 @@ export function Canvas({
     const groupId = crypto.randomUUID();
     const groupNode: DiagramNode = {
       id: groupId,
-      type: 'group',
+      type: kind === 'group' ? 'group' : 'shape',
       position: { x: minX, y: minY },
       width: maxX - minX,
       height: maxY - minY,
       zIndex: -0.5,
       parentId: commonParentId,
       extent: commonParentId ? ('parent' as const) : undefined,
-      data: { kind: 'group', pageId, label: 'Group' },
+      data: kind === 'group'
+        ? { kind: 'group', pageId, label: 'Group' }
+        : { kind: 'container', pageId, label: 'Container', containerTheme: 'plain' },
     };
     // Await the parent write before saving children — a child doc with a
     // parentId React Flow can't yet resolve (parent snapshot not landed) will
@@ -1233,6 +1903,34 @@ export function Canvas({
       position: { x: n.position.x - minX, y: n.position.y - minY },
     }));
     await Promise.all(reparented.map(child => saveShape(diagramId, pageId, child)));
+  }
+
+  async function handleGroup() {
+    await wrapSelectedIn('group');
+  }
+
+  // Unlike Group, an empty container is a legitimate starting point (a Visio
+  // user places the box first, then moves shapes in) — drag-and-drop
+  // reparenting isn't built yet, so for now that "moves in" step still means
+  // select-then-Group, but the box itself shouldn't require 2+ shapes to exist.
+  async function handleInsertContainer() {
+    if (selectedShapeIds.length >= 2) {
+      await wrapSelectedIn('container');
+      return;
+    }
+    const pageId = activePageId ?? pages[0]?.id;
+    if (!pageId) return;
+    const origin = pageOrigins.get(pageId) ?? 0;
+    const node: DiagramNode = {
+      id: crypto.randomUUID(),
+      type: 'shape',
+      position: { x: PAGE_X + 60, y: origin + 60 },
+      width: 320,
+      height: 220,
+      zIndex: -0.5,
+      data: { kind: 'container', pageId, label: 'Container', containerTheme: 'plain' },
+    };
+    await saveShape(diagramId, pageId, node);
   }
 
   function handleUngroup() {
@@ -1287,11 +1985,162 @@ export function Canvas({
     onNodesChange(selectedShapeIds.filter(id => !isLocked(id)).map(id => ({ type: 'remove', id })));
   }
 
+  const activePageId = useActivePageId(pages, pageOrigins, pageDimensions);
+
+  // In-memory clipboard (a ref, not the OS Clipboard API — this is a
+  // real-time collaborative Firestore-backed canvas with no cross-tab/app
+  // paste requirement, and the async permission-gated Clipboard API adds
+  // real friction for no benefit over a plain ref).
+  const clipboardRef = useRef<{ shapes: DiagramNode[]; edges: DiagramEdge[]; sourcePageId: string } | null>(null);
+
+  // Selected shapes/group plus every descendant of a selected group
+  // (recursively, so a group-of-groups copies whole), plus any connector
+  // whose both endpoints fall inside that set.
+  function collectCopySet(): { shapes: Node[]; edges: Edge[] } {
+    const ids = new Set<string>(selectedShapeIds);
+    if (selectedGroup) ids.add(selectedGroup.id);
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const n of shapeNodes) {
+        if (n.parentId && ids.has(n.parentId) && !ids.has(n.id)) {
+          ids.add(n.id);
+          grew = true;
+        }
+      }
+    }
+    const shapes = shapeNodes.filter(n => ids.has(n.id));
+    const edges = connectorEdges.filter(e => ids.has(e.source) && ids.has(e.target));
+    return { shapes, edges };
+  }
+
+  function handleCopy() {
+    const { shapes, edges } = collectCopySet();
+    if (shapes.length === 0) return;
+    const pageId = findPageIdFor(shapes[0]);
+    if (!pageId) return;
+    clipboardRef.current = {
+      shapes: shapes.map(n => toPersistableShape(n)),
+      edges: edges.map(e => ({ ...e })) as DiagramEdge[],
+      sourcePageId: pageId,
+    };
+  }
+
+  function handleCut() {
+    const { shapes } = collectCopySet();
+    if (shapes.length === 0) return;
+    handleCopy();
+    onNodesChange(shapes.filter(n => !isLocked(n.id)).map(n => ({ type: 'remove' as const, id: n.id })));
+  }
+
+  // Depth-first so a parent is always written (and thus resolvable by
+  // React Flow) before any child that references it — mirrors handleGroup's
+  // own await-parent-before-children ordering, generalized to any depth.
+  function topoSortByParent(list: DiagramNode[]): DiagramNode[] {
+    const byId = new Map(list.map(s => [s.id, s] as const));
+    const visited = new Set<string>();
+    const ordered: DiagramNode[] = [];
+    function visit(s: DiagramNode) {
+      if (visited.has(s.id)) return;
+      visited.add(s.id);
+      if (s.parentId && byId.has(s.parentId)) visit(byId.get(s.parentId)!);
+      ordered.push(s);
+    }
+    for (const s of list) visit(s);
+    return ordered;
+  }
+
+  async function handlePaste() {
+    const clip = clipboardRef.current;
+    if (!clip || clip.shapes.length === 0) return;
+    const destPageId = activePageId ?? clip.sourcePageId;
+    const destOrigin = pageOrigins.get(destPageId) ?? 0;
+    const srcOrigin = pageOrigins.get(clip.sourcePageId) ?? 0;
+    // A small fixed offset keeps repeated pastes from stacking exactly on
+    // top of each other; the page-origin delta re-bases Y when pasting onto
+    // a different page than the shapes were copied from.
+    const PASTE_OFFSET = 24;
+    const dx = PASTE_OFFSET;
+    const dy = (destOrigin - srcOrigin) + PASTE_OFFSET;
+
+    const idMap = new Map<string, string>();
+    for (const s of clip.shapes) idMap.set(s.id, crypto.randomUUID());
+
+    const destDims = pageDimensions.get(destPageId);
+    const newShapes: DiagramNode[] = clip.shapes.map(s => {
+      const newParentId = s.parentId ? idMap.get(s.parentId) : undefined;
+      const isTopLevel = !newParentId;
+      let position = isTopLevel ? { x: s.position.x + dx, y: s.position.y + dy } : s.position;
+      // Clamp only top-level pasted shapes to the destination page immediately —
+      // matches drag clamping, and grouped children stay in their parent's
+      // already-valid local space.
+      if (isTopLevel && destDims) {
+        const w = s.width ?? 100, h = s.height ?? 100;
+        position = {
+          x: w >= destDims.width ? PAGE_X : Math.min(Math.max(position.x, PAGE_X), PAGE_X + destDims.width - w),
+          y: h >= destDims.height ? destOrigin : Math.min(Math.max(position.y, destOrigin), destOrigin + destDims.height - h),
+        };
+      }
+      return {
+        ...s,
+        id: idMap.get(s.id)!,
+        parentId: newParentId,
+        extent: newParentId ? ('parent' as const) : undefined,
+        position,
+        data: { ...s.data, pageId: destPageId },
+      };
+    });
+
+    for (const s of topoSortByParent(newShapes)) {
+      await saveShape(diagramId, destPageId, s);
+    }
+
+    const newEdges: DiagramEdge[] = clip.edges
+      .filter(e => idMap.has(e.source) && idMap.has(e.target))
+      .map(e => ({ ...e, id: crypto.randomUUID(), source: idMap.get(e.source)!, target: idMap.get(e.target)! }));
+    for (const e of newEdges) {
+      await saveConnector(diagramId, destPageId, e);
+    }
+
+    setShapeNodes(prev => [
+      ...prev.map(n => n.selected ? { ...n, selected: false } : n),
+      ...newShapes.map(s => ({ ...s, selected: true })),
+    ]);
+    setConnectorEdges(prev => [...prev, ...newEdges]);
+  }
+
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (isTypingTarget(e.target)) return;
+      if (isPresent) return;
+      if (!(e.metaKey || e.ctrlKey)) return;
+      if (e.key === 'c') { e.preventDefault(); handleCopy(); }
+      else if (e.key === 'x') { e.preventDefault(); handleCut(); }
+      else if (e.key === 'v') { e.preventDefault(); void handlePaste(); }
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPresent, selectedShapeIds, selectedGroup, shapeNodes, connectorEdges, activePageId, pageOrigins, pageDimensions, diagramId]);
+
   const [guides, setGuides] = useState<GuideLines | null>(null);
   const [dataPanelOpen, setDataPanelOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [layersPanelOpen, setLayersPanelOpen] = useState(false);
-  const activePageId = useActivePageId(pages, pageOrigins, pageDimensions);
+
+  const drawerOpen = !!singleSelectedShape || dataPanelOpen || animationPanelOpen || !!activeCommentId || !!draftComment;
+  // Re-fit only on the closed→open transition (a shape newly selected, or a
+  // panel newly opened) — not continuously on every selection change, which
+  // would fight the user's own manual zoom/pan while they're actively
+  // clicking between shapes with the drawer already open.
+  const wasDrawerOpenRef = useRef(false);
+  useEffect(() => {
+    if (drawerOpen && !wasDrawerOpenRef.current && activePageId) {
+      fitToPage(activePageId, { duration: 300 }, 316);
+    }
+    wasDrawerOpenRef.current = drawerOpen;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [drawerOpen]);
 
   function handleLayerSelect(id: string, additive: boolean) {
     const changes: NodeChange[] = additive
@@ -1394,6 +2243,9 @@ export function Canvas({
   function handleWrapperMouseDown(e: React.MouseEvent) {
     handlePenMouseDown(e);
     handleShapePlaceMouseDown(e);
+    handleMarqueeMouseDown(e);
+    handleCommentPlaceMouseDown(e);
+    handleBrushMouseDown(e);
   }
   function handleWrapperMouseUp(e: React.MouseEvent) {
     handlePenMouseUp(e);
@@ -1402,6 +2254,7 @@ export function Canvas({
 
   return (
     <div
+      ref={wrapperRef}
       style={{
         width: '100%', height: '100%', position: 'relative',
         // Distinct cursor per mode: crosshair for drawing/connecting tools,
@@ -1476,7 +2329,11 @@ export function Canvas({
           nodesDraggable={!isPresent && !toolActive}
           nodesConnectable={!isPresent && !toolActive}
           elementsSelectable={!isPresent && !toolActive}
-          deleteKeyCode={isPresent ? [] : ['Backspace', 'Delete']}
+          // Suppressed while Direct Selection is active — Delete/Backspace
+          // means "delete the focused anchor point" there (a dedicated
+          // keydown effect above), not "delete the whole path"; letting both
+          // stay bound to the same key would double-fire on one press.
+          deleteKeyCode={isPresent || directSelectMode ? [] : ['Backspace', 'Delete']}
           proOptions={{ hideAttribution: true }}
           style={isPresent ? { background: 'transparent' } : undefined}
         >
@@ -1485,6 +2342,7 @@ export function Canvas({
           <AlignmentGuidesOverlay guides={guides} />
           <RemoteCursorsLayer peers={peers} shapeNodes={shapeNodes} />
           <PenDrawingOverlay anchors={draftAnchors} dragPreview={penDrag} />
+          {brushDraft && <BrushDrawingOverlay points={brushDraft} />}
           <ConnectorDrawingOverlay drag={connectDrag} />
           {editingPathId && (() => {
             const editNode = shapeNodesRef.current.find(n => n.id === editingPathId);
@@ -1500,7 +2358,11 @@ export function Canvas({
                 vbW={vbW}
                 vbH={vbH}
                 rotationDeg={editData.rotation ?? 0}
+                activeAnchorIndex={activeAnchorIndex}
+                interactive={directSelectMode}
                 onMarkerMouseDown={handleAnchorMarkerMouseDown}
+                onMarkerDoubleClick={(index) => handleToggleAnchorSmooth(index)}
+                onSegmentMouseDown={(segmentIndex, t) => handleInsertAnchor(segmentIndex, t)}
               />
             );
           })()}
@@ -1606,15 +2468,25 @@ export function Canvas({
       {!isPresent && (
         <Toolbar
           leftOffset={layersPanelOpen ? 276 : 16}
+          isSelectMode={!toolActive}
+          onSelectTool={clearOtherTools}
           onOpenShapeGallery={() => setShapeGalleryOpen(true)}
-          isPlacingBasicShape={!!placingShapeKind && placingShapeKind !== 'hotspot' && placingShapeKind !== 'image'}
+          isPlacingBasicShape={!!placingShapeKind && placingShapeKind !== 'hotspot' && placingShapeKind !== 'image' && placingShapeKind !== 'video'}
           penMode={penMode}
           onTogglePen={handleTogglePen}
+          brushMode={brushMode}
+          onToggleBrush={handleToggleBrush}
+          directSelectMode={directSelectMode}
+          onToggleDirectSelect={handleToggleDirectSelect}
+          directSelectDisabled={!editingPathId && !directSelectMode}
           connectMode={connectMode}
           onToggleConnect={handleToggleConnect}
           isPlacingHotspot={placingShapeKind === 'hotspot'}
           onStartPlacingHotspot={() => beginPlacingShape('hotspot')}
-          onUploadImage={handleUploadImage}
+          onUploadMedia={handleUploadMedia}
+          onInsertContainer={handleInsertContainer}
+          isPlacingComment={placingComment}
+          onStartPlacingComment={beginPlacingComment}
           layersPanelOpen={layersPanelOpen}
           onToggleLayers={() => setLayersPanelOpen(o => !o)}
           highlightMode={highlightMode}
@@ -1630,11 +2502,21 @@ export function Canvas({
         <ShapeGalleryModal
           open={shapeGalleryOpen}
           onClose={() => setShapeGalleryOpen(false)}
-          onSelect={kind => beginPlacingShape(kind)}
+          onSelect={(kind, extraData) => beginPlacingShape(kind, extraData)}
         />
       )}
       {!isPresent && (
-        <ShapeStampCursor kind={placingShapeKind} imageUrl={pendingImagePlacement?.imageUrl} pos={stampScreenPos} />
+        <ShapeStampCursor kind={placingShapeKind} imageUrl={pendingMediaPlacement?.kind === 'image' ? pendingMediaPlacement.url : undefined} iconName={pendingShapeExtraData?.iconName} pos={stampScreenPos} />
+      )}
+      {marqueeRect && (
+        <div
+          style={{
+            position: 'fixed', left: marqueeRect.x, top: marqueeRect.y,
+            width: marqueeRect.width, height: marqueeRect.height,
+            border: '1px solid #1677ff', background: 'rgba(22, 119, 255, 0.08)',
+            pointerEvents: 'none', zIndex: 1000,
+          }}
+        />
       )}
       {!isPresent && layersPanelOpen && (
         <LayersPanel
@@ -1651,12 +2533,17 @@ export function Canvas({
           onClose={() => setLayersPanelOpen(false)}
         />
       )}
-      <PageNavigatorRail
-        diagramId={diagramId}
-        pages={pages} pageOrigins={pageOrigins} pageDimensions={pageDimensions}
-        rightOffset={(singleSelectedShape || dataPanelOpen || animationPanelOpen) ? 316 : 16}
-        onSelectPage={pageId => fitToPage(pageId, { duration: 300 })}
-      />
+      {/* Hidden entirely (not just shifted) while a drawer covers the right
+          side — there isn't room for it, and rightOffset would either
+          overlap the drawer or crowd the remaining space. */}
+      {!isPresent && !drawerOpen && (
+        <PageNavigatorRail
+          diagramId={diagramId}
+          pages={pages} pageOrigins={pageOrigins} pageDimensions={pageDimensions}
+          rightOffset={16}
+          onSelectPage={pageId => fitToPage(pageId, { duration: 300 })}
+        />
+      )}
 
 
       {!isPresent && (
@@ -1680,6 +2567,7 @@ export function Canvas({
           variables={variables}
           connectorEdges={connectorEdges}
           onChange={patch => onCommit(singleSelectedShape.id, patch)}
+          onResize={(w, h) => handleResizeShape(singleSelectedShape.id, w, h)}
           onDeleteEdge={id => onEdgesChange([{ type: 'remove', id }])}
           onClose={deselectAll}
         />
@@ -1691,6 +2579,23 @@ export function Canvas({
           onUpsert={v => upsertVariable(diagramId, v)}
           onDelete={id => deleteVariable(diagramId, id)}
           onClose={() => setDataPanelOpen(false)}
+        />
+      )}
+
+      {!isPresent && (draftComment || activeCommentId) && (
+        <CommentThreadPanel
+          comment={activeCommentId ? findComment(activeCommentId) ?? null : null}
+          draft={draftComment}
+          currentUserId={user?.uid ?? ''}
+          currentUserSeed={user?.email ?? user?.uid ?? ''}
+          onPost={handlePostComment}
+          onReply={handleReplyToComment}
+          onEditComment={handleEditActiveComment}
+          onEditReply={handleEditActiveReply}
+          onDeleteReply={handleDeleteActiveReply}
+          onToggleResolved={handleToggleActiveResolved}
+          onDeleteThread={handleDeleteActiveThread}
+          onClose={() => { setDraftComment(null); setActiveCommentId(null); }}
         />
       )}
 
@@ -1714,6 +2619,9 @@ export function Canvas({
           {selectedShapeIds.length >= 2 && (
             <Tooltip title="Group"><Button size="small" icon={<GroupOutlined />} onClick={handleGroup} /></Tooltip>
           )}
+          <Tooltip title={selectedShapeIds.length >= 2 ? 'Wrap in container' : 'Insert container'}>
+            <Button size="small" icon={<BorderOuterOutlined />} onClick={handleInsertContainer} />
+          </Tooltip>
           <Tooltip title="Bring to front"><Button size="small" icon={<VerticalAlignTopOutlined />} onClick={bringToFront} /></Tooltip>
           <Tooltip title="Send to back"><Button size="small" icon={<VerticalAlignBottomOutlined />} onClick={sendToBack} /></Tooltip>
           <Tooltip title="Delete"><Button size="small" danger icon={<DeleteOutlined />} onClick={deleteSelected} /></Tooltip>

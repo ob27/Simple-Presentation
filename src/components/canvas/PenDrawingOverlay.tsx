@@ -32,23 +32,30 @@ export function PenDrawingOverlay({ anchors, dragPreview }: Props) {
     <ViewportPortal>
       <svg style={{ position: 'absolute', top: -off, left: -off, width: EXTENT, height: EXTENT, pointerEvents: 'none', overflow: 'visible' }}>
         {shiftedD && <path d={shiftedD} fill="none" stroke="#ff5fc4" strokeWidth={1.5} strokeDasharray="4 3" />}
-        {anchors.map((a, i) => (
-          <g key={i}>
-            <circle cx={a.x + off} cy={a.y + off} r={4} fill="#fff" stroke="#ff5fc4" strokeWidth={1.5} />
-            {a.handleIn && (
-              <>
-                <line x1={a.x + off} y1={a.y + off} x2={a.x + a.handleIn.x + off} y2={a.y + a.handleIn.y + off} stroke="#ff5fc4" strokeWidth={1} strokeDasharray="2 2" />
-                <rect x={a.x + a.handleIn.x + off - 2.5} y={a.y + a.handleIn.y + off - 2.5} width={5} height={5} fill="#ff5fc4" />
-              </>
-            )}
-            {a.handleOut && (
-              <>
-                <line x1={a.x + off} y1={a.y + off} x2={a.x + a.handleOut.x + off} y2={a.y + a.handleOut.y + off} stroke="#ff5fc4" strokeWidth={1} strokeDasharray="2 2" />
-                <rect x={a.x + a.handleOut.x + off - 2.5} y={a.y + a.handleOut.y + off - 2.5} width={5} height={5} fill="#ff5fc4" />
-              </>
-            )}
-          </g>
-        ))}
+        {anchors.map((a, i) => {
+          const isCorner = !a.handleIn && !a.handleOut;
+          return (
+            <g key={i}>
+              {a.handleIn && (
+                <>
+                  <line x1={a.x + off} y1={a.y + off} x2={a.x + a.handleIn.x + off} y2={a.y + a.handleIn.y + off} stroke="#ff5fc4" strokeWidth={1} strokeDasharray="2 2" />
+                  <circle cx={a.x + a.handleIn.x + off} cy={a.y + a.handleIn.y + off} r={3} fill="#ffa8e3" stroke="#ff5fc4" strokeWidth={1} />
+                </>
+              )}
+              {a.handleOut && (
+                <>
+                  <line x1={a.x + off} y1={a.y + off} x2={a.x + a.handleOut.x + off} y2={a.y + a.handleOut.y + off} stroke="#ff5fc4" strokeWidth={1} strokeDasharray="2 2" />
+                  <circle cx={a.x + a.handleOut.x + off} cy={a.y + a.handleOut.y + off} r={3} fill="#ffa8e3" stroke="#ff5fc4" strokeWidth={1} />
+                </>
+              )}
+              {isCorner ? (
+                <rect x={a.x + off - 4} y={a.y + off - 4} width={8} height={8} fill="#fff" stroke="#ff5fc4" strokeWidth={1.5} />
+              ) : (
+                <circle cx={a.x + off} cy={a.y + off} r={4} fill="#fff" stroke="#ff5fc4" strokeWidth={1.5} />
+              )}
+            </g>
+          );
+        })}
         {dragPreview && (
           <>
             <line

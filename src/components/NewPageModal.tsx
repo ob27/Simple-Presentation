@@ -28,7 +28,11 @@ export function NewPageModal({ open, onClose, onCreate }: Props) {
   }
 
   return (
-    <Modal title="New Page" open={open} onCancel={onClose} footer={null} destroyOnClose width={520}>
+    // Widened from the original 520 — 8 category tabs (Paper/Phone/Tablet/
+    // Watch/Web/Presentation/Social/Custom) overflow into an easy-to-miss
+    // "..." dropdown at the old width, on top of Presentation/Social being
+    // long labels.
+    <Modal title="New Page" open={open} onCancel={onClose} footer={null} destroyOnClose width={680}>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 14, marginTop: 8 }}>
         <Tabs
           size="small"

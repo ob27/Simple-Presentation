@@ -1,12 +1,13 @@
 import {
   doc, getDoc, setDoc, deleteDoc, collection,
-  query, where, getDocs, updateDoc, onSnapshot, writeBatch, serverTimestamp, arrayUnion,
+  query, where, getDocs, updateDoc, onSnapshot, writeBatch, serverTimestamp, arrayUnion, arrayRemove,
 } from 'firebase/firestore';
 import { db } from './firebase';
-import type { DiagramDocument, DiagramPage, PresentationSettings } from './types/document';
-import type { DiagramNode } from './types/shapes';
+import type { DiagramDocument, DiagramPage, PresentationSettings, DiagramFolder, DiagramFolderInviteInfo, FolderRole } from './types/document';
+import type { DiagramNode, ShapeNodeData } from './types/shapes';
 import type { DiagramEdge } from './types/edges';
 import type { DiagramVariable } from './types/variables';
+import type { DiagramComment } from './types/comments';
 import { getPageDimensions } from './utils/paperSizes';
 import { DEFAULT_ORIENTATION, DEFAULT_PAPER_SIZE } from './constants';
 
@@ -217,6 +218,23 @@ export async function deleteConnector(diagramId: string, pageId: string, edgeId:
   await deleteDoc(doc(db, 'diagrams', diagramId, 'pages', pageId, 'connectors', edgeId));
 }
 
+// ── Comments ─────────────────────────────────────────────────────────────────
+
+export function subscribeComments(diagramId: string, pageId: string, onChange: (comments: DiagramComment[]) => void): () => void {
+  const col = collection(db, 'diagrams', diagramId, 'pages', pageId, 'comments');
+  return onSnapshot(col, snap => {
+    onChange(snap.docs.map(d => d.data() as DiagramComment));
+  });
+}
+
+export async function saveComment(diagramId: string, pageId: string, comment: DiagramComment): Promise<void> {
+  await setDoc(doc(db, 'diagrams', diagramId, 'pages', pageId, 'comments', comment.id), comment);
+}
+
+export async function deleteComment(diagramId: string, pageId: string, commentId: string): Promise<void> {
+  await deleteDoc(doc(db, 'diagrams', diagramId, 'pages', pageId, 'comments', commentId));
+}
+
 // ── Variables (data-bound styling) ──────────────────────────────────────────
 
 export function subscribeVariables(diagramId: string, onChange: (vars: DiagramVariable[]) => void): () => void {
@@ -258,4 +276,362 @@ export async function loadUserDiagrams(uid: string): Promise<DiagramDocument[]> 
   const col = collection(db, 'diagrams');
   const snap = await getDocs(query(col, where('ownerId', '==', uid)));
   return snap.docs.map(d => ({ id: d.id, ...d.data() } as DiagramDocument));
+}
+
+// ── Folders ──────────────────────────────────────────────────────────────────
+// Ported one-for-one from Simple AIM Kanban's folder system (src/store.ts
+// there) for UX/sharing-model consistency across the two sibling apps — same
+// Firebase project, but a separate `diagramFolders`/`diagramFolderInvites`
+// collection pair so the two apps' folders never mix.
+
+export async function createFolder(uid: string, name: string, email?: string): Promise<DiagramFolder> {
+  const id = crypto.randomUUID();
+  const inviteToken = crypto.randomUUID();
+  const editorInviteToken = crypto.randomUUID();
+  const folder: DiagramFolder = {
+    id, name, ownerId: uid, ownerEmail: email ?? '',
+    memberIds: [], editorIds: [], memberEmails: {}, diagramIds: [],
+    inviteToken, editorInviteToken, createdAt: Date.now(),
+  };
+  await Promise.all([
+    setDoc(doc(db, 'diagramFolders', id), folder),
+    setDoc(doc(db, 'diagramFolderInvites', inviteToken), {
+      folderId: id, folderName: name, ownerEmail: email ?? '', diagramIds: [], role: 'viewer',
+    }),
+    setDoc(doc(db, 'diagramFolderInvites', editorInviteToken), {
+      folderId: id, folderName: name, ownerEmail: email ?? '', diagramIds: [], role: 'editor',
+    }),
+  ]);
+  return folder;
+}
+
+export async function deleteFolder(folder: DiagramFolder): Promise<void> {
+  const ops = [
+    deleteDoc(doc(db, 'diagramFolders', folder.id)),
+    deleteDoc(doc(db, 'diagramFolderInvites', folder.inviteToken)),
+  ];
+  if (folder.editorInviteToken) {
+    ops.push(deleteDoc(doc(db, 'diagramFolderInvites', folder.editorInviteToken)));
+  }
+  await Promise.all(ops);
+}
+
+export async function renameFolder(folder: DiagramFolder, name: string): Promise<void> {
+  const ops: Promise<void>[] = [
+    updateDoc(doc(db, 'diagramFolders', folder.id), { name }),
+    updateDoc(doc(db, 'diagramFolderInvites', folder.inviteToken), { folderName: name }),
+  ];
+  if (folder.editorInviteToken) {
+    ops.push(updateDoc(doc(db, 'diagramFolderInvites', folder.editorInviteToken), { folderName: name }));
+  }
+  await Promise.all(ops);
+}
+
+// When a folder with existing members gains a new diagram, every folder
+// member/editor needs matching access on that diagram too — otherwise
+// "share the folder" wouldn't actually grant access to what's inside it.
+export async function addDiagramToFolder(
+  folder: DiagramFolder,
+  diagramId: string,
+  allDiagrams: DiagramDocument[],
+): Promise<void> {
+  const newIds = [...new Set([...folder.diagramIds, diagramId])];
+  const inviteOps: Promise<void>[] = [
+    updateDoc(doc(db, 'diagramFolders', folder.id), { diagramIds: newIds }),
+    updateDoc(doc(db, 'diagramFolderInvites', folder.inviteToken), { diagramIds: newIds }),
+  ];
+  if (folder.editorInviteToken) {
+    inviteOps.push(updateDoc(doc(db, 'diagramFolderInvites', folder.editorInviteToken), { diagramIds: newIds }));
+  }
+  await Promise.all(inviteOps);
+  if (folder.memberIds.length > 0) {
+    const diagram = allDiagrams.find(d => d.id === diagramId);
+    if (diagram && diagram.ownerId === folder.ownerId) {
+      const editorIds = folder.editorIds ?? [];
+      await Promise.all(folder.memberIds.map(memberId => {
+        const memberEmail = folder.memberEmails?.[memberId];
+        const isEditor = editorIds.includes(memberId);
+        const update: Record<string, unknown> = isEditor
+          ? { memberIds: arrayUnion(memberId) }
+          : { viewerIds: arrayUnion(memberId) };
+        if (memberEmail) update[`memberEmails.${memberId}`] = memberEmail;
+        return updateDoc(doc(db, 'diagrams', diagramId), update).catch(() => {});
+      }));
+    }
+  }
+}
+
+export async function removeDiagramFromFolder(folder: DiagramFolder, diagramId: string): Promise<void> {
+  const newIds = folder.diagramIds.filter(id => id !== diagramId);
+  await Promise.all([
+    updateDoc(doc(db, 'diagramFolders', folder.id), { diagramIds: newIds }),
+    updateDoc(doc(db, 'diagramFolderInvites', folder.inviteToken), { diagramIds: newIds }),
+  ]);
+}
+
+export function subscribeUserFolders(uid: string, onChange: (folders: DiagramFolder[]) => void): () => void {
+  const col = collection(db, 'diagramFolders');
+  const slices: Record<string, Map<string, DiagramFolder>> = {
+    owner: new Map(), member: new Map(),
+  };
+
+  function rebuild() {
+    const merged = new Map<string, DiagramFolder>();
+    for (const slice of Object.values(slices)) {
+      for (const [id, f] of slice) merged.set(id, f);
+    }
+    onChange(Array.from(merged.values()).sort((a, b) => a.createdAt - b.createdAt));
+  }
+
+  const makeUnsub = (sliceKey: string, q: ReturnType<typeof query>) =>
+    onSnapshot(q, snap => {
+      const slice = slices[sliceKey];
+      slice.clear();
+      snap.forEach(d => slice.set(d.id, { id: d.id, ...(d.data() as object) } as DiagramFolder));
+      rebuild();
+    }, () => {});
+
+  const unsubs = [
+    makeUnsub('owner', query(col, where('ownerId', '==', uid))),
+    makeUnsub('member', query(col, where('memberIds', 'array-contains', uid))),
+  ];
+  return () => unsubs.forEach(u => u());
+}
+
+export async function resolveFolderInvite(token: string): Promise<DiagramFolderInviteInfo | null> {
+  const snap = await getDoc(doc(db, 'diagramFolderInvites', token));
+  if (!snap.exists()) return null;
+  const d = snap.data();
+  return {
+    folderId: d.folderId as string,
+    folderName: d.folderName as string,
+    ownerEmail: d.ownerEmail as string,
+    diagramIds: (d.diagramIds as string[]) ?? [],
+    role: (d.role as FolderRole | undefined) ?? 'viewer',
+  };
+}
+
+export async function joinFolder(
+  folderId: string,
+  uid: string,
+  email?: string,
+  diagramIds: string[] = [],
+  role: 'editor' | 'viewer' = 'viewer',
+): Promise<void> {
+  const folderUpdate: Record<string, unknown> = { memberIds: arrayUnion(uid) };
+  if (role === 'editor') folderUpdate.editorIds = arrayUnion(uid);
+  if (email) folderUpdate[`memberEmails.${uid}`] = email;
+  await updateDoc(doc(db, 'diagramFolders', folderId), folderUpdate);
+  await Promise.all(diagramIds.map(diagramId => {
+    const diagramUpdate: Record<string, unknown> = role === 'editor'
+      ? { memberIds: arrayUnion(uid) }
+      : { viewerIds: arrayUnion(uid) };
+    if (email) diagramUpdate[`memberEmails.${uid}`] = email;
+    return updateDoc(doc(db, 'diagrams', diagramId), diagramUpdate).catch(() => {});
+  }));
+}
+
+export async function setFolderMemberRole(
+  folder: DiagramFolder,
+  uid: string,
+  newRole: 'editor' | 'viewer',
+): Promise<void> {
+  const editorIds = folder.editorIds ?? [];
+  const folderUpdate: Record<string, unknown> = {};
+  if (newRole === 'editor' && !editorIds.includes(uid)) {
+    folderUpdate.editorIds = arrayUnion(uid);
+  } else if (newRole === 'viewer' && editorIds.includes(uid)) {
+    folderUpdate.editorIds = arrayRemove(uid);
+  }
+  if (Object.keys(folderUpdate).length > 0) {
+    await updateDoc(doc(db, 'diagramFolders', folder.id), folderUpdate);
+  }
+  await Promise.all(folder.diagramIds.map(async diagramId => {
+    const diagramUpdate: Record<string, unknown> = newRole === 'editor'
+      ? { memberIds: arrayUnion(uid), viewerIds: arrayRemove(uid) }
+      : { viewerIds: arrayUnion(uid), memberIds: arrayRemove(uid) };
+    return updateDoc(doc(db, 'diagrams', diagramId), diagramUpdate).catch(() => {});
+  }));
+}
+
+export async function removeFolderMember(folder: DiagramFolder, uid: string): Promise<void> {
+  const emails = { ...(folder.memberEmails ?? {}) };
+  delete emails[uid];
+  await updateDoc(doc(db, 'diagramFolders', folder.id), {
+    memberIds: arrayRemove(uid),
+    editorIds: arrayRemove(uid),
+    memberEmails: emails,
+  });
+  await Promise.all(folder.diagramIds.map(diagramId =>
+    updateDoc(doc(db, 'diagrams', diagramId), {
+      memberIds: arrayRemove(uid),
+      viewerIds: arrayRemove(uid),
+    }).catch(() => {}),
+  ));
+}
+
+export async function generateEditorInvite(folder: DiagramFolder): Promise<string> {
+  const token = crypto.randomUUID();
+  await Promise.all([
+    updateDoc(doc(db, 'diagramFolders', folder.id), { editorInviteToken: token }),
+    setDoc(doc(db, 'diagramFolderInvites', token), {
+      folderId: folder.id,
+      folderName: folder.name,
+      ownerEmail: folder.ownerEmail ?? '',
+      diagramIds: folder.diagramIds,
+      role: 'editor',
+    }),
+  ]);
+  return token;
+}
+
+// ── Templates ────────────────────────────────────────────────────────────────
+// A template is a regular `diagrams` doc with isTemplate:true — this reuses
+// every existing subscribe/read function and rule for the full page/shape/
+// connector/variable tree, so opening a template to author/tweak it just
+// works with the existing editor, zero new code there.
+
+async function cloneDiagramContent(
+  sourceDiagramId: string,
+  newOwnerId: string,
+  newOwnerEmail: string | undefined,
+  overrides: { name: string; isTemplate?: boolean; templateCategory?: string; templateDescription?: string; templateIsBuiltIn?: boolean },
+): Promise<DiagramDocument> {
+  const sourcePagesSnap = await getDocs(collection(db, 'diagrams', sourceDiagramId, 'pages'));
+  const sourcePages = sourcePagesSnap.docs.map(d => ({ id: d.id, ...d.data() } as DiagramPage));
+  const pageIdMap = new Map<string, string>();
+  for (const p of sourcePages) pageIdMap.set(p.id, crypto.randomUUID());
+
+  // Every shape/connector across all pages is gathered — and every shape's
+  // fresh id assigned — before any cross-reference gets remapped below, since
+  // a link or dataBinding on page 1 can point at a shape/variable on page 5.
+  const shapesByPage = new Map<string, DiagramNode[]>();
+  const connectorsByPage = new Map<string, DiagramEdge[]>();
+  const shapeIdMap = new Map<string, string>();
+  for (const p of sourcePages) {
+    const shapesSnap = await getDocs(collection(db, 'diagrams', sourceDiagramId, 'pages', p.id, 'shapes'));
+    const shapes = shapesSnap.docs.map(d => ({ id: d.id, ...d.data() } as unknown as DiagramNode));
+    shapesByPage.set(p.id, shapes);
+    for (const s of shapes) shapeIdMap.set(s.id, crypto.randomUUID());
+
+    const connectorsSnap = await getDocs(collection(db, 'diagrams', sourceDiagramId, 'pages', p.id, 'connectors'));
+    connectorsByPage.set(p.id, connectorsSnap.docs.map(d => ({ id: d.id, ...d.data() } as unknown as DiagramEdge)));
+  }
+
+  const variablesSnap = await getDocs(collection(db, 'diagrams', sourceDiagramId, 'variables'));
+  const sourceVariables = variablesSnap.docs.map(d => ({ id: d.id, ...d.data() } as DiagramVariable));
+  const variableIdMap = new Map<string, string>();
+  for (const v of sourceVariables) variableIdMap.set(v.id, crypto.randomUUID());
+
+  const newDiagramId = crypto.randomUUID();
+  const newInviteToken = crypto.randomUUID();
+  const newDiagram: DiagramDocument = {
+    id: newDiagramId,
+    name: overrides.name,
+    ownerId: newOwnerId,
+    ownerEmail: newOwnerEmail ?? '',
+    coOwnerIds: [],
+    memberIds: [],
+    memberEmails: {},
+    viewerIds: [],
+    inviteToken: newInviteToken,
+    pageOrder: sourcePages.map(p => pageIdMap.get(p.id)!),
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    isTemplate: overrides.isTemplate,
+    templateCategory: overrides.templateCategory,
+    templateDescription: overrides.templateDescription,
+    templateIsBuiltIn: overrides.templateIsBuiltIn,
+  };
+
+  // The parent diagram doc must exist BEFORE any subcollection write commits —
+  // every pages/shapes/connectors rule resolves access via get() on this
+  // parent doc, and get() inside a security rule does not see other writes
+  // still pending in the same batch. Writing it here, awaited on its own
+  // (mirrors handleGroup's identical parent-before-children ordering in
+  // Canvas.tsx), guarantees it's already committed by the time the chunked
+  // batches below run.
+  await Promise.all([
+    setDoc(doc(db, 'diagrams', newDiagramId), newDiagram),
+    setDoc(doc(db, 'diagramInvites', newInviteToken), { diagramId: newDiagramId, diagramName: overrides.name, ownerId: newOwnerId }),
+  ]);
+
+  const writes: { ref: ReturnType<typeof doc>; data: object }[] = [];
+
+  for (const p of sourcePages) {
+    const newPageId = pageIdMap.get(p.id)!;
+    writes.push({ ref: doc(db, 'diagrams', newDiagramId, 'pages', newPageId), data: { ...p, id: newPageId } });
+
+    for (const s of shapesByPage.get(p.id) ?? []) {
+      const newShapeId = shapeIdMap.get(s.id)!;
+      const newParentId = s.parentId ? shapeIdMap.get(s.parentId) : undefined;
+      const data = { ...(s.data as ShapeNodeData), pageId: newPageId };
+      if (data.dataBinding) {
+        const newVarId = variableIdMap.get(data.dataBinding.variableId);
+        data.dataBinding = newVarId ? { ...data.dataBinding, variableId: newVarId } : undefined;
+      }
+      if (data.link) {
+        const newTargetPageId = data.link.targetPageId ? pageIdMap.get(data.link.targetPageId) : undefined;
+        const newTargetNodeId = data.link.targetNodeId ? shapeIdMap.get(data.link.targetNodeId) : undefined;
+        data.link = data.link.type === 'url'
+          ? data.link
+          : (newTargetPageId || newTargetNodeId) ? { ...data.link, targetPageId: newTargetPageId, targetNodeId: newTargetNodeId } : undefined;
+      }
+      writes.push({
+        ref: doc(db, 'diagrams', newDiagramId, 'pages', newPageId, 'shapes', newShapeId),
+        data: { ...s, id: newShapeId, parentId: newParentId, data },
+      });
+    }
+
+    for (const e of connectorsByPage.get(p.id) ?? []) {
+      const newSource = shapeIdMap.get(e.source);
+      const newTarget = shapeIdMap.get(e.target);
+      if (!newSource || !newTarget) continue; // dangling reference — don't carry a broken edge forward
+      const newEdgeId = crypto.randomUUID();
+      writes.push({
+        ref: doc(db, 'diagrams', newDiagramId, 'pages', newPageId, 'connectors', newEdgeId),
+        data: { ...e, id: newEdgeId, source: newSource, target: newTarget },
+      });
+    }
+  }
+
+  for (const v of sourceVariables) {
+    const newVarId = variableIdMap.get(v.id)!;
+    writes.push({ ref: doc(db, 'diagrams', newDiagramId, 'variables', newVarId), data: { ...v, id: newVarId } });
+  }
+
+  // Firestore caps a single batch at 500 writes; a template's shape count is
+  // unbounded, so commit in safely-sized chunks instead of one batch.
+  const CHUNK = 400;
+  for (let i = 0; i < writes.length; i += CHUNK) {
+    const batch = writeBatch(db);
+    for (const w of writes.slice(i, i + CHUNK)) batch.set(w.ref, w.data);
+    await batch.commit();
+  }
+
+  return newDiagram;
+}
+
+export async function saveDiagramAsTemplate(diagram: DiagramDocument, category?: string, description?: string): Promise<DiagramDocument> {
+  return cloneDiagramContent(diagram.id, diagram.ownerId, diagram.ownerEmail, {
+    name: diagram.name, isTemplate: true, templateCategory: category, templateDescription: description, templateIsBuiltIn: false,
+  });
+}
+
+export async function createDiagramFromTemplate(templateDiagramId: string, newName: string, uid: string, email?: string): Promise<DiagramDocument> {
+  return cloneDiagramContent(templateDiagramId, uid, email, { name: newName, isTemplate: false });
+}
+
+export function subscribeBuiltInTemplates(onChange: (templates: DiagramDocument[]) => void): () => void {
+  const col = collection(db, 'diagrams');
+  return onSnapshot(query(col, where('isTemplate', '==', true), where('templateIsBuiltIn', '==', true)), snap => {
+    onChange(snap.docs.map(d => ({ id: d.id, ...d.data() } as DiagramDocument)));
+  }, () => {});
+}
+
+export function subscribeMyTemplates(uid: string, onChange: (templates: DiagramDocument[]) => void): () => void {
+  const col = collection(db, 'diagrams');
+  return onSnapshot(query(col, where('isTemplate', '==', true), where('ownerId', '==', uid)), snap => {
+    onChange(snap.docs.map(d => ({ id: d.id, ...d.data() } as DiagramDocument)));
+  }, () => {});
 }

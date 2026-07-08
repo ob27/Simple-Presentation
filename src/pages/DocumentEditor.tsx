@@ -55,7 +55,7 @@ export function DocumentEditor() {
         </Tooltip>
         <div style={{ flex: 1 }} />
         <Tooltip title="Present">
-          <Button icon={<PlayCircleOutlined />} onClick={() => window.open(`/simple-diagram/d/${id}/present`, '_blank')} />
+          <Button icon={<PlayCircleOutlined />} onClick={() => window.open(`/simple-presentation/d/${id}/present`, '_blank')} />
         </Tooltip>
         <Tooltip title="Add page">
           <Button icon={<PlusOutlined />} onClick={() => setNewPageOpen(true)}>Page</Button>

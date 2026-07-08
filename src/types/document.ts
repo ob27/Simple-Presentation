@@ -39,4 +39,36 @@ export interface DiagramDocument {
   createdAt: number;
   updatedAt: number;
   presentationSettings?: PresentationSettings;
+  isTemplate?: boolean;
+  templateCategory?: string;
+  templateDescription?: string;
+  templateIsBuiltIn?: boolean;
+}
+
+export type FolderRole = 'owner' | 'editor' | 'viewer';
+
+// Mirrors Simple AIM Kanban's Folder type exactly (substituting diagramIds
+// for kanbanIds) for UX/sharing-model consistency across the two sibling
+// apps — see src/store.ts's folder functions for the full port.
+export interface DiagramFolder {
+  id: string;
+  name: string;
+  ownerId: string;
+  ownerEmail?: string;
+  memberIds: string[];
+  editorIds: string[];
+  memberEmails: Record<string, string>;
+  diagramIds: string[];
+  inviteToken: string;
+  editorInviteToken?: string;
+  createdAt: number;
+  folderLogoUrl?: string | null;
+}
+
+export interface DiagramFolderInviteInfo {
+  folderId: string;
+  folderName: string;
+  ownerEmail: string;
+  diagramIds: string[];
+  role: FolderRole;
 }

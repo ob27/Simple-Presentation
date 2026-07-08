@@ -1,4 +1,4 @@
-import { memo, useState } from 'react';
+import { memo, useState, useRef } from 'react';
 import type { NodeProps } from '@xyflow/react';
 
 export interface PageFrameNodeData extends Record<string, unknown> {
@@ -20,9 +20,26 @@ function PageFrameNodeImpl({ data }: NodeProps) {
     if (draft.trim() && draft !== pageName && pageId) onRename?.(pageId, draft.trim());
   }
 
+  // A plain onClick fires on mouseup as long as down and up both land on
+  // this div — true even after a drag-select marquee that started on the
+  // page background, since nothing here ever moves out from under the
+  // cursor. That was silently clearing the marquee's selection immediately
+  // after RF applied it. Tracking real movement (same threshold convention
+  // used for anchor click-vs-drag elsewhere) makes this only fire on an
+  // actual click.
+  const downPosRef = useRef({ x: 0, y: 0 });
+  function handleMouseDown(e: React.MouseEvent) {
+    downPosRef.current = { x: e.clientX, y: e.clientY };
+  }
+  function handleClick(e: React.MouseEvent) {
+    const dist = Math.hypot(e.clientX - downPosRef.current.x, e.clientY - downPosRef.current.y);
+    if (dist < 3) onDeselectAll?.();
+  }
+
   return (
     <div
-      onClick={() => onDeselectAll?.()}
+      onMouseDown={handleMouseDown}
+      onClick={handleClick}
       style={{
         width, height,
         background: '#fff',
