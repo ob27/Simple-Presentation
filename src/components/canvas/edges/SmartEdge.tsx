@@ -12,7 +12,7 @@ interface RuntimeEdgeData {
   __hidden?: boolean;
 }
 
-function SmartEdgeImpl({ id, source, target, style, markerEnd, selected, data }: EdgeProps) {
+function SmartEdgeImpl({ id, source, target, style, markerStart, markerEnd, selected, data }: EdgeProps) {
   const sourceNode = useInternalNode(source);
   const targetNode = useInternalNode(target);
 
@@ -56,6 +56,7 @@ function SmartEdgeImpl({ id, source, target, style, markerEnd, selected, data }:
       <BaseEdge
         id={id}
         path={path}
+        markerStart={markerStart}
         markerEnd={markerEnd}
         style={{ stroke: selected ? '#1677ff' : '#8a93a6', strokeWidth: selected ? 2 : 1.5, opacity, transition: 'opacity 0.3s', ...style }}
       />

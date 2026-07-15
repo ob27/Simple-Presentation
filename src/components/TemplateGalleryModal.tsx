@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Modal, Tabs, Input, Button, Spin, message } from 'antd';
-import { FileAddOutlined } from '@ant-design/icons';
+import { IconFileAdd } from './icons';
 import {
   subscribeBuiltInTemplates, subscribeMyTemplates, createDiagram, createDiagramFromTemplate,
 } from '../store';
@@ -16,20 +16,27 @@ interface Props {
 
 type Selection = { type: 'blank' } | { type: 'template'; template: DiagramDocument };
 
-function TemplateCard({ label, description, onClick }: { label: React.ReactNode; description?: string; onClick: () => void }) {
+function TemplateCard({ label, description, thumbnailUrl, onClick }: { label: React.ReactNode; description?: string; thumbnailUrl?: string; onClick: () => void }) {
   return (
     <div
       onClick={onClick}
       style={{
-        border: '1px solid #e6e8ef', borderRadius: 10, padding: 14, cursor: 'pointer',
-        display: 'flex', flexDirection: 'column', gap: 4, minHeight: 84,
+        border: '1px solid #e6e8ef', borderRadius: 10, cursor: 'pointer', overflow: 'hidden',
+        display: 'flex', flexDirection: 'column', minHeight: 84,
         background: '#fff', transition: 'box-shadow 0.15s',
       }}
       onMouseEnter={e => (e.currentTarget.style.boxShadow = '0 2px 10px rgba(0,0,0,0.08)')}
       onMouseLeave={e => (e.currentTarget.style.boxShadow = 'none')}
     >
-      <span style={{ fontWeight: 600, fontSize: 14, color: '#1a1a2e' }}>{label}</span>
-      {description && <span style={{ fontSize: 12, color: '#888' }}>{description}</span>}
+      {thumbnailUrl && (
+        <div style={{ height: 90, background: '#f8f9fb', borderBottom: '1px solid #f0f0f0', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <img src={thumbnailUrl} alt="" style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
+        </div>
+      )}
+      <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 4 }}>
+        <span style={{ fontWeight: 600, fontSize: 14, color: '#1a1a2e' }}>{label}</span>
+        {description && <span style={{ fontSize: 12, color: '#888' }}>{description}</span>}
+      </div>
     </div>
   );
 }
@@ -88,7 +95,7 @@ export function TemplateGalleryModal({ open, uid, email, onClose, onCreated }: P
     ) : (
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 10, paddingTop: 4 }}>
         {templates.map(t => (
-          <TemplateCard key={t.id} label={t.name} description={t.templateDescription} onClick={() => chooseTemplate(t)} />
+          <TemplateCard key={t.id} label={t.name} description={t.templateDescription} thumbnailUrl={t.templateThumbnailUrl} onClick={() => chooseTemplate(t)} />
         ))}
       </div>
     )
@@ -118,7 +125,7 @@ export function TemplateGalleryModal({ open, uid, email, onClose, onCreated }: P
       ) : (
         <>
           <div style={{ marginBottom: 12 }}>
-            <TemplateCard label={<span><FileAddOutlined /> Start blank</span>} description="A single blank page" onClick={chooseBlank} />
+            <TemplateCard label={<span><IconFileAdd /> Start blank</span>} description="A single blank page" onClick={chooseBlank} />
           </div>
           <Tabs
             size="small"

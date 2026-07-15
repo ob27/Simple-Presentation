@@ -1,15 +1,22 @@
 import { memo, useState } from 'react';
 import { NodeResizer, useReactFlow, type NodeProps } from '@xyflow/react';
-import { LinkOutlined } from '@ant-design/icons';
-import type { ShapeNodeData, PieSegment } from '../../../types/shapes';
+import { IconLink } from '../../icons';
+import type { ShapeNodeData, PieSegment, ChartDataPoint } from '../../../types/shapes';
 import type { ResolvedStyle } from '../../../utils/shapeStyleResolver';
 import { getAntdIconComponent } from '../../../utils/iconRegistry';
+import { buildGradientCss } from '../../../utils/gradient';
 import { DEFAULT_PIE_SEGMENTS } from '../../../utils/pieDefaults';
+import { DEFAULT_CHART_DATA } from '../../../utils/chartDefaults';
 import { BrushStamps } from '../BrushStamps';
 import { useRotateHandle } from './useRotateHandle';
 import { RotateHandle } from './RotateHandle';
 import { ConnectionHandles } from './ConnectionHandles';
 import { EdgeResizeHandles } from './EdgeResizeHandles';
+import { useShiftHeld } from './useShiftHeld';
+import { RichTextEditor } from './RichTextEditor';
+import { RichTextDisplay } from './RichTextDisplay';
+import { richTextFromLabel } from '../../../utils/richText';
+import { TableGrid } from './TableGrid';
 
 // Kinds whose outline can't be drawn with a plain CSS border — clip-path
 // cuts the box down to the polygon shape, which clips the rectangular border
@@ -259,6 +266,50 @@ function PieChartSvg({ segments, innerRadiusFrac }: { segments?: PieSegment[]; i
   );
 }
 
+// Hand-rolled SVG, same convention as PieChartSvg above — bars/a polyline
+// are strictly simpler than the arc math pie charts already need, so a
+// charting library isn't warranted here either. Static data only (no live
+// variable binding — see ChartDataPoint's doc comment for why).
+function ChartSvg({ chartType, data }: { chartType?: 'bar' | 'line'; data?: ChartDataPoint[] }) {
+  const points = data && data.length > 0 ? data : DEFAULT_CHART_DATA;
+  const maxValue = Math.max(1, ...points.map(p => Math.max(0, p.value)));
+  const padding = 6;
+  const plotW = 100 - padding * 2;
+  const plotH = 100 - padding * 2;
+  const n = points.length;
+
+  if (chartType === 'line') {
+    const stepX = n > 1 ? plotW / (n - 1) : 0;
+    const coords = points.map((p, i) => ({
+      x: padding + i * stepX,
+      y: padding + plotH * (1 - Math.max(0, p.value) / maxValue),
+      p,
+    }));
+    const path = coords.map((c, i) => `${i === 0 ? 'M' : 'L'}${c.x},${c.y}`).join(' ');
+    return (
+      <svg width="100%" height="100%" viewBox="0 0 100 100" style={{ position: 'absolute', inset: 0 }}>
+        <line x1={padding} y1={100 - padding} x2={100 - padding} y2={100 - padding} stroke="#e6e8ef" strokeWidth={0.5} />
+        <path d={path} fill="none" stroke={coords[0]?.p.color ?? '#7C93E8'} strokeWidth={1.5} vectorEffect="non-scaling-stroke" />
+        {coords.map((c, i) => <circle key={points[i].id} cx={c.x} cy={c.y} r={2} fill={c.p.color} />)}
+      </svg>
+    );
+  }
+
+  const gap = plotW / n * 0.2;
+  const barW = plotW / n - gap;
+  return (
+    <svg width="100%" height="100%" viewBox="0 0 100 100" style={{ position: 'absolute', inset: 0 }}>
+      <line x1={padding} y1={100 - padding} x2={100 - padding} y2={100 - padding} stroke="#e6e8ef" strokeWidth={0.5} />
+      {points.map((p, i) => {
+        const h = plotH * (Math.max(0, p.value) / maxValue);
+        const x = padding + i * (barW + gap) + gap / 2;
+        const y = 100 - padding - h;
+        return <rect key={p.id} x={x} y={y} width={barW} height={h} fill={p.color} />;
+      })}
+    </svg>
+  );
+}
+
 function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
   const shapeData = data as unknown as ShapeNodeData & ShapeNodeRuntimeData & {
     __resolvedStyle?: ResolvedStyle; __dimmed?: boolean; __hidden?: boolean;
@@ -271,9 +322,30 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
   const resolved = shapeData.__resolvedStyle;
   const fill = resolved?.fill ?? shapeData.fillColor
     ?? (isArchimateElement ? ARCHIMATE_LAYER_COLORS[shapeData.archimateLayer ?? 'application'] : defaultFill(shapeData.kind));
+  // A data-binding rule's resolved fill (dynamic, conditional) wins over a
+  // manually-set gradient (static) — same precedence as opacity above.
+  const fillCss = (!resolved?.fill && shapeData.fillGradient) ? buildGradientCss(shapeData.fillGradient) : fill;
   const stroke = resolved?.strokeColor ?? shapeData.strokeColor ?? '#7C93E8';
   const strokeWidth = resolved?.strokeWidth ?? shapeData.strokeWidth ?? (shapeData.kind === 'text' ? 0 : 1.5);
-  const opacity = shapeData.__hidden ? 0 : shapeData.__dimmed ? 0.2 : (resolved?.opacity ?? 1);
+  const baseOpacity = (shapeData.opacity ?? 100) / 100;
+  const opacity = shapeData.__hidden ? 0 : shapeData.__dimmed ? 0.2 : (resolved?.opacity ?? baseOpacity);
+  const blurFilter = shapeData.blur ? `blur(${shapeData.blur}px)` : undefined;
+  // flyIn/zoom entrance animations add a transform here, on the OUTERMOST
+  // wrapper — every kind-specific branch below already has its own opacity
+  // transition (each with its own inner rotation transform), so composing
+  // an entrance transform on a shared parent avoids touching/duplicating
+  // that per-branch logic while still animating in lockstep with the
+  // existing opacity fade. 'fade' (the default, matching every shape's
+  // pre-existing behavior) adds no transform at all.
+  const animationDurationMs = shapeData.animationDuration ?? 300;
+  const entranceTransform = shapeData.__hidden
+    ? shapeData.animationType === 'flyIn' ? 'translateY(24px)'
+      : shapeData.animationType === 'zoom' ? 'scale(0.5)'
+        : undefined
+    : undefined;
+  const entranceTransition = shapeData.animationType && shapeData.animationType !== 'fade'
+    ? `transform ${animationDurationMs}ms ease`
+    : undefined;
   const rotation = shapeData.rotation ?? 0;
   const isSharpCorneredByDefault = ['umlClass', 'umlPackage', 'umlComponent', 'umlNote', 'archimateElement'].includes(shapeData.kind);
   const cornerRadius = shapeData.cornerRadius ?? (isSharpCorneredByDefault ? 0 : 4);
@@ -290,17 +362,21 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
   const isUmlNote = shapeData.kind === 'umlNote';
   const isIcon = shapeData.kind === 'icon';
   const isPieChart = shapeData.kind === 'pieChart';
+  const isChart = shapeData.kind === 'chart';
+  const isTable = shapeData.kind === 'table';
   const isBrushStroke = shapeData.kind === 'brushStroke';
   const isCurved = CURVED_KINDS.has(shapeData.kind);
   const IconComponent = isIcon && shapeData.iconName ? getAntdIconComponent(shapeData.iconName) : undefined;
   // Kinds whose visual identity comes entirely from custom content (an icon
-  // glyph, a pie's own slices, a vector outline) rather than the generic
-  // rect fill/border — the plain box underneath must stay invisible so it
-  // doesn't show through as a stray rectangle behind/around that content.
-  const noBoxDecoration = isText || isIcon || isPieChart || POLYGON_KINDS.has(shapeData.kind) || isCurved;
+  // glyph, a pie's own slices, a vector outline, a table's own per-cell
+  // borders) rather than the generic rect fill/border — the plain box
+  // underneath must stay invisible so it doesn't show through as a stray
+  // rectangle behind/around that content.
+  const noBoxDecoration = isText || isIcon || isPieChart || isChart || isTable || POLYGON_KINDS.has(shapeData.kind) || isCurved;
   const containerTheme = shapeData.containerTheme ?? 'plain';
   const isPolygon = POLYGON_KINDS.has(shapeData.kind);
   const locked = !!shapeData.locked;
+  const shiftHeld = useShiftHeld(!!selected && !locked);
   const effect = shapeData.effect ?? (isStickyNote ? 'shadow' : 'none');
   const effectShadow = effectBoxShadow(effect);
   // "float"/"glow" are CSS animations (see index.css), not static values — a
@@ -316,6 +392,12 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
     if (draft === shapeData.label) return;
     updateNodeData(id, { label: draft });
     shapeData.onCommit?.(id, { label: draft });
+  }
+
+  function commitRichText(paragraphs: NonNullable<ShapeNodeData['richText']>, plainText: string) {
+    setEditing(false);
+    updateNodeData(id, { richText: paragraphs, label: plainText });
+    shapeData.onCommit?.(id, { richText: paragraphs, label: plainText });
   }
 
   const onRotateStart = useRotateHandle(id, rotation, shapeData.onCommit);
@@ -344,9 +426,28 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
   }
 
   return (
-    <div style={{ width: '100%', height: '100%', position: 'relative' }} onMouseDown={handleMouseDown}>
-      <NodeResizer isVisible={selected && !locked} minWidth={24} minHeight={24} lineStyle={{ borderColor: '#1677ff' }} handleStyle={{ width: 8, height: 8, borderRadius: 2 }} />
-      {selected && !locked && <EdgeResizeHandles minWidth={24} minHeight={24} />}
+    // `filter` here (not scoped to just the shape's own content) means the
+    // resize/rotate handles below blur slightly too while a blurred shape is
+    // selected — a minor, worth-it tradeoff against threading blur through
+    // every one of this component's many per-kind rendering branches below.
+    <div
+      style={{
+        width: '100%', height: '100%', position: 'relative', filter: blurFilter,
+        transform: entranceTransform, transition: entranceTransition,
+      }}
+      onMouseDown={handleMouseDown}
+    >
+      <NodeResizer
+        isVisible={selected && !locked} minWidth={24} minHeight={24} keepAspectRatio={shiftHeld}
+        // zIndex keeps these above the shape's own content div, which sits
+        // later in the DOM and would otherwise win the default DOM-order
+        // stacking at any point along the border it fully covers (only the
+        // corners escaped this by accident, when cornerRadius rounds the
+        // content div's hit-testable area away from the exact vertex).
+        lineStyle={{ borderColor: '#1677ff', zIndex: 10 }}
+        handleStyle={{ width: 8, height: 8, borderRadius: 2, zIndex: 10 }}
+      />
+      {selected && !locked && <EdgeResizeHandles minWidth={24} minHeight={24} keepAspectRatio={shiftHeld} />}
 
       {selected && !locked && <RotateHandle onMouseDown={onRotateStart} />}
 
@@ -361,11 +462,11 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
             border: shapeData.readOnly ? 'none' : '1.5px dashed #ff5fc4',
             background: shapeData.readOnly ? 'transparent' : 'rgba(255, 95, 196, 0.12)',
             opacity: shapeData.readOnly ? 0 : opacity,
-            transition: 'opacity 0.3s',
+            transition: `opacity ${animationDurationMs}ms`,
           }}
         />
       ) : isImage ? (
-        <div style={{ width: '100%', height: '100%', transform: `rotate(${rotation}deg)`, opacity, transition: 'opacity 0.3s' }}>
+        <div style={{ width: '100%', height: '100%', transform: `rotate(${rotation}deg)`, opacity, transition: `opacity ${animationDurationMs}ms` }}>
           {shapeData.imageUrl ? (
             <img
               src={shapeData.imageUrl}
@@ -378,7 +479,7 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
           )}
         </div>
       ) : isVideo ? (
-        <div style={{ width: '100%', height: '100%', transform: `rotate(${rotation}deg)`, opacity, transition: 'opacity 0.3s' }}>
+        <div style={{ width: '100%', height: '100%', transform: `rotate(${rotation}deg)`, opacity, transition: `opacity ${animationDurationMs}ms` }}>
           {shapeData.videoUrl ? (
             <video
               src={shapeData.videoUrl}
@@ -405,7 +506,7 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
       ) : isActor ? (
         <div
           style={{
-            width: '100%', height: '100%', opacity, transition: 'opacity 0.3s',
+            width: '100%', height: '100%', opacity, transition: `opacity ${animationDurationMs}ms`,
             transform: `rotate(${rotation}deg)`,
             display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 2,
           }}
@@ -429,7 +530,7 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
         <svg
           width="100%" height="100%" preserveAspectRatio="none"
           viewBox={`0 0 ${shapeData.brushViewBoxWidth ?? 100} ${shapeData.brushViewBoxHeight ?? 100}`}
-          style={{ display: 'block', opacity, transition: 'opacity 0.3s' }}
+          style={{ display: 'block', opacity, transition: `opacity ${animationDurationMs}ms` }}
         >
           <BrushStamps
             points={shapeData.brushPoints ?? []}
@@ -441,13 +542,13 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
       ) : isContainer ? (
         <div
           style={{
-            width: '100%', height: '100%', opacity, transition: 'opacity 0.3s, background 0.3s',
+            width: '100%', height: '100%', opacity, transition: `opacity ${animationDurationMs}ms, background 0.3s`,
             transform: `rotate(${rotation}deg)`,
             boxSizing: 'border-box', position: 'relative',
             borderRadius: cornerRadius,
             border: `${strokeWidth}px solid ${stroke}`,
             borderStyle: borderStyleFor(shapeData.strokeStyle),
-            background: containerTheme === 'filled' ? fill : 'transparent',
+            background: containerTheme === 'filled' ? fillCss : 'transparent',
             boxShadow: effectShadow,
           }}
           onDoubleClick={() => { if (shapeData.readOnly || locked) return; setDraft(shapeData.label ?? ''); setEditing(true); }}
@@ -514,23 +615,23 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
           style={{
             width: '100%', height: '100%',
             transform: effect === 'float' ? undefined : `rotate(${rotation}deg)`,
-            transition: 'background 0.3s, opacity 0.3s',
+            transition: `background 0.3s, opacity ${animationDurationMs}ms`,
             opacity,
             display: 'flex',
             alignItems: isUmlClass ? 'flex-start' : isText ? (ALIGN_ITEMS_BY_VERTICAL[shapeData.verticalAlign ?? 'middle']) : 'center',
             justifyContent: isText ? (JUSTIFY_BY_ALIGN[shapeData.textAlign ?? 'center']) : 'center',
-            background: noBoxDecoration ? 'transparent' : fill,
+            background: noBoxDecoration ? 'transparent' : fillCss,
             border: noBoxDecoration ? 'none' : `${strokeWidth}px solid ${stroke}`,
             borderStyle: noBoxDecoration ? undefined : borderStyleFor(shapeData.strokeStyle),
             boxShadow: noBoxDecoration ? undefined : effectShadow,
             boxSizing: 'border-box',
-            padding: isUmlClass ? '8px 6px 6px' : isIcon || isPieChart ? 0 : 6,
+            padding: isUmlClass ? '8px 6px 6px' : isIcon || isPieChart || isChart ? 0 : 6,
             position: 'relative',
             ...(isPolygon || isCurved ? {} : shapeClipStyle(shapeData.kind, cornerRadius)),
             ...(effect === 'float' ? { ['--sd-rot' as string]: `${rotation}deg` } as React.CSSProperties : {}),
             ...(isPolygon || isCurved ? {} : effect === 'glow' ? glowCssVars : {}),
           }}
-          onDoubleClick={() => { if (shapeData.readOnly || locked) return; setDraft(shapeData.label ?? ''); setEditing(true); }}
+          onDoubleClick={() => { if (shapeData.readOnly || locked || isTable) return; setDraft(shapeData.label ?? ''); setEditing(true); }}
         >
           {isPolygon && (
             <svg
@@ -574,6 +675,23 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
           )}
           {isPieChart && (
             <PieChartSvg segments={shapeData.pieSegments} innerRadiusFrac={shapeData.pieInnerRadius} />
+          )}
+          {isChart && (
+            <ChartSvg chartType={shapeData.chartType} data={shapeData.chartData} />
+          )}
+          {isTable && (
+            <TableGrid
+              rows={shapeData.tableRows ?? 1}
+              cols={shapeData.tableCols ?? 1}
+              cells={shapeData.tableCells ?? []}
+              stroke={stroke}
+              fontSize={shapeData.fontSize ?? 12}
+              locked={locked}
+              onCommitCells={cells => {
+                updateNodeData(id, { tableCells: cells });
+                shapeData.onCommit?.(id, { tableCells: cells });
+              }}
+            />
           )}
           {isIcon && (
             IconComponent
@@ -628,7 +746,16 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
               <path d="M0,0 L16,16" stroke={stroke} strokeWidth={strokeWidth} />
             </svg>
           )}
-          {editing ? (
+          {isTable ? null : editing && isText ? (
+            <RichTextEditor
+              paragraphs={shapeData.richText ?? richTextFromLabel(shapeData.label ?? '')}
+              baseStyle={textStyle}
+              baseColorHex={shapeData.fontColor ?? '#1a1a2e'}
+              textAlign={shapeData.textAlign ?? 'center'}
+              onCommit={commitRichText}
+              onCancel={() => setEditing(false)}
+            />
+          ) : editing ? (
             <input
               autoFocus
               value={draft}
@@ -636,16 +763,23 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
               onBlur={commitLabel}
               onKeyDown={e => { if (e.key === 'Enter') commitLabel(); if (e.key === 'Escape') setEditing(false); }}
               style={{
-                width: '100%', textAlign: isText ? (shapeData.textAlign ?? 'center') : 'center', border: 'none', outline: 'none',
+                width: '100%', textAlign: 'center', border: 'none', outline: 'none',
                 background: 'transparent', fontFamily: 'inherit',
-                ...(isText ? textStyle : { fontSize: 13 }),
+                fontSize: 13,
               }}
+            />
+          ) : isText ? (
+            <RichTextDisplay
+              paragraphs={shapeData.richText}
+              label={shapeData.label}
+              style={textStyle}
+              textAlign={shapeData.textAlign ?? 'center'}
             />
           ) : (
             <span style={{
-              textAlign: isText ? (shapeData.textAlign ?? 'center') : 'center', wordBreak: 'break-word', userSelect: 'none',
+              textAlign: 'center', wordBreak: 'break-word', userSelect: 'none',
               fontFamily: isStickyNote ? "'Segoe Print', 'Bradley Hand', cursive" : 'inherit',
-              ...(isText ? textStyle : { fontSize: 13, color: '#1a1a2e' }),
+              fontSize: 13, color: '#1a1a2e',
             }}>
               {shapeData.label}
             </span>
@@ -663,7 +797,7 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
             fontSize: 10, cursor: 'pointer', zIndex: 6, border: '1.5px solid #fff', boxShadow: '0 1px 3px rgba(0,0,0,0.25)',
           }}
         >
-          <LinkOutlined />
+          <IconLink />
         </div>
       )}
 

@@ -1,4 +1,4 @@
-import { NodeResizeControl, ResizeControlVariant } from '@xyflow/react';
+import { NodeResizeControl, ResizeControlVariant, type OnResizeEnd } from '@xyflow/react';
 
 const EDGE_POSITIONS = ['top', 'right', 'bottom', 'left'] as const;
 
@@ -11,7 +11,28 @@ const EDGE_POSITIONS = ['top', 'right', 'bottom', 'left'] as const;
 // dot at each edge's midpoint, on top of the existing Line — same visual
 // style as the corner handles, so all 8 standard resize points are
 // obviously there.
-export function EdgeResizeHandles({ minWidth, minHeight }: { minWidth: number; minHeight: number }) {
+//
+// These are independent NodeResizeControl instances, not just a visual
+// overlay on top of NodeResizer's own (invisible) line controls — dragging
+// one of these dots runs its own resize entirely, so a caller that needs to
+// know when a resize finishes (e.g. GroupNode, to rescale its children) must
+// pass `onResizeEnd` here too, not only to the sibling `<NodeResizer>`.
+//
+// zIndex is required, not cosmetic: these controls are siblings rendered
+// before the shape's own content div, so with no z-index they'd lose the
+// default DOM-order stacking to that content div, which fully covers the
+// same edge-midpoint pixel — silently swallowing the drag. (Corner handles
+// happened to escape this by sitting exactly on a rounded corner, outside
+// the content div's hit-testable area — an accident of corner-radius, not
+// a real fix, so it's addressed the same way here.)
+export function EdgeResizeHandles({
+  minWidth, minHeight, keepAspectRatio, onResizeEnd,
+}: {
+  minWidth: number;
+  minHeight: number;
+  keepAspectRatio?: boolean;
+  onResizeEnd?: OnResizeEnd;
+}) {
   return (
     <>
       {EDGE_POSITIONS.map(position => (
@@ -21,7 +42,9 @@ export function EdgeResizeHandles({ minWidth, minHeight }: { minWidth: number; m
           variant={ResizeControlVariant.Handle}
           minWidth={minWidth}
           minHeight={minHeight}
-          style={{ width: 8, height: 8, borderRadius: 2 }}
+          keepAspectRatio={keepAspectRatio}
+          onResizeEnd={onResizeEnd}
+          style={{ width: 8, height: 8, borderRadius: 2, zIndex: 10 }}
         />
       ))}
     </>

@@ -48,7 +48,6 @@ export function LoginScreen({ redirectAfterLogin }: Props) {
           <div style={{ fontSize: 24, fontWeight: 800, color: '#1a1a2e', letterSpacing: '-0.5px' }}>
             Simple Presentation
           </div>
-          <div style={{ fontSize: 12, color: '#aaa', marginTop: 2, fontWeight: 500 }}>by Oestler</div>
           <div style={{ fontSize: 13, color: '#888', marginTop: 8 }}>
             {mode === 'signin' ? 'Sign in to access your diagrams' : 'Reset your password'}
           </div>

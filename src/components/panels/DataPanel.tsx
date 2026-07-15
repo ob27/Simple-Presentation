@@ -1,8 +1,9 @@
 import { useState, useRef } from 'react';
 import { Table, Button, Input, InputNumber, Modal, message, Tooltip } from 'antd';
-import { PlusOutlined, DeleteOutlined, UploadOutlined, CloseOutlined } from '@ant-design/icons';
+import { IconAdd, IconDelete, IconUpload, IconClose } from '../icons';
 import type { DiagramVariable } from '../../types/variables';
 import { importVariablesCsv } from '../../utils/variableCsvImport';
+import { PeekableDrawer } from './PeekableDrawer';
 
 interface Props {
   variables: DiagramVariable[];
@@ -47,20 +48,16 @@ export function DataPanel({ variables, onUpsert, onDelete, onClose }: Props) {
   }
 
   return (
-    <div style={{
-      position: 'absolute', top: 0, right: 0, bottom: 0, width: 300, zIndex: 15,
-      background: '#fff', borderLeft: '1px solid #e6e8ef', boxShadow: '-2px 0 8px rgba(0,0,0,0.05)',
-      display: 'flex', flexDirection: 'column',
-    }}>
+    <PeekableDrawer>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', borderBottom: '1px solid #f0f0f0' }}>
         <span style={{ fontWeight: 600, fontSize: 13, color: '#1a1a2e' }}>Data</span>
-        <Button size="small" type="text" icon={<CloseOutlined />} onClick={onClose} />
+        <Button size="small" type="text" icon={<IconClose />} onClick={onClose} />
       </div>
 
       <div style={{ padding: '10px 14px', display: 'flex', gap: 8, borderBottom: '1px solid #f0f0f0' }}>
-        <Button size="small" icon={<PlusOutlined />} onClick={() => setAddOpen(true)}>Variable</Button>
+        <Button size="small" icon={<IconAdd />} onClick={() => setAddOpen(true)}>Variable</Button>
         <Tooltip title="Import CSV (columns: Name,Value)">
-          <Button size="small" icon={<UploadOutlined />} onClick={() => fileRef.current?.click()}>CSV</Button>
+          <Button size="small" icon={<IconUpload />} onClick={() => fileRef.current?.click()}>CSV</Button>
         </Tooltip>
         <input ref={fileRef} type="file" accept=".csv" style={{ display: 'none' }} onChange={handleCsvUpload} />
       </div>
@@ -85,7 +82,7 @@ export function DataPanel({ variables, onUpsert, onDelete, onClose }: Props) {
             {
               title: '', key: 'actions', width: 32,
               render: (_: unknown, record: DiagramVariable) => (
-                <Button size="small" type="text" danger icon={<DeleteOutlined />} onClick={() => onDelete(record.id)} />
+                <Button size="small" type="text" danger icon={<IconDelete />} onClick={() => onDelete(record.id)} />
               ),
             },
           ]}
@@ -106,6 +103,6 @@ export function DataPanel({ variables, onUpsert, onDelete, onClose }: Props) {
           <InputNumber placeholder="Initial value" value={newValue} onChange={v => setNewValue(v ?? 0)} style={{ width: '100%' }} />
         </div>
       </Modal>
-    </div>
+    </PeekableDrawer>
   );
 }

@@ -1,8 +1,10 @@
 import { useState } from 'react';
 import { Modal, Tag, Select, Button, message, Popconfirm } from 'antd';
-import { UserOutlined, DeleteOutlined } from '@ant-design/icons';
+import { IconDelete } from './icons';
 import type { DiagramFolder } from '../types/document';
 import { setFolderMemberRole, removeFolderMember } from '../store';
+import { useUserProfiles, resolveDisplay } from '../utils/userProfiles';
+import { CommentAvatar } from './canvas/CommentAvatar';
 
 interface Props {
   open: boolean;
@@ -41,6 +43,7 @@ export function FolderMembersModal({ open, folder, onClose }: Props) {
     email: folder.memberEmails?.[uid] ?? uid,
     role: editorIds.includes(uid) ? 'editor' as const : 'viewer' as const,
   }));
+  const profiles = useUserProfiles(members.map(m => m.uid));
 
   return (
     <Modal
@@ -56,14 +59,16 @@ export function FolderMembersModal({ open, folder, onClose }: Props) {
         </div>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          {members.map(m => (
+          {members.map(m => {
+            const display = resolveDisplay(m.uid, m.email, profiles);
+            return (
             <div key={m.uid} style={{
               display: 'flex', alignItems: 'center', gap: 10,
               padding: '10px 12px', background: '#f9f9fb', borderRadius: 8,
             }}>
-              <UserOutlined style={{ color: '#aaa', fontSize: 14, flexShrink: 0 }} />
+              <CommentAvatar seed={display.avatarSeed} photoURL={display.avatarPhotoURL} size={22} />
               <span style={{ flex: 1, fontSize: 13, color: '#333', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {m.email}
+                {display.name}
               </span>
               <Select
                 size="small"
@@ -88,13 +93,14 @@ export function FolderMembersModal({ open, folder, onClose }: Props) {
                   type="text"
                   size="small"
                   danger
-                  icon={<DeleteOutlined />}
+                  icon={<IconDelete />}
                   loading={busy === m.uid + '_remove'}
                   style={{ flexShrink: 0 }}
                 />
               </Popconfirm>
             </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </Modal>

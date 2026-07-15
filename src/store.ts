@@ -1,15 +1,16 @@
 import {
-  doc, getDoc, setDoc, deleteDoc, collection,
+  doc, getDoc, getDocFromServer, setDoc, deleteDoc, collection,
   query, where, getDocs, updateDoc, onSnapshot, writeBatch, serverTimestamp, arrayUnion, arrayRemove,
 } from 'firebase/firestore';
 import { db } from './firebase';
-import type { DiagramDocument, DiagramPage, PresentationSettings, DiagramFolder, DiagramFolderInviteInfo, FolderRole } from './types/document';
+import type { DiagramDocument, DiagramPage, PresentationSettings, PresentState, DiagramFolder, DiagramFolderInviteInfo, FolderRole } from './types/document';
 import type { DiagramNode, ShapeNodeData } from './types/shapes';
 import type { DiagramEdge } from './types/edges';
 import type { DiagramVariable } from './types/variables';
 import type { DiagramComment } from './types/comments';
 import { getPageDimensions } from './utils/paperSizes';
 import { DEFAULT_ORIENTATION, DEFAULT_PAPER_SIZE } from './constants';
+import { buildTemplateThumbnailSvgDataUrl } from './utils/templateThumbnail';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -103,10 +104,28 @@ export async function updatePresentationSettings(diagramId: string, patch: Parti
   await updateDoc(doc(db, 'diagrams', diagramId), updates);
 }
 
+// Deliberately does NOT bump `updatedAt` — this fires on every slide
+// advance while presenting, which isn't a content edit and shouldn't bump
+// the diagram to the top of a "recently edited" list.
+export async function updatePresentState(diagramId: string, state: PresentState): Promise<void> {
+  await updateDoc(doc(db, 'diagrams', diagramId), { presentState: state });
+}
+
 export function subscribeDiagram(diagramId: string, onChange: (diagram: DiagramDocument | null) => void): () => void {
-  return onSnapshot(doc(db, 'diagrams', diagramId), snap => {
-    onChange(snap.exists() ? ({ id: snap.id, ...snap.data() } as DiagramDocument) : null);
-  });
+  const ref = doc(db, 'diagrams', diagramId);
+  function emit(snap: { exists: () => boolean; id: string; data: () => unknown }) {
+    onChange(snap.exists() ? ({ id: snap.id, ...(snap.data() as object) } as DiagramDocument) : null);
+  }
+  const unsub = onSnapshot(ref, emit);
+  // The realtime listener has been observed to occasionally miss a push
+  // from another tab/client entirely (seen concretely with Presenter View's
+  // cross-tab presentState sync — a page-change navigated from the
+  // presenter tab sometimes never arrived at the audience tab's listener,
+  // even after several seconds). This periodic re-fetch is a cheap safety
+  // net: any missed push self-corrects within a few seconds instead of the
+  // subscriber staying silently stale for the rest of the session.
+  const pollId = setInterval(() => { getDocFromServer(ref).then(emit).catch(() => {}); }, 3000);
+  return () => { unsub(); clearInterval(pollId); };
 }
 
 export async function deleteDiagram(diagram: DiagramDocument): Promise<void> {
@@ -139,18 +158,28 @@ export interface NewPageOptions {
   customHeight?: number;
 }
 
-export async function addPage(diagramId: string, afterOrder: number, options: NewPageOptions = {}): Promise<DiagramPage> {
+// `afterOrder` is the order of the page this one should land immediately
+// after (-1 to insert before every page). Any existing page at or past that
+// slot gets bumped by one in the same batch, so `order` stays a gapless
+// 0..n-1 sequence no matter where the insert happens — subscribePages sorts
+// by it, and everything downstream (thumbnail order, Canvas's pageOrigins)
+// depends on that invariant holding.
+export async function addPage(diagramId: string, pages: DiagramPage[], afterOrder: number, options: NewPageOptions = {}): Promise<DiagramPage> {
+  const newOrder = afterOrder + 1;
   const pageId = crypto.randomUUID();
   const page: DiagramPage = {
     id: pageId,
-    name: options.name ?? `Page ${afterOrder + 2}`,
-    order: afterOrder + 1,
+    name: options.name ?? `Page ${newOrder + 1}`,
+    order: newOrder,
     paperSize: options.paperSize ?? DEFAULT_PAPER_SIZE,
     orientation: options.orientation ?? DEFAULT_ORIENTATION,
     customWidth: options.customWidth,
     customHeight: options.customHeight,
   };
   const batch = writeBatch(db);
+  for (const p of pages) {
+    if (p.order >= newOrder) batch.update(doc(db, 'diagrams', diagramId, 'pages', p.id), { order: p.order + 1 });
+  }
   batch.set(doc(db, 'diagrams', diagramId, 'pages', pageId), page);
   batch.update(doc(db, 'diagrams', diagramId), { updatedAt: Date.now() });
   await batch.commit();
@@ -159,6 +188,34 @@ export async function addPage(diagramId: string, afterOrder: number, options: Ne
 
 export async function updatePage(diagramId: string, pageId: string, patch: Partial<DiagramPage>): Promise<void> {
   await updateDoc(doc(db, 'diagrams', diagramId, 'pages', pageId), patch);
+}
+
+// A master page lives in the same `pages` subcollection as everything else
+// (reusing subscribePages/updatePage/deletePage unchanged) but is flagged
+// isMaster so it's filtered out of the regular, navigable/orderable page
+// list — its own `order` value is therefore never read for display and
+// paperSize/orientation are only set because DiagramPage requires them, not
+// because a master is ever actually rendered as a real page.
+export async function addMasterPage(diagramId: string, name: string): Promise<DiagramPage> {
+  const pageId = crypto.randomUUID();
+  const page: DiagramPage = {
+    id: pageId,
+    name,
+    order: -1,
+    paperSize: DEFAULT_PAPER_SIZE,
+    orientation: DEFAULT_ORIENTATION,
+    isMaster: true,
+  };
+  await setDoc(doc(db, 'diagrams', diagramId, 'pages', pageId), page);
+  return page;
+}
+
+export async function reorderPages(diagramId: string, orderedPageIds: string[]): Promise<void> {
+  const batch = writeBatch(db);
+  orderedPageIds.forEach((pageId, index) => {
+    batch.update(doc(db, 'diagrams', diagramId, 'pages', pageId), { order: index });
+  });
+  await batch.commit();
 }
 
 export async function deletePage(diagramId: string, pageId: string): Promise<void> {
@@ -612,10 +669,180 @@ async function cloneDiagramContent(
   return newDiagram;
 }
 
+// ── Version history ──────────────────────────────────────────────────────────
+// An explicit, user-triggered snapshot of a diagram's entire live content
+// (every page, its shapes/connectors, and the document's variables) stored as
+// one flattened doc — not a continuous/automatic history, since this repo has
+// no Cloud Functions to drive that server-side. Distinct from undo/redo
+// (which is a per-tab, in-memory-only command stack): a version survives a
+// reload and can be restored by anyone with access to the diagram.
+const MAX_VERSIONS = 20;
+
+export interface DiagramVersion {
+  id: string;
+  createdAt: number;
+  createdBy: string;
+  name?: string;
+  pageOrder: string[];
+  pages: DiagramPage[];
+  shapesByPage: Record<string, DiagramNode[]>;
+  connectorsByPage: Record<string, DiagramEdge[]>;
+  variables: DiagramVariable[];
+}
+
+export function subscribeVersions(diagramId: string, onChange: (versions: DiagramVersion[]) => void): () => void {
+  const col = collection(db, 'diagrams', diagramId, 'versions');
+  return onSnapshot(col, snap => {
+    const versions = snap.docs.map(d => ({ id: d.id, ...d.data() } as DiagramVersion));
+    versions.sort((a, b) => b.createdAt - a.createdAt);
+    onChange(versions);
+  });
+}
+
+export async function saveVersion(diagramId: string, uid: string, name?: string): Promise<void> {
+  const pagesSnap = await getDocs(collection(db, 'diagrams', diagramId, 'pages'));
+  const pages = pagesSnap.docs.map(d => ({ id: d.id, ...d.data() } as DiagramPage));
+
+  const shapesByPage: Record<string, DiagramNode[]> = {};
+  const connectorsByPage: Record<string, DiagramEdge[]> = {};
+  for (const p of pages) {
+    const shapesSnap = await getDocs(collection(db, 'diagrams', diagramId, 'pages', p.id, 'shapes'));
+    shapesByPage[p.id] = shapesSnap.docs.map(d => d.data() as DiagramNode);
+    const connectorsSnap = await getDocs(collection(db, 'diagrams', diagramId, 'pages', p.id, 'connectors'));
+    connectorsByPage[p.id] = connectorsSnap.docs.map(d => d.data() as DiagramEdge);
+  }
+
+  const variablesSnap = await getDocs(collection(db, 'diagrams', diagramId, 'variables'));
+  const variables = variablesSnap.docs.map(d => d.data() as DiagramVariable);
+
+  const diagramSnap = await getDoc(doc(db, 'diagrams', diagramId));
+  const pageOrder = (diagramSnap.data() as DiagramDocument | undefined)?.pageOrder ?? pages.map(p => p.id);
+
+  const versionId = crypto.randomUUID();
+  const version: DiagramVersion = {
+    id: versionId, createdAt: Date.now(), createdBy: uid, name,
+    pageOrder, pages, shapesByPage, connectorsByPage, variables,
+  };
+  await setDoc(doc(db, 'diagrams', diagramId, 'versions', versionId), version);
+
+  // Cap history at MAX_VERSIONS, dropping the oldest beyond that.
+  const existingSnap = await getDocs(collection(db, 'diagrams', diagramId, 'versions'));
+  const existing = existingSnap.docs.map(d => ({ id: d.id, ...d.data() } as DiagramVersion));
+  existing.sort((a, b) => b.createdAt - a.createdAt);
+  const toDelete = existing.slice(MAX_VERSIONS);
+  await Promise.all(toDelete.map(v => deleteDoc(doc(db, 'diagrams', diagramId, 'versions', v.id))));
+}
+
+export async function deleteVersion(diagramId: string, versionId: string): Promise<void> {
+  await deleteDoc(doc(db, 'diagrams', diagramId, 'versions', versionId));
+}
+
+// Reverts the whole document to exactly how it looked when `version` was
+// saved: deletes any page/shape/connector/variable created since, and
+// overwrites everything the version captured back into place. Not a merge or
+// a diff view — a full-document rollback, same scope boundary as the rest of
+// this pass's version history feature.
+export async function restoreVersion(diagramId: string, version: DiagramVersion): Promise<void> {
+  const livePagesSnap = await getDocs(collection(db, 'diagrams', diagramId, 'pages'));
+  const versionPageIds = new Set(version.pages.map(p => p.id));
+
+  const deletes: ReturnType<typeof doc>[] = [];
+  const sets: { ref: ReturnType<typeof doc>; data: object }[] = [];
+
+  for (const livePage of livePagesSnap.docs) {
+    const livePageId = livePage.id;
+    const liveShapesSnap = await getDocs(collection(db, 'diagrams', diagramId, 'pages', livePageId, 'shapes'));
+    const liveConnectorsSnap = await getDocs(collection(db, 'diagrams', diagramId, 'pages', livePageId, 'connectors'));
+
+    if (!versionPageIds.has(livePageId)) {
+      // This page didn't exist when the version was saved — remove it and
+      // everything on it entirely, rather than trying to reconcile it below.
+      deletes.push(doc(db, 'diagrams', diagramId, 'pages', livePageId));
+      for (const s of liveShapesSnap.docs) deletes.push(doc(db, 'diagrams', diagramId, 'pages', livePageId, 'shapes', s.id));
+      for (const e of liveConnectorsSnap.docs) deletes.push(doc(db, 'diagrams', diagramId, 'pages', livePageId, 'connectors', e.id));
+      continue;
+    }
+
+    const versionShapeIds = new Set((version.shapesByPage[livePageId] ?? []).map(s => s.id));
+    const versionConnectorIds = new Set((version.connectorsByPage[livePageId] ?? []).map(e => e.id));
+    for (const s of liveShapesSnap.docs) {
+      if (!versionShapeIds.has(s.id)) deletes.push(doc(db, 'diagrams', diagramId, 'pages', livePageId, 'shapes', s.id));
+    }
+    for (const e of liveConnectorsSnap.docs) {
+      if (!versionConnectorIds.has(e.id)) deletes.push(doc(db, 'diagrams', diagramId, 'pages', livePageId, 'connectors', e.id));
+    }
+  }
+
+  const liveVariablesSnap = await getDocs(collection(db, 'diagrams', diagramId, 'variables'));
+  const versionVariableIds = new Set(version.variables.map(v => v.id));
+  for (const v of liveVariablesSnap.docs) {
+    if (!versionVariableIds.has(v.id)) deletes.push(doc(db, 'diagrams', diagramId, 'variables', v.id));
+  }
+
+  for (const p of version.pages) {
+    sets.push({ ref: doc(db, 'diagrams', diagramId, 'pages', p.id), data: p });
+  }
+  for (const [pageId, shapes] of Object.entries(version.shapesByPage)) {
+    for (const s of shapes) sets.push({ ref: doc(db, 'diagrams', diagramId, 'pages', pageId, 'shapes', s.id), data: s });
+  }
+  for (const [pageId, edges] of Object.entries(version.connectorsByPage)) {
+    for (const e of edges) sets.push({ ref: doc(db, 'diagrams', diagramId, 'pages', pageId, 'connectors', e.id), data: e });
+  }
+  for (const v of version.variables) {
+    sets.push({ ref: doc(db, 'diagrams', diagramId, 'variables', v.id), data: v });
+  }
+
+  // Firestore caps a single batch at 500 writes; chunk both deletes and sets
+  // (never mixed on the same doc, so ordering between them doesn't matter).
+  const CHUNK = 400;
+  const allOps: Array<{ delete: true; ref: ReturnType<typeof doc> } | { delete: false; ref: ReturnType<typeof doc>; data: object }> = [
+    ...deletes.map(ref => ({ delete: true as const, ref })),
+    ...sets.map(s => ({ delete: false as const, ref: s.ref, data: s.data })),
+  ];
+  for (let i = 0; i < allOps.length; i += CHUNK) {
+    const batch = writeBatch(db);
+    for (const op of allOps.slice(i, i + CHUNK)) {
+      if (op.delete) batch.delete(op.ref); else batch.set(op.ref, op.data);
+    }
+    await batch.commit();
+  }
+
+  // pageOrder + updatedAt land last, once every page/shape/connector/variable
+  // write above has committed.
+  await updateDoc(doc(db, 'diagrams', diagramId), { pageOrder: version.pageOrder, updatedAt: Date.now() });
+}
+
 export async function saveDiagramAsTemplate(diagram: DiagramDocument, category?: string, description?: string): Promise<DiagramDocument> {
-  return cloneDiagramContent(diagram.id, diagram.ownerId, diagram.ownerEmail, {
+  const newDiagram = await cloneDiagramContent(diagram.id, diagram.ownerId, diagram.ownerEmail, {
     name: diagram.name, isTemplate: true, templateCategory: category, templateDescription: description, templateIsBuiltIn: false,
   });
+
+  // Best-effort thumbnail: "Save as template" is triggered from the
+  // Dashboard, where the source diagram isn't open/rendered anywhere, so
+  // there's no live DOM to screenshot (unlike PNG/PDF/PPTX export, which
+  // capture the currently-open Canvas). Read the source's first page +
+  // shapes instead (the clone just copied identical content) and render a
+  // rough SVG mini-preview — captured once here, since a template's
+  // content never changes after creation.
+  try {
+    const firstPageId = diagram.pageOrder[0];
+    if (firstPageId) {
+      const pageSnap = await getDoc(doc(db, 'diagrams', diagram.id, 'pages', firstPageId));
+      const page = pageSnap.data() as DiagramPage | undefined;
+      if (page) {
+        const shapesSnap = await getDocs(collection(db, 'diagrams', diagram.id, 'pages', firstPageId, 'shapes'));
+        const shapes = shapesSnap.docs.map(d => d.data() as DiagramNode);
+        const dims = getPageDimensions(page.paperSize, page.orientation, page.customWidth, page.customHeight);
+        const templateThumbnailUrl = buildTemplateThumbnailSvgDataUrl(shapes, dims);
+        await updateDoc(doc(db, 'diagrams', newDiagram.id), { templateThumbnailUrl });
+        newDiagram.templateThumbnailUrl = templateThumbnailUrl;
+      }
+    }
+  } catch {
+    // A thumbnail is a nice-to-have — the template itself already saved fine.
+  }
+
+  return newDiagram;
 }
 
 export async function createDiagramFromTemplate(templateDiagramId: string, newName: string, uid: string, email?: string): Promise<DiagramDocument> {

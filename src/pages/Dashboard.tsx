@@ -2,10 +2,10 @@ import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Button, Spin, Tag, Tooltip, Modal, Input, message, Dropdown } from 'antd';
 import {
-  PlusOutlined, LogoutOutlined, DeleteOutlined, ShareAltOutlined, FolderAddOutlined,
-  FolderOutlined, FolderOpenOutlined, DownOutlined, RightOutlined, TeamOutlined, MoreOutlined,
-  EditOutlined, PictureOutlined, FileAddOutlined,
-} from '@ant-design/icons';
+  IconAdd, IconLogout, IconDelete, IconShare, IconFolderAdd,
+  IconFolder, IconFolderOpen, IconChevronDown, IconChevronRight, IconTeam, IconMore,
+  IconPencil, IconImage, IconFileAdd, IconSettingsGear, IconPersonFallback,
+} from '../components/icons';
 import { useAuth } from '../AuthContext';
 import {
   subscribeUserDiagrams, isDiagramOwner, deleteDiagram, renameDiagram,
@@ -13,20 +13,28 @@ import {
   generateEditorInvite, saveDiagramAsTemplate,
 } from '../store';
 import { uploadFolderLogo, deleteFolderLogo } from '../utils/folderLogoUpload';
+import { getWorkspaceSettings, type WorkspaceSettings } from '../utils/workspaceSettings';
+import { useUserProfiles, resolveDisplay } from '../utils/userProfiles';
 import type { DiagramDocument, DiagramFolder } from '../types/document';
 import { FolderMembersModal } from '../components/FolderMembersModal';
 import { TemplateGalleryModal } from '../components/TemplateGalleryModal';
+import { WorkspaceSettingsDrawer } from '../components/WorkspaceSettingsDrawer';
+import { CommentAvatar } from '../components/canvas/CommentAvatar';
 
 const UNGROUPED_KEY = '__ungrouped__';
+const DEFAULT_WORKSPACE_SETTINGS: WorkspaceSettings = { navLogoUrl: null, navBgColor: '#1a1a2e' };
 
 export function Dashboard() {
   const { user, signOut } = useAuth();
+  const ownProfile = useUserProfiles(user ? [user.uid] : []);
   const navigate = useNavigate();
   const [diagrams, setDiagrams] = useState<DiagramDocument[]>([]);
   const [folders, setFolders] = useState<DiagramFolder[]>([]);
   const [loading, setLoading] = useState(true);
   const [templateGalleryOpen, setTemplateGalleryOpen] = useState(false);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  const [workspaceSettings, setWorkspaceSettings] = useState<WorkspaceSettings>(DEFAULT_WORKSPACE_SETTINGS);
 
   const [newFolderOpen, setNewFolderOpen] = useState(false);
   const [newFolderName, setNewFolderName] = useState('');
@@ -48,6 +56,11 @@ export function Dashboard() {
     const unsub1 = subscribeUserDiagrams(user.uid, ds => { setDiagrams(ds); done(); });
     const unsub2 = subscribeUserFolders(user.uid, fs => { setFolders(fs); done(); });
     return () => { unsub1(); unsub2(); };
+  }, [user]);
+
+  useEffect(() => {
+    if (!user) return;
+    getWorkspaceSettings(user.uid).then(setWorkspaceSettings);
   }, [user]);
 
   const realDiagrams = diagrams.filter(d => !d.isTemplate);
@@ -216,23 +229,23 @@ export function Dashboard() {
         {isOwner && (
           <div style={{ display: 'flex', gap: 8 }} onClick={e => e.stopPropagation()}>
             <Tooltip title="Copy invite link">
-              <Button size="small" icon={<ShareAltOutlined />} onClick={() => handleCopyInvite(d)} />
+              <Button size="small" icon={<IconShare />} onClick={() => handleCopyInvite(d)} />
             </Tooltip>
             <Dropdown
               trigger={['click']}
               menu={{
                 items: [
-                  { key: 'rename', icon: <EditOutlined />, label: 'Rename' },
-                  { key: 'template', icon: <FileAddOutlined />, label: 'Save as template' },
+                  { key: 'rename', icon: <IconPencil />, label: 'Rename' },
+                  { key: 'template', icon: <IconFileAdd />, label: 'Save as template' },
                   ...(editableFolders.length > 0 ? [{
-                    key: 'move', icon: <FolderOutlined />, label: 'Move to folder',
+                    key: 'move', icon: <IconFolder />, label: 'Move to folder',
                     children: [
                       ...editableFolders.map(f => ({ key: `move:${f.id}`, label: f.name })),
                       ...(folder ? [{ key: 'move:none', label: 'Remove from folder' }] : []),
                     ],
                   }] : []),
                   { type: 'divider' as const },
-                  { key: 'delete', icon: <DeleteOutlined />, label: 'Delete', danger: true },
+                  { key: 'delete', icon: <IconDelete />, label: 'Delete', danger: true },
                 ],
                 onClick: ({ key }) => {
                   if (key === 'rename') { setRenamingDiagram(d); setRenamingDiagramName(d.name); }
@@ -246,7 +259,7 @@ export function Dashboard() {
                 },
               }}
             >
-              <Button size="small" icon={<MoreOutlined />} />
+              <Button size="small" icon={<IconMore />} />
             </Dropdown>
           </div>
         )}
@@ -266,18 +279,51 @@ export function Dashboard() {
 
   const membersFolder = membersFolderId ? folders.find(f => f.id === membersFolderId) ?? null : null;
 
+  const navBg = workspaceSettings.navBgColor || '#1a1a2e';
+  const navBgRgb = { r: parseInt(navBg.slice(1, 3), 16) || 0, g: parseInt(navBg.slice(3, 5), 16) || 0, b: parseInt(navBg.slice(5, 7), 16) || 0 };
+  const navIsLight = (navBgRgb.r * 299 + navBgRgb.g * 587 + navBgRgb.b * 114) / 1000 > 128;
+  const navTextColor = navIsLight ? '#1a1a2e' : '#ffffff';
+  const navSubtleTextColor = navIsLight ? 'rgba(0,0,0,0.45)' : 'rgba(255,255,255,0.55)';
+
   return (
     <div style={{ minHeight: '100vh', background: '#EEF0F5', display: 'flex', flexDirection: 'column' }}>
       <div style={{
-        background: '#1a1a2e', padding: '0 24px', height: 56,
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0,
+        background: navBg, padding: '0 24px', height: 56,
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0, transition: 'background 0.2s',
       }}>
-        <span style={{ color: '#fff', fontWeight: 800, fontSize: 18, letterSpacing: '-0.3px' }}>
-          Simple Presentation <span style={{ fontWeight: 400, color: 'rgba(255,255,255,0.55)', fontSize: 15 }}>by Oestler</span>
-        </span>
+        {workspaceSettings.navLogoUrl ? (
+          <img src={workspaceSettings.navLogoUrl} alt="logo" style={{ height: 34, width: 'auto', objectFit: 'contain' }} />
+        ) : (
+          <span style={{ display: 'flex', alignItems: 'center', gap: 8, color: navTextColor, fontWeight: 800, fontSize: 18, letterSpacing: '-0.3px' }}>
+            <img src={navIsLight ? '/favicon-black.svg' : '/favicon-white.svg'} alt="" style={{ height: 16, width: 'auto' }} />
+            Simple Presentation
+          </span>
+        )}
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <span style={{ color: 'rgba(255,255,255,0.55)', fontSize: 13 }}>{user?.email}</span>
-          <Button icon={<LogoutOutlined />} size="small" type="text" onClick={signOut} style={{ color: 'rgba(255,255,255,0.5)' }} />
+          <Dropdown
+            trigger={['click']}
+            menu={{
+              items: [
+                { key: 'email', label: user ? resolveDisplay(user.uid, user.email ?? '', ownProfile).name : user, disabled: true },
+                { type: 'divider' as const },
+                { key: 'profile', icon: <IconPersonFallback />, label: 'Profile' },
+                { key: 'settings', icon: <IconSettingsGear />, label: 'Workspace settings' },
+                { type: 'divider' as const },
+                { key: 'signout', icon: <IconLogout />, label: 'Sign out', danger: true },
+              ],
+              onClick: ({ key }) => {
+                if (key === 'profile') window.location.href = '/profile';
+                if (key === 'settings') setWorkspaceOpen(true);
+                if (key === 'signout') signOut();
+              },
+            }}
+          >
+            <span style={{ display: 'inline-flex', cursor: 'pointer' }}>
+              {user?.email
+                ? <CommentAvatar seed={resolveDisplay(user.uid, user.email, ownProfile).avatarSeed} photoURL={ownProfile[user.uid]?.avatarPhotoURL} size={28} />
+                : <span style={{ color: navSubtleTextColor, fontSize: 13 }}>Account</span>}
+            </span>
+          </Dropdown>
         </div>
       </div>
 
@@ -285,8 +331,8 @@ export function Dashboard() {
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 24 }}>
           <h1 style={{ fontSize: 22, fontWeight: 700, color: '#1a1a2e', margin: 0 }}>Your Diagrams</h1>
           <div style={{ display: 'flex', gap: 8 }}>
-            <Button icon={<FolderAddOutlined />} onClick={() => setNewFolderOpen(true)}>New Folder</Button>
-            <Button type="primary" icon={<PlusOutlined />} onClick={() => setTemplateGalleryOpen(true)}>
+            <Button icon={<IconFolderAdd />} onClick={() => setNewFolderOpen(true)}>New Folder</Button>
+            <Button type="primary" icon={<IconAdd />} onClick={() => setTemplateGalleryOpen(true)}>
               New Diagram
             </Button>
           </div>
@@ -303,7 +349,7 @@ export function Dashboard() {
             <div style={{ fontSize: 14, color: '#999', marginBottom: 28, maxWidth: 320, margin: '0 auto 28px' }}>
               Paper-format pages, smart connectors, and a canvas you can actually publish.
             </div>
-            <Button type="primary" icon={<PlusOutlined />} size="large" onClick={() => setTemplateGalleryOpen(true)}>
+            <Button type="primary" icon={<IconAdd />} size="large" onClick={() => setTemplateGalleryOpen(true)}>
               New Diagram
             </Button>
           </div>
@@ -325,12 +371,12 @@ export function Dashboard() {
                     onClick={() => toggleCollapse(folder.id)}
                   >
                     <span style={{ color: '#666', fontSize: 12, display: 'inline-flex' }}>
-                      {isCollapsed ? <RightOutlined /> : <DownOutlined />}
+                      {isCollapsed ? <IconChevronRight /> : <IconChevronDown />}
                     </span>
                     {folder.folderLogoUrl ? (
                       <img src={folder.folderLogoUrl} alt="folder icon" style={{ height: 22, width: 'auto', objectFit: 'contain', flexShrink: 0 }} />
                     ) : (
-                      isCollapsed ? <FolderOutlined style={{ color: '#555', fontSize: 16 }} /> : <FolderOpenOutlined style={{ color: '#555', fontSize: 16 }} />
+                      isCollapsed ? <IconFolder style={{ color: '#555', fontSize: 16 }} /> : <IconFolderOpen style={{ color: '#555', fontSize: 16 }} />
                     )}
                     <span style={{ fontWeight: 700, fontSize: 15, color: '#1a1a2e', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                       {folder.name}
@@ -348,8 +394,8 @@ export function Dashboard() {
                         trigger={['click']}
                         menu={{
                           items: [
-                            { key: 'editor', icon: <EditOutlined />, label: 'Copy editor invite link' },
-                            { key: 'viewer', icon: <ShareAltOutlined />, label: 'Copy viewer invite link' },
+                            { key: 'editor', icon: <IconPencil />, label: 'Copy editor invite link' },
+                            { key: 'viewer', icon: <IconShare />, label: 'Copy viewer invite link' },
                           ],
                           onClick: ({ key, domEvent }) => {
                             domEvent.stopPropagation();
@@ -359,7 +405,7 @@ export function Dashboard() {
                       >
                         <Tooltip title="Share folder">
                           <button onClick={e => e.stopPropagation()} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '2px 6px', color: '#999', borderRadius: 4, lineHeight: 1, fontSize: 14 }}>
-                            <ShareAltOutlined />
+                            <IconShare />
                           </button>
                         </Tooltip>
                       </Dropdown>
@@ -367,7 +413,7 @@ export function Dashboard() {
                     {isOwner && (
                       <Tooltip title="Manage members">
                         <button onClick={e => { e.stopPropagation(); setMembersFolderId(folder.id); }} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '2px 6px', color: '#999', borderRadius: 4, lineHeight: 1, fontSize: 14 }}>
-                          <TeamOutlined />
+                          <IconTeam />
                         </button>
                       </Tooltip>
                     )}
@@ -376,12 +422,12 @@ export function Dashboard() {
                         trigger={['click']}
                         menu={{
                           items: [
-                            { key: 'rename', icon: <EditOutlined />, label: 'Rename folder' },
+                            { key: 'rename', icon: <IconPencil />, label: 'Rename folder' },
                             { type: 'divider' as const },
-                            { key: 'upload-icon', icon: <PictureOutlined />, label: uploadingIconForFolder === folder.id ? 'Uploading…' : 'Upload folder icon' },
-                            ...(folder.folderLogoUrl ? [{ key: 'remove-icon', icon: <DeleteOutlined />, label: 'Remove folder icon' }] : []),
+                            { key: 'upload-icon', icon: <IconImage />, label: uploadingIconForFolder === folder.id ? 'Uploading…' : 'Upload folder icon' },
+                            ...(folder.folderLogoUrl ? [{ key: 'remove-icon', icon: <IconDelete />, label: 'Remove folder icon' }] : []),
                             { type: 'divider' as const },
-                            { key: 'delete', icon: <DeleteOutlined />, label: 'Delete folder', danger: true },
+                            { key: 'delete', icon: <IconDelete />, label: 'Delete folder', danger: true },
                           ],
                           onClick: ({ key, domEvent }) => {
                             domEvent.stopPropagation();
@@ -393,7 +439,7 @@ export function Dashboard() {
                         }}
                       >
                         <button onClick={e => e.stopPropagation()} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '2px 6px', color: '#999', borderRadius: 4, lineHeight: 1, fontSize: 14 }}>
-                          <MoreOutlined />
+                          <IconMore />
                         </button>
                       </Dropdown>
                     )}
@@ -420,7 +466,7 @@ export function Dashboard() {
                     style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: isCollapsed ? 0 : 12, padding: '10px 14px', background: '#E2E4EC', borderRadius: isCollapsed ? 10 : '10px 10px 0 0', cursor: 'pointer', userSelect: 'none' }}
                     onClick={() => toggleCollapse(UNGROUPED_KEY)}
                   >
-                    <span style={{ color: '#666', fontSize: 12, display: 'inline-flex' }}>{isCollapsed ? <RightOutlined /> : <DownOutlined />}</span>
+                    <span style={{ color: '#666', fontSize: 12, display: 'inline-flex' }}>{isCollapsed ? <IconChevronRight /> : <IconChevronDown />}</span>
                     <span style={{ fontWeight: 700, fontSize: 15, color: '#1a1a2e', flex: 1 }}>Ungrouped</span>
                     <span style={{ fontSize: 12, color: '#999' }}>{ungrouped.length} diagram{ungrouped.length !== 1 ? 's' : ''}</span>
                   </div>
@@ -507,6 +553,16 @@ export function Dashboard() {
 
       {membersFolder && (
         <FolderMembersModal open={!!membersFolder} folder={membersFolder} onClose={() => setMembersFolderId(null)} />
+      )}
+
+      {user && (
+        <WorkspaceSettingsDrawer
+          open={workspaceOpen}
+          uid={user.uid}
+          settings={workspaceSettings}
+          onChange={setWorkspaceSettings}
+          onClose={() => setWorkspaceOpen(false)}
+        />
       )}
     </div>
   );

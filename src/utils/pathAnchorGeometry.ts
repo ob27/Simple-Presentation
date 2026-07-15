@@ -1,4 +1,4 @@
-import type { PathAnchor } from '../types/shapes';
+import type { PathAnchor, PathContourData } from '../types/shapes';
 
 export interface AbsoluteRect { x: number; y: number; width: number; height: number }
 
@@ -11,12 +11,15 @@ export interface AbsoluteRect { x: number; y: number; width: number; height: num
 // and anchor-docked connectors all agree pixel-for-pixel on where an anchor
 // actually renders.
 
-export function computePathViewBox(anchors: PathAnchor[]): { width: number; height: number } {
+export function computePathViewBox(anchors: PathAnchor[], holes?: PathContourData[]): { width: number; height: number } {
   const xs: number[] = [];
   const ys: number[] = [];
-  for (const a of anchors) {
-    xs.push(a.x, a.x + (a.handleIn?.x ?? 0), a.x + (a.handleOut?.x ?? 0));
-    ys.push(a.y, a.y + (a.handleIn?.y ?? 0), a.y + (a.handleOut?.y ?? 0));
+  const contours = holes ? [anchors, ...holes.map(h => h.anchors)] : [anchors];
+  for (const contour of contours) {
+    for (const a of contour) {
+      xs.push(a.x, a.x + (a.handleIn?.x ?? 0), a.x + (a.handleOut?.x ?? 0));
+      ys.push(a.y, a.y + (a.handleIn?.y ?? 0), a.y + (a.handleOut?.y ?? 0));
+    }
   }
   if (xs.length === 0) return { width: 1, height: 1 };
   return { width: Math.max(1, Math.max(...xs)), height: Math.max(1, Math.max(...ys)) };
@@ -42,6 +45,21 @@ export function buildPathD(anchors: PathAnchor[], closed: boolean): string {
     }
   }
   if (closed) d += ' Z';
+  return d;
+}
+
+// Appends each hole as its own `M...Z` subpath onto the main contour's `d` —
+// SVG natively supports multiple subpaths in one `d` attribute, and with
+// `fill-rule="evenodd"` (set by the renderer alongside this) an overlapping
+// subpath cuts a real hole rather than just drawing another opaque shape on
+// top. Only path shapes produced by a boolean op populate `holes`; the pen
+// tool and direct-select anchor editing never touch this — they only ever
+// see and edit the single main `anchors` contour.
+export function buildPathDWithHoles(anchors: PathAnchor[], closed: boolean, holes?: PathContourData[]): string {
+  let d = buildPathD(anchors, closed);
+  if (holes) {
+    for (const hole of holes) d += ' ' + buildPathD(hole.anchors, hole.closed);
+  }
   return d;
 }
 

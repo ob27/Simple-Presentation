@@ -1,5 +1,34 @@
 import { memo, useState, useRef } from 'react';
 import type { NodeProps } from '@xyflow/react';
+import type { PageNumberPosition, PageNumberStyle } from '../../../types/document';
+
+const PX_PER_MM = 96 / 25.4;
+
+// `{page}`/`{pages}` tokens let the same header/footer text work across
+// every page in the document rather than needing to hand-edit a page number
+// into each page individually.
+function substituteTokens(text: string, pageIndex: number, pageCount: number): string {
+  return text.replace(/\{page\}/g, String(pageIndex)).replace(/\{pages\}/g, String(pageCount));
+}
+
+function formatPageNumber(style: PageNumberStyle | undefined, pageIndex: number, pageCount: number): string {
+  if (style === 'page-prefix') return `Page ${pageIndex}`;
+  if (style === 'of-total') return `${pageIndex} of ${pageCount}`;
+  return String(pageIndex);
+}
+
+// Maps a corner/edge choice to absolute inset styles — same 8px inset the
+// header/footer text already uses, so a page number placed in a corner
+// lines up visually with header/footer text placed along an edge.
+function pageNumberInsetStyle(position: PageNumberPosition | undefined): React.CSSProperties {
+  const [vertical, horizontal] = (position ?? 'bottom-right').split('-') as ['top' | 'bottom', 'left' | 'center' | 'right'];
+  const style: React.CSSProperties = { position: 'absolute', pointerEvents: 'none' };
+  style[vertical] = 8;
+  if (horizontal === 'center') { style.left = 8; style.right = 8; style.textAlign = 'center'; }
+  else if (horizontal === 'left') { style.left = 8; style.textAlign = 'left'; }
+  else { style.right = 8; style.textAlign = 'right'; }
+  return style;
+}
 
 export interface PageFrameNodeData extends Record<string, unknown> {
   pageName: string;
@@ -8,10 +37,27 @@ export interface PageFrameNodeData extends Record<string, unknown> {
   height: number;
   onRename?: (pageId: string, name: string) => void;
   onDeselectAll?: () => void;
+  marginTop?: number;
+  marginRight?: number;
+  marginBottom?: number;
+  marginLeft?: number;
+  headerText?: string;
+  footerText?: string;
+  pageIndex?: number;
+  pageCount?: number;
+  backgroundColor?: string;
+  pageNumberEnabled?: boolean;
+  pageNumberStyle?: PageNumberStyle;
+  pageNumberPosition?: PageNumberPosition;
 }
 
 function PageFrameNodeImpl({ data }: NodeProps) {
-  const { pageName, pageId, width, height, onRename, onDeselectAll } = data as unknown as PageFrameNodeData;
+  const {
+    pageName, pageId, width, height, onRename, onDeselectAll,
+    marginTop, marginRight, marginBottom, marginLeft, headerText, footerText, pageIndex, pageCount, backgroundColor,
+    pageNumberEnabled, pageNumberStyle, pageNumberPosition,
+  } = data as unknown as PageFrameNodeData;
+  const hasMargins = !!(marginTop || marginRight || marginBottom || marginLeft);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(pageName);
 
@@ -42,7 +88,7 @@ function PageFrameNodeImpl({ data }: NodeProps) {
       onClick={handleClick}
       style={{
         width, height,
-        background: '#fff',
+        background: backgroundColor ?? '#fff',
         boxShadow: '0 2px 12px rgba(0,0,0,0.12)',
         border: '1px solid rgba(0,0,0,0.06)',
         position: 'relative',
@@ -80,6 +126,47 @@ function PageFrameNodeImpl({ data }: NodeProps) {
           }}
         >
           {pageName}
+        </div>
+      )}
+
+      {hasMargins && (
+        <div
+          style={{
+            position: 'absolute', pointerEvents: 'none',
+            top: (marginTop ?? 0) * PX_PER_MM, left: (marginLeft ?? 0) * PX_PER_MM,
+            right: (marginRight ?? 0) * PX_PER_MM, bottom: (marginBottom ?? 0) * PX_PER_MM,
+            border: '1px dashed #b7bed1',
+          }}
+        />
+      )}
+      {headerText && (
+        <div
+          className="nopan nodrag"
+          style={{
+            position: 'absolute', top: 8, left: 8, right: 8, pointerEvents: 'none',
+            fontSize: 11, color: '#8a93a6', textAlign: 'center',
+          }}
+        >
+          {substituteTokens(headerText, pageIndex ?? 1, pageCount ?? 1)}
+        </div>
+      )}
+      {footerText && (
+        <div
+          className="nopan nodrag"
+          style={{
+            position: 'absolute', bottom: 8, left: 8, right: 8, pointerEvents: 'none',
+            fontSize: 11, color: '#8a93a6', textAlign: 'center',
+          }}
+        >
+          {substituteTokens(footerText, pageIndex ?? 1, pageCount ?? 1)}
+        </div>
+      )}
+      {pageNumberEnabled && (
+        <div
+          className="nopan nodrag"
+          style={{ ...pageNumberInsetStyle(pageNumberPosition), fontSize: 11, color: '#8a93a6' }}
+        >
+          {formatPageNumber(pageNumberStyle, pageIndex ?? 1, pageCount ?? 1)}
         </div>
       )}
     </div>

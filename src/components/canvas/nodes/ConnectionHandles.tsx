@@ -10,19 +10,34 @@ const SIDES: { position: Position; style: React.CSSProperties }[] = [
 // `visible` used to be driven by `selected` — but a selected shape ALSO
 // shows NodeResizer's edge-midpoint resize handles at these exact same
 // coordinates, so the two competed for the same click. Visibility is now
-// driven by the Arrow tool being active instead; hover-to-reveal remains as
-// a secondary precision path for anyone who wants to drag straight from a
-// handle without turning the tool on.
+// driven by the Arrow tool being active instead. A previous version also
+// revealed these on hover as a "precision path" for connecting without
+// switching tools — that reintroduced the exact same conflict (hovering an
+// edge to grab a resize handle would surface a connection handle sitting
+// on top of it instead, which silently swallows the drag and does nothing
+// since connectMode is off), so hover-reveal was removed: visibility is
+// now strictly tied to the Arrow tool actually being active.
+//
+// pointerEvents has to be set on each `<Handle>` itself, not just the
+// wrapping span: React Flow's own stylesheet gives every handle a
+// `.connectionindicator { pointer-events: all }` rule, which — being a
+// class rule directly on the element — wins over an ancestor's inherited
+// `pointer-events: none`. Relying on the span alone left these handles
+// fully clickable even while "invisible", silently swallowing clicks meant
+// for the resize dots sitting underneath at the same coordinates.
 export function ConnectionHandles({ visible }: { visible: boolean }) {
   return (
     <>
       {SIDES.map(({ position, style }) => (
-        <span key={position} style={{ position: 'absolute', ...style, zIndex: 5 }}>
+        <span key={position} style={{ position: 'absolute', ...style, zIndex: 5, pointerEvents: visible ? undefined : 'none' }}>
           <Handle
             type="target"
             position={position}
             id={`${position}-target`}
-            style={{ width: 20, height: 20, opacity: 0, border: 'none', background: 'transparent' }}
+            style={{
+              width: 20, height: 20, opacity: 0, border: 'none', background: 'transparent',
+              pointerEvents: visible ? undefined : 'none',
+            }}
           />
           <Handle
             type="source"
@@ -31,9 +46,8 @@ export function ConnectionHandles({ visible }: { visible: boolean }) {
             style={{
               width: 9, height: 9, background: '#1677ff', border: '1.5px solid #fff',
               opacity: visible ? 1 : 0, transition: 'opacity 0.12s',
+              pointerEvents: visible ? undefined : 'none',
             }}
-            onMouseEnter={e => (e.currentTarget.style.opacity = '1')}
-            onMouseLeave={e => { if (!visible) e.currentTarget.style.opacity = '0'; }}
           />
         </span>
       ))}

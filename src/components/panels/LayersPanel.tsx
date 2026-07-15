@@ -2,11 +2,12 @@ import { useMemo, useState } from 'react';
 import type { Node } from '@xyflow/react';
 import { Button, Tooltip } from 'antd';
 import {
-  CloseOutlined, FolderOutlined, PictureOutlined, EyeOutlined, EyeInvisibleOutlined,
-  LockOutlined, UnlockOutlined, UpOutlined, DownOutlined, MenuUnfoldOutlined, MenuFoldOutlined,
-  CaretRightOutlined, CaretDownOutlined, AimOutlined, EditOutlined,
-} from '@ant-design/icons';
+  IconClose, IconGroup, IconImage, IconEyeOpen, IconEyeClosed,
+  IconLock, IconUnlock, IconMoveUp, IconMoveDown, IconOutdent, IconIndent,
+  IconDisclosureTriangle, IconHotspot, IconPathShape,
+} from '../icons';
 import type { ShapeKind, ShapeNodeData } from '../../types/shapes';
+import { PeekableDrawer } from './PeekableDrawer';
 
 interface LayerTreeNode {
   id: string;
@@ -51,10 +52,10 @@ function flattenTree(tree: LayerTreeNode[], depth: number, collapsed: Set<string
 }
 
 function KindIcon({ kind }: { kind: ShapeKind }) {
-  if (kind === 'group') return <FolderOutlined style={{ color: '#8a93a6' }} />;
-  if (kind === 'image') return <PictureOutlined style={{ color: '#8CA3E8' }} />;
-  if (kind === 'hotspot') return <AimOutlined style={{ color: '#ff5fc4' }} />;
-  if (kind === 'path') return <EditOutlined style={{ color: '#7C93E8' }} />;
+  if (kind === 'group') return <IconGroup style={{ color: '#8a93a6' }} />;
+  if (kind === 'image') return <IconImage style={{ color: '#8CA3E8' }} />;
+  if (kind === 'hotspot') return <IconHotspot style={{ color: '#ff5fc4' }} />;
+  if (kind === 'path') return <IconPathShape style={{ color: '#7C93E8' }} />;
   if (kind === 'text') return <span style={{ fontSize: 11, color: '#555', fontWeight: 600 }}>T</span>;
   const style: React.CSSProperties = { width: 10, height: 10, display: 'inline-block', background: '#8CA3E8', flexShrink: 0 };
   if (kind === 'ellipse') style.borderRadius = '50%';
@@ -110,14 +111,10 @@ export function LayersPanel({
   }
 
   return (
-    <div style={{
-      position: 'absolute', top: 0, left: 0, bottom: 0, width: 260, zIndex: 15,
-      background: '#fff', borderRight: '1px solid #e6e8ef', boxShadow: '2px 0 8px rgba(0,0,0,0.05)',
-      display: 'flex', flexDirection: 'column',
-    }}>
+    <PeekableDrawer>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', borderBottom: '1px solid #f0f0f0' }}>
         <span style={{ fontWeight: 600, fontSize: 13, color: '#1a1a2e' }}>Layers</span>
-        <Button size="small" type="text" icon={<CloseOutlined />} onClick={onClose} />
+        <Button size="small" type="text" icon={<IconClose />} onClick={onClose} />
       </div>
 
       <div style={{ flex: 1, overflowY: 'auto', padding: '6px 4px' }}>
@@ -143,7 +140,7 @@ export function LayersPanel({
             >
               {row.hasChildren ? (
                 <span onClick={e => { e.stopPropagation(); toggleCollapse(row.id); }} style={{ fontSize: 10, color: '#999', width: 12, flexShrink: 0 }}>
-                  {collapsed.has(row.id) ? <CaretRightOutlined /> : <CaretDownOutlined />}
+                  <IconDisclosureTriangle style={collapsed.has(row.id) ? undefined : { transform: 'rotate(90deg)' }} />
                 </span>
               ) : (
                 <span style={{ width: 12, flexShrink: 0 }} />
@@ -171,21 +168,21 @@ export function LayersPanel({
                 </span>
               )}
               <div style={{ display: 'flex', gap: 0 }}>
-                <Tooltip title="Outdent"><Button size="small" type="text" icon={<MenuUnfoldOutlined />} disabled={!row.node.parentId} onClick={e => { e.stopPropagation(); onOutdent(row.id); }} /></Tooltip>
-                <Tooltip title="Indent into folder above"><Button size="small" type="text" icon={<MenuFoldOutlined />} onClick={e => { e.stopPropagation(); onIndent(row.id); }} /></Tooltip>
-                <Tooltip title="Move up"><Button size="small" type="text" icon={<UpOutlined />} onClick={e => { e.stopPropagation(); onReorder(row.id, -1); }} /></Tooltip>
-                <Tooltip title="Move down"><Button size="small" type="text" icon={<DownOutlined />} onClick={e => { e.stopPropagation(); onReorder(row.id, 1); }} /></Tooltip>
+                <Tooltip title="Outdent"><Button size="small" type="text" icon={<IconOutdent />} disabled={!row.node.parentId} onClick={e => { e.stopPropagation(); onOutdent(row.id); }} /></Tooltip>
+                <Tooltip title="Indent into folder above"><Button size="small" type="text" icon={<IconIndent />} onClick={e => { e.stopPropagation(); onIndent(row.id); }} /></Tooltip>
+                <Tooltip title="Move up"><Button size="small" type="text" icon={<IconMoveUp />} onClick={e => { e.stopPropagation(); onReorder(row.id, -1); }} /></Tooltip>
+                <Tooltip title="Move down"><Button size="small" type="text" icon={<IconMoveDown />} onClick={e => { e.stopPropagation(); onReorder(row.id, 1); }} /></Tooltip>
                 <Tooltip title={data.locked ? 'Unlock' : 'Lock'}>
-                  <Button size="small" type="text" icon={data.locked ? <LockOutlined /> : <UnlockOutlined />} onClick={e => { e.stopPropagation(); onToggleLocked(row.id); }} />
+                  <Button size="small" type="text" icon={data.locked ? <IconLock /> : <IconUnlock />} onClick={e => { e.stopPropagation(); onToggleLocked(row.id); }} />
                 </Tooltip>
                 <Tooltip title={data.hidden ? 'Show' : 'Hide'}>
-                  <Button size="small" type="text" icon={data.hidden ? <EyeInvisibleOutlined /> : <EyeOutlined />} onClick={e => { e.stopPropagation(); onToggleHidden(row.id); }} />
+                  <Button size="small" type="text" icon={data.hidden ? <IconEyeClosed /> : <IconEyeOpen />} onClick={e => { e.stopPropagation(); onToggleHidden(row.id); }} />
                 </Tooltip>
               </div>
             </div>
           );
         })}
       </div>
-    </div>
+    </PeekableDrawer>
   );
 }

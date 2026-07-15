@@ -21,3 +21,8 @@ vite.config.ts.timestamp*
 # Firebase
 .firebase/
 firebase-debug.log
+
+# Stray tsc build artifacts
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts

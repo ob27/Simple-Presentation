@@ -1,17 +1,20 @@
 import { useState } from 'react';
-import { Tabs, ColorPicker, InputNumber, Select, Radio, Button, Tooltip, Switch } from 'antd';
+import { Tabs, ColorPicker, InputNumber, Select, Radio, Button, Tooltip, Switch, Slider, Input } from 'antd';
 import {
-  LinkOutlined, CloseOutlined, DatabaseOutlined, DeleteOutlined, PlusOutlined, FontSizeOutlined, VideoCameraOutlined,
-  BoldOutlined, ItalicOutlined, UnderlineOutlined, StrikethroughOutlined, LineHeightOutlined,
-  AlignLeftOutlined, AlignCenterOutlined, AlignRightOutlined, MenuOutlined,
-  VerticalAlignTopOutlined, VerticalAlignMiddleOutlined, VerticalAlignBottomOutlined, HighlightOutlined,
-} from '@ant-design/icons';
+  IconLink, IconClose, IconDataBinding, IconDelete, IconAdd, IconFontSize, IconVideoCamera,
+  IconBold, IconItalic, IconUnderline, IconStrikethrough, IconLineHeight,
+  IconAlignLeft, IconAlignCenter, IconAlignRight, IconJustify,
+  IconAlignTop, IconAlignMiddle, IconAlignBottom, IconBrush,
+} from '../icons';
 import type { Node, Edge } from '@xyflow/react';
-import type { ShapeNodeData } from '../../types/shapes';
+import type { ShapeNodeData, CustomField } from '../../types/shapes';
 import type { DiagramPage } from '../../types/document';
 import type { ShapeLink } from '../../types/links';
 import type { DiagramVariable, StyleRule, StyleRuleOp } from '../../types/variables';
 import { DEFAULT_PIE_SEGMENTS } from '../../utils/pieDefaults';
+import { DEFAULT_CHART_DATA } from '../../utils/chartDefaults';
+import { ColorPickerField } from './ColorPickerField';
+import { defaultGradient } from '../../utils/gradient';
 
 const OP_OPTIONS: { value: StyleRuleOp; label: string }[] = [
   { value: '<', label: '<' }, { value: '<=', label: '≤' },
@@ -33,14 +36,23 @@ interface Props {
   connectorEdges: Edge[];
   onChange: (patch: Partial<ShapeNodeData>) => void;
   onResize: (width: number, height: number) => void;
+  onMove: (x: number, y: number) => void;
+  // The Y origin (px) of the page this shape lives on, so X/Y can be shown
+  // relative to the page's top-left corner rather than this document's
+  // internal stacked-pages coordinate space (PAGE_X is always 0, so only Y
+  // needs the offset — kept as an explicit prop anyway so that isn't baked
+  // in twice).
+  pageOrigin: number;
   onDeleteEdge: (id: string) => void;
   onClose: () => void;
 }
 
-export function ShapePropertiesPanel({ node, pages, allShapes, variables, connectorEdges, onChange, onResize, onDeleteEdge, onClose }: Props) {
+export function ShapePropertiesPanel({ node, pages, allShapes, variables, connectorEdges, onChange, onResize, onMove, pageOrigin, onDeleteEdge, onClose }: Props) {
   const data = node.data as ShapeNodeData;
   const widthMm = Math.round(((node.width ?? 100) / PX_PER_MM) * 10) / 10;
   const heightMm = Math.round(((node.height ?? 70) / PX_PER_MM) * 10) / 10;
+  const xMm = Math.round((node.position.x / PX_PER_MM) * 10) / 10;
+  const yMm = Math.round(((node.position.y - pageOrigin) / PX_PER_MM) * 10) / 10;
   function handleWidthMmChange(mm: number | null) {
     if (mm === null || mm <= 0) return;
     onResize(mm * PX_PER_MM, node.height ?? 70);
@@ -48,6 +60,14 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
   function handleHeightMmChange(mm: number | null) {
     if (mm === null || mm <= 0) return;
     onResize(node.width ?? 100, mm * PX_PER_MM);
+  }
+  function handleXMmChange(mm: number | null) {
+    if (mm === null) return;
+    onMove(mm * PX_PER_MM, node.position.y);
+  }
+  function handleYMmChange(mm: number | null) {
+    if (mm === null) return;
+    onMove(node.position.x, pageOrigin + mm * PX_PER_MM);
   }
   const [linkType, setLinkType] = useState<'page' | 'shape' | 'none'>(
     data.link?.type === 'shape' ? 'shape' : data.link?.type === 'page' ? 'page' : 'none',
@@ -64,6 +84,9 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
   const shapesOnTargetPage = allShapes.filter(s =>
     s.id !== node.id && s.type === 'shape' && (s.data as ShapeNodeData).pageId === (data.link?.targetPageId ?? '')
   );
+  const allTagOptions = Array.from(new Set(allShapes.flatMap(s => (s.data as ShapeNodeData).tags ?? [])))
+    .sort()
+    .map(t => ({ value: t, label: t }));
 
   // A connector's visual path can end up rendered underneath a shape (e.g.
   // two connected nodes overlapping produces a degenerate routed path) —
@@ -88,6 +111,18 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
     onChange({ dataBinding: { variableId: data.dataBinding?.variableId ?? '', ...data.dataBinding, rules } });
   }
 
+  function updateCustomField(index: number, patch: Partial<CustomField>) {
+    const fields = [...(data.customFields ?? [])];
+    fields[index] = { ...fields[index], ...patch };
+    onChange({ customFields: fields });
+  }
+  function addCustomField() {
+    onChange({ customFields: [...(data.customFields ?? []), { key: '', value: '' }] });
+  }
+  function removeCustomField(index: number) {
+    onChange({ customFields: (data.customFields ?? []).filter((_, i) => i !== index) });
+  }
+
   return (
     <div style={{
       position: 'absolute', top: 0, right: 0, bottom: 0, width: 260, zIndex: 15,
@@ -96,7 +131,7 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
     }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', borderBottom: '1px solid #f0f0f0' }}>
         <span style={{ fontWeight: 600, fontSize: 13, color: '#1a1a2e' }}>Shape</span>
-        <Button size="small" type="text" icon={<CloseOutlined />} onClick={onClose} />
+        <Button size="small" type="text" icon={<IconClose />} onClick={onClose} />
       </div>
 
       {connections.length > 0 && (
@@ -117,7 +152,7 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
                     {otherLabel}
                   </span>
                   <Tooltip title="Delete this connector">
-                    <Button size="small" type="text" danger icon={<DeleteOutlined />} onClick={() => onDeleteEdge(e.id)} />
+                    <Button size="small" type="text" danger icon={<IconDelete />} onClick={() => onDeleteEdge(e.id)} />
                   </Tooltip>
                 </div>
               );
@@ -151,20 +186,89 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
                     />
                   </div>
                 </div>
+                <div style={{ display: 'flex', gap: 10 }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>X (mm)</div>
+                    <InputNumber
+                      step={0.1} value={xMm} style={{ width: '100%' }}
+                      onChange={handleXMmChange}
+                    />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Y (mm)</div>
+                    <InputNumber
+                      step={0.1} value={yMm} style={{ width: '100%' }}
+                      onChange={handleYMmChange}
+                    />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Rotation (°)</div>
+                    <InputNumber
+                      step={1} value={data.rotation ?? 0} style={{ width: '100%' }}
+                      onChange={v => onChange({ rotation: v ?? 0 })}
+                    />
+                  </div>
+                </div>
                 <div>
                   <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Fill</div>
-                  <ColorPicker
-                    value={data.fillColor ?? '#E3EAFD'}
-                    onChangeComplete={c => onChange({ fillColor: c.toHexString() })}
-                    showText
-                  />
+                  <Radio.Group
+                    size="small" style={{ marginBottom: 6 }}
+                    value={data.fillGradient ? 'gradient' : 'solid'}
+                    onChange={e => onChange({
+                      fillGradient: e.target.value === 'gradient' ? (data.fillGradient ?? defaultGradient(data.fillColor ?? '#E3EAFD')) : undefined,
+                    })}
+                  >
+                    <Radio.Button value="solid">Solid</Radio.Button>
+                    <Radio.Button value="gradient">Gradient</Radio.Button>
+                  </Radio.Group>
+                  {data.fillGradient ? (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      <Select
+                        size="small" style={{ width: '100%' }}
+                        value={data.fillGradient.type}
+                        options={[{ value: 'linear', label: 'Linear' }, { value: 'radial', label: 'Radial' }]}
+                        onChange={v => onChange({ fillGradient: { ...data.fillGradient!, type: v } })}
+                      />
+                      {data.fillGradient.type === 'linear' && (
+                        <div>
+                          <div style={{ fontSize: 11, color: '#aaa', marginBottom: 2 }}>Angle</div>
+                          <Slider
+                            min={0} max={360} value={data.fillGradient.angle ?? 90}
+                            onChange={v => onChange({ fillGradient: { ...data.fillGradient!, angle: v } })}
+                          />
+                        </div>
+                      )}
+                      <div style={{ display: 'flex', gap: 8 }}>
+                        <ColorPickerField
+                          value={data.fillGradient.stops[0]?.color ?? '#E3EAFD'}
+                          onChangeComplete={hex => {
+                            const stops = [...data.fillGradient!.stops];
+                            stops[0] = { color: hex, offset: stops[0]?.offset ?? 0 };
+                            onChange({ fillGradient: { ...data.fillGradient!, stops } });
+                          }}
+                        />
+                        <ColorPickerField
+                          value={data.fillGradient.stops[1]?.color ?? '#ffffff'}
+                          onChangeComplete={hex => {
+                            const stops = [...data.fillGradient!.stops];
+                            stops[1] = { color: hex, offset: stops[1]?.offset ?? 100 };
+                            onChange({ fillGradient: { ...data.fillGradient!, stops } });
+                          }}
+                        />
+                      </div>
+                    </div>
+                  ) : (
+                    <ColorPickerField
+                      value={data.fillColor ?? '#E3EAFD'}
+                      onChangeComplete={hex => onChange({ fillColor: hex })}
+                    />
+                  )}
                 </div>
                 <div>
                   <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Stroke</div>
-                  <ColorPicker
+                  <ColorPickerField
                     value={data.strokeColor ?? '#7C93E8'}
-                    onChangeComplete={c => onChange({ strokeColor: c.toHexString() })}
-                    showText
+                    onChangeComplete={hex => onChange({ strokeColor: hex })}
                   />
                 </div>
                 <div>
@@ -212,6 +316,22 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
                     />
                   </div>
                 )}
+                <div style={{ display: 'flex', gap: 10 }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Opacity (%)</div>
+                    <Slider
+                      min={0} max={100} value={data.opacity ?? 100}
+                      onChange={v => onChange({ opacity: v })}
+                    />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Blur (px)</div>
+                    <Slider
+                      min={0} max={20} value={data.blur ?? 0}
+                      onChange={v => onChange({ blur: v })}
+                    />
+                  </div>
+                </div>
                 {data.kind === 'container' && (
                   <div>
                     <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Theme</div>
@@ -231,10 +351,9 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
                 {data.kind === 'container' && (data.containerTheme === 'header' || data.containerTheme === 'swimlane') && (
                   <div>
                     <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Accent color</div>
-                    <ColorPicker
+                    <ColorPickerField
                       value={data.containerAccentColor ?? '#7C93E8'}
-                      onChangeComplete={c => onChange({ containerAccentColor: c.toHexString() })}
-                      showText
+                      onChangeComplete={hex => onChange({ containerAccentColor: hex })}
                     />
                   </div>
                 )}
@@ -310,14 +429,14 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
                                 }}
                               />
                               <Button
-                                size="small" icon={<DeleteOutlined />} danger
+                                size="small" icon={<IconDelete />} danger
                                 onClick={() => onChange({ pieSegments: segments.filter((_, idx) => idx !== i) })}
                               />
                             </div>
                           );
                         })}
                         <Button
-                          size="small" icon={<PlusOutlined />}
+                          size="small" icon={<IconAdd />}
                           onClick={() => {
                             const segments = data.pieSegments ?? DEFAULT_PIE_SEGMENTS;
                             onChange({ pieSegments: [...segments, { id: crypto.randomUUID(), label: 'New', value: 1, color: '#8CA3E8' }] });
@@ -329,12 +448,77 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
                     </div>
                   </>
                 )}
+                {data.kind === 'chart' && (
+                  <>
+                    <div>
+                      <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Chart type</div>
+                      <Radio.Group
+                        size="small" value={data.chartType ?? 'bar'}
+                        onChange={e => onChange({ chartType: e.target.value })}
+                      >
+                        <Radio.Button value="bar">Bar</Radio.Button>
+                        <Radio.Button value="line">Line</Radio.Button>
+                      </Radio.Group>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Data</div>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                        {(data.chartData ?? DEFAULT_CHART_DATA).map((point, i) => {
+                          const points = data.chartData ?? DEFAULT_CHART_DATA;
+                          return (
+                            <div key={point.id} style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                              <ColorPicker
+                                value={point.color}
+                                onChangeComplete={c => {
+                                  const next = [...points];
+                                  next[i] = { ...next[i], color: c.toHexString() };
+                                  onChange({ chartData: next });
+                                }}
+                              />
+                              <input
+                                value={point.label}
+                                placeholder="Label"
+                                onChange={e => {
+                                  const next = [...points];
+                                  next[i] = { ...next[i], label: e.target.value };
+                                  onChange({ chartData: next });
+                                }}
+                                style={{ flex: 1, minWidth: 0, padding: '4px 8px', border: '1px solid #d9d9d9', borderRadius: 4, fontSize: 12, boxSizing: 'border-box' }}
+                              />
+                              <InputNumber
+                                min={0} value={point.value} style={{ width: 64 }}
+                                onChange={v => {
+                                  const next = [...points];
+                                  next[i] = { ...next[i], value: v ?? 0 };
+                                  onChange({ chartData: next });
+                                }}
+                              />
+                              <Button
+                                size="small" icon={<IconDelete />} danger
+                                onClick={() => onChange({ chartData: points.filter((_, idx) => idx !== i) })}
+                              />
+                            </div>
+                          );
+                        })}
+                        <Button
+                          size="small" icon={<IconAdd />}
+                          onClick={() => {
+                            const points = data.chartData ?? DEFAULT_CHART_DATA;
+                            onChange({ chartData: [...points, { id: crypto.randomUUID(), label: 'New', value: 1, color: '#8CA3E8' }] });
+                          }}
+                        >
+                          Add data point
+                        </Button>
+                      </div>
+                    </div>
+                  </>
+                )}
               </div>
             ),
           },
           ...(data.kind === 'text' ? [{
             key: 'text',
-            label: <span><FontSizeOutlined /> Text</span>,
+            label: <span><IconFontSize /> Text</span>,
             children: (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 16, paddingTop: 8 }}>
                 <div>
@@ -358,14 +542,14 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
                       <Tooltip title="Font size">
                         <InputNumber
                           min={8} max={96} value={data.fontSize ?? 13} style={{ width: '100%' }}
-                          prefix={<FontSizeOutlined style={{ color: '#bbb' }} />}
+                          prefix={<IconFontSize style={{ color: '#bbb' }} />}
                           onChange={v => onChange({ fontSize: v ?? 13 })}
                         />
                       </Tooltip>
                       <Tooltip title="Line height">
                         <InputNumber
                           min={0.8} max={3} step={0.1} value={data.lineHeight ?? 1.3} style={{ width: '100%' }}
-                          prefix={<LineHeightOutlined style={{ color: '#bbb' }} />}
+                          prefix={<IconLineHeight style={{ color: '#bbb' }} />}
                           onChange={v => onChange({ lineHeight: v ?? 1.3 })}
                         />
                       </Tooltip>
@@ -379,26 +563,25 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
                     </div>
                     <div style={{ display: 'flex', gap: 4 }}>
                       <Button
-                        size="small" type={data.fontWeight === 'bold' ? 'primary' : 'default'} icon={<BoldOutlined />}
+                        size="small" type={data.fontWeight === 'bold' ? 'primary' : 'default'} icon={<IconBold />}
                         onClick={() => onChange({ fontWeight: data.fontWeight === 'bold' ? 'normal' : 'bold' })}
                       />
                       <Button
-                        size="small" type={data.fontStyle === 'italic' ? 'primary' : 'default'} icon={<ItalicOutlined />}
+                        size="small" type={data.fontStyle === 'italic' ? 'primary' : 'default'} icon={<IconItalic />}
                         onClick={() => onChange({ fontStyle: data.fontStyle === 'italic' ? 'normal' : 'italic' })}
                       />
                       <Button
-                        size="small" type={data.textDecoration === 'underline' ? 'primary' : 'default'} icon={<UnderlineOutlined />}
+                        size="small" type={data.textDecoration === 'underline' ? 'primary' : 'default'} icon={<IconUnderline />}
                         onClick={() => onChange({ textDecoration: data.textDecoration === 'underline' ? 'none' : 'underline' })}
                       />
                       <Button
-                        size="small" type={data.textDecoration === 'line-through' ? 'primary' : 'default'} icon={<StrikethroughOutlined />}
+                        size="small" type={data.textDecoration === 'line-through' ? 'primary' : 'default'} icon={<IconStrikethrough />}
                         onClick={() => onChange({ textDecoration: data.textDecoration === 'line-through' ? 'none' : 'line-through' })}
                       />
                     </div>
-                    <ColorPicker
+                    <ColorPickerField
                       value={data.fontColor ?? '#1a1a2e'}
-                      onChangeComplete={c => onChange({ fontColor: c.toHexString() })}
-                      showText
+                      onChangeComplete={hex => onChange({ fontColor: hex })}
                     />
                   </div>
                 </div>
@@ -411,18 +594,18 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
                     <div>
                       <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Alignment</div>
                       <Radio.Group size="small" value={data.textAlign ?? 'center'} onChange={e => onChange({ textAlign: e.target.value })}>
-                        <Radio.Button value="left"><AlignLeftOutlined /></Radio.Button>
-                        <Radio.Button value="center"><AlignCenterOutlined /></Radio.Button>
-                        <Radio.Button value="right"><AlignRightOutlined /></Radio.Button>
-                        <Radio.Button value="justify"><MenuOutlined /></Radio.Button>
+                        <Radio.Button value="left"><IconAlignLeft /></Radio.Button>
+                        <Radio.Button value="center"><IconAlignCenter /></Radio.Button>
+                        <Radio.Button value="right"><IconAlignRight /></Radio.Button>
+                        <Radio.Button value="justify"><IconJustify /></Radio.Button>
                       </Radio.Group>
                     </div>
                     <div>
                       <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Vertical alignment</div>
                       <Radio.Group size="small" value={data.verticalAlign ?? 'middle'} onChange={e => onChange({ verticalAlign: e.target.value })}>
-                        <Radio.Button value="top"><VerticalAlignTopOutlined /></Radio.Button>
-                        <Radio.Button value="middle"><VerticalAlignMiddleOutlined /></Radio.Button>
-                        <Radio.Button value="bottom"><VerticalAlignBottomOutlined /></Radio.Button>
+                        <Radio.Button value="top"><IconAlignTop /></Radio.Button>
+                        <Radio.Button value="middle"><IconAlignMiddle /></Radio.Button>
+                        <Radio.Button value="bottom"><IconAlignBottom /></Radio.Button>
                       </Radio.Group>
                     </div>
                   </div>
@@ -432,7 +615,7 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
           }] : []),
           ...(data.kind === 'video' ? [{
             key: 'video',
-            label: <span><VideoCameraOutlined /> Video</span>,
+            label: <span><IconVideoCamera /> Video</span>,
             children: (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 14, paddingTop: 8 }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -456,7 +639,7 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
           }] : []),
           ...(data.kind === 'brushStroke' ? [{
             key: 'brush',
-            label: <span><HighlightOutlined /> Brush</span>,
+            label: <span><IconBrush /> Brush</span>,
             children: (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 14, paddingTop: 8 }}>
                 <div>
@@ -481,10 +664,9 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
                 </div>
                 <div>
                   <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Color</div>
-                  <ColorPicker
+                  <ColorPickerField
                     value={data.strokeColor ?? '#1a1a2e'}
-                    onChangeComplete={c => onChange({ strokeColor: c.toHexString() })}
-                    showText
+                    onChangeComplete={hex => onChange({ strokeColor: hex })}
                   />
                 </div>
               </div>
@@ -492,7 +674,7 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
           }] : []),
           {
             key: 'link',
-            label: <span><LinkOutlined /> Link</span>,
+            label: <span><IconLink /> Link</span>,
             children: (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 14, paddingTop: 8 }}>
                 <Radio.Group
@@ -559,9 +741,39 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
           },
           {
             key: 'data',
-            label: <span><DatabaseOutlined /> Data</span>,
+            label: <span><IconDataBinding /> Data binding</span>,
             children: (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 10, paddingTop: 8 }}>
+                <div>
+                  <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Custom fields</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {(data.customFields ?? []).map((field, i) => (
+                      <div key={i} style={{ display: 'flex', gap: 4 }}>
+                        <Input
+                          size="small" placeholder="Key" value={field.key} style={{ flex: 1 }}
+                          onChange={e => updateCustomField(i, { key: e.target.value })}
+                        />
+                        <Input
+                          size="small" placeholder="Value" value={field.value} style={{ flex: 1 }}
+                          onChange={e => updateCustomField(i, { value: e.target.value })}
+                        />
+                        <Button size="small" type="text" danger icon={<IconDelete />} onClick={() => removeCustomField(i)} />
+                      </div>
+                    ))}
+                    <Button size="small" icon={<IconAdd />} onClick={addCustomField}>Add field</Button>
+                  </div>
+                </div>
+                <div style={{ borderTop: '1px solid #f0f0f0', margin: '2px 0' }} />
+                <div>
+                  <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Tags</div>
+                  <Select
+                    mode="tags" size="small" style={{ width: '100%' }} placeholder="Add a tag"
+                    value={data.tags ?? []}
+                    options={allTagOptions}
+                    onChange={v => onChange({ tags: v })}
+                  />
+                </div>
+                <div style={{ borderTop: '1px solid #f0f0f0', margin: '2px 0' }} />
                 <div>
                   <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Bound variable</div>
                   <Select
@@ -592,10 +804,10 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
                           value={rule.style.fill ?? '#ff4d4f'}
                           onChangeComplete={c => updateRule(i, { style: { ...rule.style, fill: c.toHexString() } })}
                         />
-                        <Button size="small" type="text" danger icon={<DeleteOutlined />} onClick={() => removeRule(i)} />
+                        <Button size="small" type="text" danger icon={<IconDelete />} onClick={() => removeRule(i)} />
                       </div>
                     ))}
-                    <Button size="small" icon={<PlusOutlined />} onClick={addRule}>Add rule</Button>
+                    <Button size="small" icon={<IconAdd />} onClick={addRule}>Add rule</Button>
                   </>
                 )}
               </div>

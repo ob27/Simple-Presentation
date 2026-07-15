@@ -1,4 +1,5 @@
 import { useMemo, useState, useEffect, useCallback, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import {
   ReactFlow, Background, Controls, addEdge, applyNodeChanges, applyEdgeChanges,
   MarkerType, ConnectionMode, useReactFlow, type Node, type Edge, type NodeTypes, type EdgeTypes,
@@ -6,14 +7,19 @@ import {
 } from '@xyflow/react';
 import { Button, Tooltip, Select, Popover, Switch, ColorPicker } from 'antd';
 import {
-  DeleteOutlined, VerticalAlignTopOutlined, VerticalAlignBottomOutlined,
-  GroupOutlined, UngroupOutlined, BorderOuterOutlined,
-  CloseCircleOutlined, LeftOutlined, RightOutlined,
-  FullscreenOutlined, FullscreenExitOutlined, SettingOutlined, BorderOutlined,
-} from '@ant-design/icons';
-import type { DiagramPage, PresentationSettings } from '../../types/document';
+  IconDelete, IconAlignTop, IconAlignBottom, IconAlignMiddle,
+  IconAlignLeft, IconAlignCenter, IconAlignRight, IconDistributeH, IconDistributeV,
+  IconBringToFront, IconSendToBack, IconDuplicate,
+  IconBooleanUnion, IconBooleanSubtract, IconBooleanIntersect, IconBooleanExclude,
+  IconGroup, IconUngroup, IconContainer,
+  IconExit, IconChevronLeft, IconChevronRight,
+  IconFullscreenEnter, IconFullscreenExit, IconSettingsGear, IconFillScreen,
+  IconAddRow, IconRemoveRow, IconAddColumn, IconRemoveColumn,
+} from '../icons';
+import type { DiagramPage, PresentationSettings, PresentState } from '../../types/document';
+import type { ToolId } from '../../types/tools';
 import type { ShapeKind, DiagramNode, ShapeNodeData, PathAnchor, BrushPoint } from '../../types/shapes';
-import type { DiagramEdge, SmartEdgeData } from '../../types/edges';
+import type { DiagramEdge, SmartEdgeData, ArrowStyle } from '../../types/edges';
 import { getPageDimensions } from '../../utils/paperSizes';
 import { PAGE_GAP, PAGE_X } from '../../constants';
 import { PageFrameNode } from './nodes/PageFrameNode';
@@ -24,8 +30,12 @@ import { CommentPinNode } from './nodes/CommentPinNode';
 import { CommentThreadPanel } from '../panels/CommentThreadPanel';
 import { SmartEdge } from './edges/SmartEdge';
 import { PageNavigatorRail } from './PageNavigatorRail';
+import { RulerOverlay } from './Ruler';
 import { Toolbar } from './Toolbar';
-import { ShapeGalleryModal } from '../ShapeGalleryModal';
+import { ToolSettingsPanel } from '../panels/ToolSettingsPanel';
+import { FavoriteShapesPanel } from './FavoriteShapesPanel';
+import { useFavoriteShapes, MAX_FAVORITE_SHAPES } from '../../hooks/useFavoriteShapes';
+import { useToolDefaults } from '../../hooks/useToolDefaults';
 import { ShapeStampCursor } from './ShapeStampCursor';
 import { useActivePageId } from './useActivePageId';
 import { AlignmentGuidesOverlay } from './AlignmentGuidesOverlay';
@@ -38,11 +48,16 @@ import {
   subdivideBezierAt, synthesizeSmoothHandles,
 } from '../../utils/pathAnchorGeometry';
 import { computeAlignmentGuides, type GuideLines } from './alignmentGuides';
+import { applyBooleanOp, groupContoursByContainment, ellipseToAnchors, roundedRectToAnchors, type BooleanOp, type PathContour } from '../../utils/pathBoolean';
 import { ShapePropertiesPanel } from '../panels/ShapePropertiesPanel';
 import { DataPanel } from '../panels/DataPanel';
+import { ValidationPanel } from '../panels/ValidationPanel';
+import { computeValidationIssues } from '../../utils/diagramValidation';
 import { AnimationPanel, type SequenceItem } from '../panels/AnimationPanel';
 import { LayersPanel } from '../panels/LayersPanel';
+import { PageSettingsPanel } from '../panels/PageSettingsPanel';
 import { ExportModal } from '../ExportModal';
+import { ShortcutsHelpModal } from '../ShortcutsHelpModal';
 import { RemoteCursorsLayer } from './RemoteCursorsLayer';
 import { PresentationFrame } from './PresentationFrame';
 import { usePresence } from '../../hooks/usePresence';
@@ -90,16 +105,63 @@ interface Props {
   onExitPresent?: () => void;
   presentationSettings?: PresentationSettings;
   onUpdatePresentationSettings?: (patch: Partial<PresentationSettings>) => void;
+  // Two-way sync for Presenter View: whichever presentation window (main
+  // audience view or a separate presenter-mode tab) navigates writes here,
+  // and both adopt whatever the other last wrote — see PresentState's own
+  // doc comment for why this (not true OS-level dual-monitor control) is
+  // the actual deliverable.
+  presentState?: PresentState;
+  onPresentStateChange?: (state: PresentState) => void;
+  toolbarSlot?: HTMLElement | null;
+  onInsertPageAt?: (afterOrder: number) => void;
+  onReorderPages?: (pages: DiagramPage[]) => void;
+  // Diagram members, for @mention autocomplete in comment threads.
+  members?: { uid: string; email: string }[];
 }
 
+// A connector's arrowhead is chosen per-end (start/end independently) after
+// it's drawn, stored in `data.startArrow`/`endArrow` and materialized into
+// React Flow's own `markerStart`/`markerEnd` edge fields here — `undefined`
+// falls back to each end's pre-existing default (no start arrow, filled
+// arrow at the end) so every connector created before this field existed
+// keeps looking exactly the same.
+function arrowMarker(style: ArrowStyle | undefined, fallback: ArrowStyle) {
+  const resolved = style ?? fallback;
+  if (resolved === 'none') return undefined;
+  return { type: resolved === 'arrow' ? MarkerType.Arrow : MarkerType.ArrowClosed, color: '#8a93a6' };
+}
+
+// Fields the Style Paint tool copies from a source shape onto a target —
+// deliberately just the "look" (fill/stroke/effects + text styling), never
+// content, geometry, links, data-bindings, or animation config. Matches
+// exactly the fields ShapePropertiesPanel's Style + Text tabs expose.
+const STYLE_PAINT_FIELDS = [
+  'fillColor', 'strokeColor', 'strokeWidth', 'strokeStyle', 'cornerRadius',
+  'effect', 'opacity', 'blur', 'fillGradient', 'containerTheme', 'containerAccentColor',
+  'fontSize', 'fontColor', 'fontWeight', 'fontFamily', 'textAlign',
+  'fontStyle', 'textDecoration', 'letterSpacing', 'lineHeight', 'verticalAlign',
+] as const satisfies readonly (keyof ShapeNodeData)[];
+
 export function Canvas({
-  diagramId, pages, diagramName = 'diagram', mode = 'edit', onExitPresent,
-  presentationSettings, onUpdatePresentationSettings,
+  diagramId, pages: pagesProp, diagramName = 'diagram', mode = 'edit', onExitPresent,
+  presentationSettings, onUpdatePresentationSettings, presentState, onPresentStateChange,
+  toolbarSlot, onInsertPageAt, onReorderPages, members = [],
 }: Props) {
+  // Master pages (isMaster: true) live in the same pages subcollection as
+  // everything else — reusing all of addPage/updatePage/subscribePages
+  // unchanged — but they're never themselves navigated to, presented,
+  // exported, or counted in {page}/{pages}: they exist only to be pointed
+  // at by other pages' masterPageId. Every existing `pages` usage below
+  // this line continues to mean "the regular, navigable pages" unchanged;
+  // `masterPages` is the small separate list for the settings-form
+  // dropdown and for resolving a page's inherited background/header/footer.
+  const masterPages = useMemo(() => pagesProp.filter(p => p.isMaster), [pagesProp]);
+  const pages = useMemo(() => pagesProp.filter(p => !p.isMaster), [pagesProp]);
+
   const { user } = useAuth();
   const { screenToFlowPosition, setCenter, getZoom, getInternalNode, fitBounds, getViewport, setViewport, updateNodeData } = useReactFlow();
   const isPresent = mode === 'present';
-  const { peers, updateCursor, updateDragPreview } = usePresence(diagramId, user);
+  const { peers, updateCursor, updateDragPreview } = usePresence(diagramId, user, mode);
   // Measures the actual on-screen container size so fitToPage can reserve
   // space for the properties drawer (an absolutely-positioned overlay that
   // doesn't shrink this element's own measured size) — fitBounds's own
@@ -130,6 +192,54 @@ export function Canvas({
   // pageDimensions. Routing through a ref that's refreshed every render
   // keeps the call always current without forcing frameNodes to recompute.
   const deselectAllRef = useRef<() => void>(() => {});
+
+  // ── Undo/redo ────────────────────────────────────────────────────────────
+  // A per-tab, this-user-only local command stack — NOT a document-wide
+  // history. It only ever knows how to reverse/reapply actions taken from
+  // this editing session, so undoing never touches whatever a collaborator
+  // is doing concurrently on their own client; it also never even sees their
+  // edits, since Firestore itself (not this stack) remains the only shared
+  // source of truth. Scope for this pass covers the everyday "oops" moments
+  // (restyle, resize, move/nudge, align/distribute, reorder, delete) — NOT
+  // paste/duplicate creation, group/ungroup, connectors, path-anchor edits,
+  // comments, pages, or variables, which would each need their own careful
+  // (and considerably more involved) undo modeling.
+  const undoStackRef = useRef<{ undo: () => void; redo: () => void }[]>([]);
+  const redoStackRef = useRef<{ undo: () => void; redo: () => void }[]>([]);
+  const MAX_HISTORY = 100;
+  function pushHistory(entry: { undo: () => void; redo: () => void }) {
+    undoStackRef.current.push(entry);
+    if (undoStackRef.current.length > MAX_HISTORY) undoStackRef.current.shift();
+    redoStackRef.current = [];
+  }
+  function undo() {
+    const entry = undoStackRef.current.pop();
+    if (!entry) return;
+    entry.undo();
+    redoStackRef.current.push(entry);
+  }
+  function redo() {
+    const entry = redoStackRef.current.pop();
+    if (!entry) return;
+    entry.redo();
+    undoStackRef.current.push(entry);
+  }
+  // Coalesces a burst of rapid same-field edits (holding an arrow key,
+  // dragging a slider, typing into a text field) into ONE history entry
+  // covering the whole burst — `before` is captured only once, from the
+  // first call in the burst, so undo reverts all the way back to the state
+  // before the burst started rather than one keystroke at a time.
+  const historyDebounceRef = useRef<Map<string, { timer: ReturnType<typeof setTimeout>; before: unknown }>>(new Map());
+  function pushDebouncedHistory<T>(key: string, before: T, after: T, apply: (value: T) => void, delay = 500) {
+    const pending = historyDebounceRef.current.get(key);
+    const trueBefore = (pending ? pending.before : before) as T;
+    if (pending) clearTimeout(pending.timer);
+    const timer = setTimeout(() => {
+      historyDebounceRef.current.delete(key);
+      pushHistory({ undo: () => apply(trueBefore), redo: () => apply(after) });
+    }, delay);
+    historyDebounceRef.current.set(key, { timer, before: trueBefore });
+  }
 
   const { pageOrigins, pageDimensions } = useMemo(() => {
     const origins = new Map<string, number>();
@@ -214,19 +324,30 @@ export function Canvas({
   // off any shape) never reaches the pane's own click handler, so RF's
   // usual "click empty space to deselect" behavior silently doesn't fire
   // there. Deselecting explicitly on click closes that gap.
-  const frameNodes = useMemo<Node[]>(() => pages.map(page => ({
-    id: `pageFrame-${page.id}`,
-    type: 'pageFrame',
-    position: { x: PAGE_X, y: pageOrigins.get(page.id) ?? 0 },
-    data: {
-      pageName: page.name, pageId: page.id, onRename: handleRenamePage,
-      onDeselectAll: () => deselectAllRef.current(),
-      ...(pageDimensions.get(page.id) ?? { width: 794, height: 1123 }),
-    },
-    draggable: false,
-    selectable: false,
-    zIndex: -1,
-  })), [pages, pageOrigins, pageDimensions, diagramId]);
+  const frameNodes = useMemo<Node[]>(() => pages.map((page, i) => {
+    const master = page.masterPageId ? masterPages.find(m => m.id === page.masterPageId) : undefined;
+    return {
+      id: `pageFrame-${page.id}`,
+      type: 'pageFrame',
+      position: { x: PAGE_X, y: pageOrigins.get(page.id) ?? 0 },
+      data: {
+        pageName: page.name, pageId: page.id, onRename: handleRenamePage,
+        onDeselectAll: () => deselectAllRef.current(),
+        marginTop: page.marginTop, marginRight: page.marginRight, marginBottom: page.marginBottom, marginLeft: page.marginLeft,
+        // Master-inherited fields fall through only when this page leaves
+        // its own copy unset — same convention as every other optional page field.
+        backgroundColor: page.backgroundColor ?? master?.backgroundColor,
+        headerText: page.headerText ?? master?.headerText,
+        footerText: page.footerText ?? master?.footerText,
+        pageNumberEnabled: page.pageNumberEnabled, pageNumberStyle: page.pageNumberStyle, pageNumberPosition: page.pageNumberPosition,
+        pageIndex: i + 1, pageCount: pages.length,
+        ...(pageDimensions.get(page.id) ?? { width: 794, height: 1123 }),
+      },
+      draggable: false,
+      selectable: false,
+      zIndex: -1,
+    };
+  }), [pages, masterPages, pageOrigins, pageDimensions, diagramId]);
 
   const [variables, setVariables] = useState<DiagramVariable[]>([]);
   useEffect(() => subscribeVariables(diagramId, setVariables), [diagramId]);
@@ -284,6 +405,12 @@ export function Canvas({
       if (isPresent) {
         const targetPage = allPages.find(p => p.id === link.targetPageId);
         zoom = computePresentationLayout(pageDims, targetPage?.paperSize ?? 'A4', windowSizeRef.current, effectiveSettingsRef.current).zoom;
+        // Keep the page counter/Next-Prev state in sync with a link-driven
+        // jump — without this, presentPageIndex goes stale after following a
+        // hotspot/shape link to a different page, and the next arrow-key
+        // press then advances relative to the wrong page.
+        const targetIndex = allPages.findIndex(p => p.id === link.targetPageId);
+        if (targetIndex >= 0) setPresentPageIndex(targetIndex);
       }
       setCenter(pageDims.width / 2, origin + pageDims.height / 2, { zoom, duration });
     }
@@ -314,7 +441,7 @@ export function Canvas({
   function rebuildShapes() {
     const merged: Node[] = [];
     for (const slice of shapesSlices.current.values()) {
-      for (const n of slice.values()) merged.push({ ...n, data: { ...n.data, onCommit, onNavigateLink: navigateToLink, readOnly: isPresent } });
+      for (const n of slice.values()) merged.push({ ...n, data: { ...n.data, onCommit, onNavigateLink: navigateToLink, onResizeGroup: handleResizeGroup, readOnly: isPresent } });
     }
     // React Flow requires a parent node to appear before its children in the
     // array. Firestore's onSnapshot delivery order is unspecified, so sort by
@@ -379,21 +506,46 @@ export function Canvas({
         return;
       }
     }
-  }, [diagramId]);
+  }, [diagramId, shapeNodes]);
 
-  const onCommit = useCallback((id: string, patch: Partial<ShapeNodeData>) => {
+  function applyDataPatch(id: string, data: ShapeNodeData) {
     for (const slice of shapesSlices.current.values()) {
       const existing = slice.get(id);
       if (existing) {
-        const updated: DiagramNode = { ...existing, data: { ...existing.data, ...patch } };
+        const updated: DiagramNode = { ...existing, data };
         slice.set(id, updated);
         saveShape(diagramId, existing.data.pageId, updated);
         rebuildShapes();
         return;
       }
     }
+  }
+  const onCommit = useCallback((id: string, patch: Partial<ShapeNodeData>) => {
+    for (const slice of shapesSlices.current.values()) {
+      const existing = slice.get(id);
+      if (existing) {
+        const prevData = existing.data;
+        const nextData = { ...existing.data, ...patch };
+        applyDataPatch(id, nextData);
+        pushDebouncedHistory(`data:${id}`, prevData, nextData, d => applyDataPatch(id, d));
+        return;
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [diagramId]);
 
+  function applySize(id: string, size: { width: number; height: number }) {
+    for (const slice of shapesSlices.current.values()) {
+      const existing = slice.get(id);
+      if (existing) {
+        const updated: DiagramNode = { ...existing, width: size.width, height: size.height };
+        slice.set(id, updated);
+        saveShape(diagramId, existing.data.pageId, updated);
+        rebuildShapes();
+        return;
+      }
+    }
+  }
   // Precise numeric resize (e.g. the properties panel's mm-based width/
   // height inputs) — width/height live on the node itself, not `.data`, so
   // this can't go through onCommit above.
@@ -401,14 +553,193 @@ export function Canvas({
     for (const slice of shapesSlices.current.values()) {
       const existing = slice.get(id);
       if (existing) {
-        const updated: DiagramNode = { ...existing, width, height };
+        const prevSize = { width: existing.width ?? 100, height: existing.height ?? 70 };
+        const nextSize = { width, height };
+        applySize(id, nextSize);
+        pushDebouncedHistory(`size:${id}`, prevSize, nextSize, s => applySize(id, s));
+        return;
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [diagramId]);
+
+  function applyPosition(id: string, position: { x: number; y: number }) {
+    for (const slice of shapesSlices.current.values()) {
+      const existing = slice.get(id);
+      if (existing) {
+        const updated: DiagramNode = { ...existing, position };
         slice.set(id, updated);
         saveShape(diagramId, existing.data.pageId, updated);
         rebuildShapes();
         return;
       }
     }
+  }
+  // Precise numeric move (the properties panel's mm-based X/Y inputs) —
+  // same "lives on the node, not `.data`" reasoning as handleResizeShape.
+  const handleMoveShape = useCallback((id: string, x: number, y: number) => {
+    for (const slice of shapesSlices.current.values()) {
+      const existing = slice.get(id);
+      if (existing) {
+        const prevPos = existing.position;
+        const nextPos = { x, y };
+        applyPosition(id, nextPos);
+        pushDebouncedHistory(`pos:${id}`, prevPos, nextPos, p => applyPosition(id, p));
+        return;
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [diagramId]);
+
+  // Resizing a group's own frame proportionally rescales every descendant
+  // (any nesting depth) rather than leaving them at their old absolute
+  // pixel geometry inside a now differently-sized frame, which would just
+  // look broken (content overflowing or not filling the new bounds). Reads
+  // the Firestore-committed snapshot directly (via shapesSlices, not the
+  // `shapeNodes` React state) so this stays correct no matter when this
+  // callback's closure was captured — same reasoning as onCommit above.
+  const handleResizeGroup = useCallback((groupId: string, newWidth: number, newHeight: number, newX: number, newY: number) => {
+    const oldGroup = getCommittedShape(groupId);
+    if (!oldGroup) return;
+    const oldWidth = oldGroup.width ?? 100;
+    const oldHeight = oldGroup.height ?? 100;
+    const scaleX = oldWidth > 0 ? newWidth / oldWidth : 1;
+    const scaleY = oldHeight > 0 ? newHeight / oldHeight : 1;
+
+    const allCommitted: DiagramNode[] = [];
+    for (const slice of shapesSlices.current.values()) for (const n of slice.values()) allCommitted.push(n);
+    const byId = new Map(allCommitted.map(n => [n.id, n]));
+    const descendantIds = new Set<string>();
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const n of allCommitted) {
+        if (n.parentId && (n.parentId === groupId || descendantIds.has(n.parentId)) && !descendantIds.has(n.id)) {
+          descendantIds.add(n.id);
+          grew = true;
+        }
+      }
+    }
+
+    type GeomSnapshot = { id: string; position: { x: number; y: number }; width?: number; height?: number; pageId: string };
+    const before: GeomSnapshot[] = [{ id: groupId, position: oldGroup.position, width: oldGroup.width, height: oldGroup.height, pageId: oldGroup.data.pageId }];
+    const after: GeomSnapshot[] = [{ id: groupId, position: { x: newX, y: newY }, width: newWidth, height: newHeight, pageId: oldGroup.data.pageId }];
+    for (const id of descendantIds) {
+      const n = byId.get(id);
+      if (!n) continue;
+      before.push({ id, position: n.position, width: n.width, height: n.height, pageId: n.data.pageId });
+      after.push({
+        id,
+        position: { x: n.position.x * scaleX, y: n.position.y * scaleY },
+        width: n.width !== undefined ? n.width * scaleX : undefined,
+        height: n.height !== undefined ? n.height * scaleY : undefined,
+        pageId: n.data.pageId,
+      });
+    }
+
+    function applySnapshots(snaps: GeomSnapshot[]) {
+      setShapeNodes(prev => prev.map(n => {
+        const s = snaps.find(x => x.id === n.id);
+        if (!s) return n;
+        const updated = { ...n, position: s.position, ...(s.width !== undefined ? { width: s.width } : {}), ...(s.height !== undefined ? { height: s.height } : {}) };
+        saveShape(diagramId, s.pageId, toPersistableShape(updated));
+        return updated;
+      }));
+    }
+
+    applySnapshots(after);
+    pushHistory({ undo: () => applySnapshots(before), redo: () => applySnapshots(after) });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [diagramId]);
+
+  // "Magic Resize" — when a page's paper size/orientation changes, every
+  // shape belonging to that page (any nesting depth) is rescaled by the
+  // same factor rather than left at its old absolute pixel geometry inside
+  // a differently-sized page. Applying the SAME scaleX/scaleY uniformly at
+  // every depth (not just top-level shapes) correctly reproduces a uniform
+  // scale of the whole page's content, same reasoning as handleResizeGroup
+  // above — only top-level shapes need the extra page-origin math, since a
+  // nested shape's position is already relative to its own parent, not the
+  // page.
+  const handleResizePageContent = useCallback((pageId: string, scaleX: number, scaleY: number, pageOrigin: number) => {
+    const allCommitted: DiagramNode[] = [];
+    for (const slice of shapesSlices.current.values()) for (const n of slice.values()) allCommitted.push(n);
+    const pageShapes = allCommitted.filter(n => n.data.pageId === pageId);
+    if (pageShapes.length === 0) return;
+
+    type GeomSnapshot = { id: string; position: { x: number; y: number }; width?: number; height?: number };
+    const before: GeomSnapshot[] = [];
+    const after: GeomSnapshot[] = [];
+    for (const n of pageShapes) {
+      before.push({ id: n.id, position: n.position, width: n.width, height: n.height });
+      const isTopLevel = !n.parentId;
+      const newPosition = isTopLevel
+        ? { x: n.position.x * scaleX, y: pageOrigin + (n.position.y - pageOrigin) * scaleY }
+        : { x: n.position.x * scaleX, y: n.position.y * scaleY };
+      after.push({
+        id: n.id, position: newPosition,
+        width: n.width !== undefined ? n.width * scaleX : undefined,
+        height: n.height !== undefined ? n.height * scaleY : undefined,
+      });
+    }
+
+    function applySnapshots(snaps: GeomSnapshot[]) {
+      setShapeNodes(prev => prev.map(n => {
+        const s = snaps.find(x => x.id === n.id);
+        if (!s) return n;
+        const updated = { ...n, position: s.position, ...(s.width !== undefined ? { width: s.width } : {}), ...(s.height !== undefined ? { height: s.height } : {}) };
+        saveShape(diagramId, pageId, toPersistableShape(updated));
+        return updated;
+      }));
+    }
+
+    applySnapshots(after);
+    pushHistory({ undo: () => applySnapshots(before), redo: () => applySnapshots(after) });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [diagramId]);
+
+  // Reordering pages changes each page's cumulative Y origin in the stacked
+  // canvas (see the pageOrigins useMemo above), but every shape stores an
+  // ABSOLUTE canvas Y position — without this, a page's frame moves to its
+  // new slot while every shape on it stays exactly where it was, visually
+  // leaving the whole page's content behind. Mirrors handleResizePageContent's
+  // "read every committed shape, shift top-level ones, persist" shape.
+  const handleReorderPagesWithShapes = useCallback((reordered: DiagramPage[]) => {
+    const newOrigins = new Map<string, number>();
+    let cursorY = 0;
+    for (const page of reordered) {
+      newOrigins.set(page.id, cursorY);
+      const { height } = getPageDimensions(page.paperSize, page.orientation, page.customWidth, page.customHeight);
+      cursorY += height + PAGE_GAP;
+    }
+
+    const allCommitted: DiagramNode[] = [];
+    for (const slice of shapesSlices.current.values()) for (const n of slice.values()) allCommitted.push(n);
+
+    const updates = new Map<string, { pageId: string; position: { x: number; y: number } }>();
+    for (const page of reordered) {
+      const deltaY = (newOrigins.get(page.id) ?? 0) - (pageOrigins.get(page.id) ?? 0);
+      if (deltaY === 0) continue;
+      for (const n of allCommitted) {
+        // Only top-level shapes carry an absolute, page-relative Y — a
+        // grouped/contained child's position is already local to its parent.
+        if ((n.data as ShapeNodeData).pageId !== page.id || n.parentId) continue;
+        updates.set(n.id, { pageId: page.id, position: { x: n.position.x, y: n.position.y + deltaY } });
+      }
+    }
+
+    if (updates.size > 0) {
+      setShapeNodes(prev => prev.map(n => {
+        const u = updates.get(n.id);
+        if (!u) return n;
+        const updated = { ...n, position: u.position };
+        saveShape(diagramId, u.pageId, toPersistableShape(updated));
+        return updated;
+      }));
+    }
+
+    onReorderPages?.(reordered);
+  }, [diagramId, pageOrigins, onReorderPages]);
 
   const [penMode, setPenMode] = useState(false);
   const [draftAnchors, setDraftAnchors] = useState<PathAnchor[]>([]);
@@ -424,12 +755,23 @@ export function Canvas({
   const [brushMode, setBrushMode] = useState(false);
   const [brushDraft, setBrushDraft] = useState<BrushPoint[] | null>(null);
 
+  // Style Paint ("format painter"): click a source shape to pick up its
+  // look, then click any number of target shapes to apply it — stays armed
+  // across multiple targets until the tool is toggled off or Escape'd,
+  // matching PowerPoint/Illustrator's own format-painter convention.
+  const [stylePaintMode, setStylePaintMode] = useState(false);
+  const [stylePaintSource, setStylePaintSource] = useState<Partial<ShapeNodeData> | null>(null);
+
   // Click-to-place: picking a shape (from the gallery or the quick Hotspot
   // button) no longer creates it immediately — it arms this, and the next
   // canvas click places it exactly there instead of always at the viewport
-  // center. Single-use: placing one shape disarms it again, so it takes a
-  // fresh gallery pick to place another.
+  // center. Single-use: placing one shape disarms it again. The gallery
+  // panel itself (unlike the old modal) never needs to reopen after a
+  // placement — it's a non-modal panel, so it simply never closed in the
+  // first place; see beginPlacingShape's `keepGalleryOpen` option.
   const [shapeGalleryOpen, setShapeGalleryOpen] = useState(false);
+  const { favorites, isFavorite, toggleFavorite } = useFavoriteShapes();
+  const { defaults: toolDefaults, updatePenDefaults, updateBrushDefaults, updateConnectorDefaults } = useToolDefaults();
   const [placingShapeKind, setPlacingShapeKind] = useState<ShapeKind | null>(null);
   const [pendingMediaPlacement, setPendingMediaPlacement] = useState<{ kind: 'image' | 'video'; url: string; width: number; height: number } | null>(null);
   // Carries per-placement data the gallery can't express via `kind` alone —
@@ -477,9 +819,21 @@ export function Canvas({
   const [directSelectMode, setDirectSelectMode] = useState(false);
   const [activeAnchorIndex, setActiveAnchorIndex] = useState<number | null>(null);
 
-  const toolActive = penMode || connectMode || directSelectMode || !!placingShapeKind;
+  const [highlightMode, setHighlightMode] = useState(false);
+  const [highlighted, setHighlighted] = useState<{ nodeIds: Set<string>; edgeIds: Set<string> } | null>(null);
 
-  function clearOtherTools() {
+  const toolActive = penMode || connectMode || directSelectMode || brushMode || stylePaintMode || highlightMode || !!placingShapeKind;
+
+  // The one shared reset+activate function behind every toolbar button
+  // (drawing modes AND right-side panels alike) — replaces what used to be
+  // clearOtherTools() (mode flags only) plus five separate hand-written
+  // per-panel reset lists. Unconditionally resets EVERY mode/panel flag,
+  // then activates exactly the one requested. Two real bugs this fixes for
+  // free just by existing: Branch Highlight used to skip clearOtherTools()
+  // entirely (so it could stack with any drawing tool); Data/Animation's
+  // own hand-written reset lists each independently forgot to close
+  // Validation. With one shared reset list, neither can happen again.
+  function selectTool(toolId: ToolId) {
     // Finalize (not discard) an in-progress pen path when switching tools —
     // matches the pen tool's own Escape/toggle-off behavior.
     if (penMode) {
@@ -489,16 +843,43 @@ export function Canvas({
     setPenMode(false); lastPenClickRef.current = null;
     setConnectMode(false); setConnectDrag(null);
     setPlacingShapeKind(null); setPendingMediaPlacement(null);
+    setPendingShapeExtraData(null);
     setHighlightMode(false); setHighlighted(null);
     setDirectSelectMode(false); setActiveAnchorIndex(null);
     setPlacingComment(false);
     setBrushMode(false);
-  }
+    setStylePaintMode(false); setStylePaintSource(null);
+    setLayersPanelOpen(false);
+    setAnimationPanelOpen(false); setRevealStep(-1);
+    setDataPanelOpen(false);
+    setValidationPanelOpen(false);
+    setPageSettingsPanelOpen(false);
+    setGridRulersPanelOpen(false);
+    setTagsPanelOpen(false);
+    setShapeGalleryOpen(false);
 
-  function handleToggleDirectSelect() {
-    const wasOn = directSelectMode;
-    clearOtherTools();
-    if (!wasOn) setDirectSelectMode(true);
+    switch (toolId) {
+      case 'select': break;
+      case 'directSelect': setDirectSelectMode(true); break;
+      case 'pen': setPenMode(true); break;
+      case 'brush': setBrushMode(true); break;
+      case 'stylePaint': setStylePaintMode(true); break;
+      case 'connect': setConnectMode(true); break;
+      case 'comment': setPlacingComment(true); break;
+      case 'highlight': setHighlightMode(true); break;
+      case 'layers': setLayersPanelOpen(true); break;
+      case 'animation': setAnimationPanelOpen(true); break;
+      case 'data': setDataPanelOpen(true); break;
+      case 'validation': setValidationPanelOpen(true); break;
+      case 'pageSettings': setPageSettingsPanelOpen(true); break;
+      case 'gridRulers': setGridRulersPanelOpen(true); break;
+      case 'tags': setTagsPanelOpen(true); break;
+      case 'shapeGallery': setShapeGalleryOpen(true); break;
+      // 'shapes'/'hotspot'/'media' are armed via beginPlacingShape(kind) /
+      // handleUploadMedia(file), not reachable through this switch directly —
+      // both call selectTool('select') first for the same blanket reset,
+      // then set placingShapeKind themselves.
+    }
   }
 
   // Reset anchor focus whenever the edited path changes (including becoming
@@ -507,8 +888,6 @@ export function Canvas({
     setActiveAnchorIndex(null);
   }, [editingPathId]);
 
-  const [highlightMode, setHighlightMode] = useState(false);
-  const [highlighted, setHighlighted] = useState<{ nodeIds: Set<string>; edgeIds: Set<string> } | null>(null);
   const [animationPanelOpen, setAnimationPanelOpen] = useState(false);
   const [revealStep, setRevealStep] = useState(-1);
   const [presentPageIndex, setPresentPageIndex] = useState(0);
@@ -571,6 +950,8 @@ export function Canvas({
       label: (n.data as ShapeNodeData).label || (n.data as ShapeNodeData).kind,
       revealOrder: (n.data as ShapeNodeData).revealOrder,
       pageId: (n.data as ShapeNodeData).pageId,
+      animationType: (n.data as ShapeNodeData).animationType,
+      animationDuration: (n.data as ShapeNodeData).animationDuration,
     })),
     ...connectorEdges.map(e => ({
       id: e.id, kind: 'connector' as const,
@@ -594,6 +975,27 @@ export function Canvas({
   );
   const presentThresholdOrder = presentStep >= 0 ? presentSequence[presentStep]?.revealOrder ?? -Infinity : -Infinity;
 
+  // Tags currently toggled off via the Tags panel — a local view filter
+  // (never persisted), read by isTagHidden below. Declared here, ahead of
+  // the `nodes` useMemo a few lines down, since that memo's callback runs
+  // synchronously during render (unlike an event-handler closure), so
+  // referencing a not-yet-declared `const` at that point would throw.
+  const [hiddenTags, setHiddenTags] = useState<Set<string>>(new Set());
+  const allTags = useMemo(() => {
+    const set = new Set<string>();
+    for (const n of shapeNodes) {
+      for (const t of (n.data as ShapeNodeData).tags ?? []) set.add(t);
+    }
+    return Array.from(set).sort();
+  }, [shapeNodes]);
+  function toggleTagVisibility(tag: string) {
+    setHiddenTags(prev => {
+      const next = new Set(prev);
+      if (next.has(tag)) next.delete(tag); else next.add(tag);
+      return next;
+    });
+  }
+
   // Persisted layer-visibility (data.hidden, set via the Layers panel) is
   // distinct from the ephemeral __hidden reveal-order overlay computed below
   // — a shape can be mid-reveal-sequence AND author-hidden at once, so these
@@ -608,6 +1010,20 @@ export function Canvas({
     if (!node) return false;
     if ((node.data as ShapeNodeData).hidden) return true;
     return node.parentId ? isPersistedHidden(node.parentId, byId, guard) : false;
+  }
+
+  // A shape (or an ancestor) carrying any currently-toggled-off tag is
+  // hidden too — this is a purely local viewer filter (hiddenTags is
+  // client-side React state, never written to Firestore), unlike
+  // isPersistedHidden's data.hidden, which every collaborator shares.
+  function isTagHidden(id: string, byId: Map<string, Node>, guard: Set<string> = new Set()): boolean {
+    if (guard.has(id)) return false;
+    guard.add(id);
+    const node = byId.get(id);
+    if (!node) return false;
+    const tags = (node.data as ShapeNodeData).tags;
+    if (tags?.some(t => hiddenTags.has(t))) return true;
+    return node.parentId ? isTagHidden(node.parentId, byId, guard) : false;
   }
 
   const nodes = useMemo(() => {
@@ -633,13 +1049,15 @@ export function Canvas({
       const locked = !!shapeData.locked;
       return {
         ...n, data: { ...n.data, ...extra },
-        hidden: isPersistedHidden(n.id, byId),
+        hidden: isPersistedHidden(n.id, byId) || isTagHidden(n.id, byId),
         // An explicit per-node `draggable` always overrides RF's global
-        // nodesDraggable prop, so it must repeat the same toolActive gate —
-        // otherwise clicking a shape's body while the Arrow/Pen tool is
-        // active drags the shape instead of starting a connector/path.
-        draggable: !locked && !toolActive,
-        connectable: !locked,
+        // nodesDraggable prop, so it must repeat the same toolActive/isPresent
+        // gates — otherwise clicking a shape's body while the Arrow/Pen tool
+        // is active drags the shape instead of starting a connector/path, and
+        // shapes stay movable while presenting since the global prop alone
+        // isn't enough to block it.
+        draggable: !locked && !toolActive && !isPresent,
+        connectable: !locked && !isPresent,
       };
     });
     // Comment pins are an authoring/collaboration affordance, not part of
@@ -654,7 +1072,11 @@ export function Canvas({
       draggable: false,
       selectable: false,
       zIndex: 20,
-      data: { resolved: c.resolved, replyCount: c.replies.length, active: c.id === activeCommentId, onOpen: (id: string) => { setDraftComment(null); setActiveCommentId(id); } },
+      data: {
+        resolved: c.resolved, replyCount: c.replies.length, active: c.id === activeCommentId, x: c.x, y: c.y,
+        onOpen: (id: string) => { setDraftComment(null); setActiveCommentId(id); },
+        onMove: handleMoveComment,
+      },
     }));
     // A not-yet-saved draft still gets a visible marker at its drop point —
     // otherwise clicking with the comment tool would open the compose panel
@@ -673,7 +1095,7 @@ export function Canvas({
       });
     }
     return [...frameNodes, ...styled, ...commentNodes];
-  }, [frameNodes, shapeNodes, variables, highlighted, animationPanelOpen, revealStep, isPresent, presentPage, presentThresholdOrder, connectMode, toolActive, directSelectMode, comments, activeCommentId, draftComment]);
+  }, [frameNodes, shapeNodes, variables, highlighted, animationPanelOpen, revealStep, isPresent, presentPage, presentThresholdOrder, connectMode, toolActive, directSelectMode, comments, activeCommentId, draftComment, hiddenTags]);
 
   const edges = useMemo(() => connectorEdges.map(e => {
     const edgeData = e.data as SmartEdgeData | undefined;
@@ -684,7 +1106,12 @@ export function Canvas({
     } else if (!isPresent && animationPanelOpen && edgeData?.revealOrder !== undefined) {
       hidden = edgeData.revealOrder > revealStep;
     }
-    return { ...e, data: { ...e.data, __dimmed: highlighted ? !highlighted.edgeIds.has(e.id) : false, __hidden: hidden } };
+    return {
+      ...e,
+      markerStart: arrowMarker(edgeData?.startArrow, 'none'),
+      markerEnd: arrowMarker(edgeData?.endArrow, 'arrowClosed'),
+      data: { ...e.data, __dimmed: highlighted ? !highlighted.edgeIds.has(e.id) : false, __hidden: hidden },
+    };
   }), [connectorEdges, shapeNodes, highlighted, animationPanelOpen, revealStep, isPresent, presentPage, presentThresholdOrder]);
 
   function renumberSequence(items: SequenceItem[]) {
@@ -717,11 +1144,44 @@ export function Canvas({
     renumberSequence(sequenced);
   }
 
+  // Entrance-animation type/duration only meaningfully apply to shapes —
+  // connectors' reveal is still opacity-only, unchanged.
+  function handleChangeAnimation(id: string, patch: { animationType?: 'fade' | 'flyIn' | 'zoom'; animationDuration?: number }) {
+    onCommit(id, patch);
+  }
+
   function handleNodeClick(_event: unknown, node: Node) {
     if (node.type !== 'shape') return;
     const link = (node.data as ShapeNodeData).link;
     if (isPresent && link) { navigateToLink(node.id); return; }
-    if (!isPresent && !highlightMode) return;
+    if (!isPresent && stylePaintMode) {
+      if (!stylePaintSource) {
+        const data = node.data as ShapeNodeData;
+        // Copy every field unconditionally (including ones the source never
+        // explicitly set, as `undefined`) rather than only ones present on
+        // source — a freshly-placed, never-customized shape has NONE of
+        // these keys set at all (ShapeNode.tsx falls back to defaults at
+        // render time), so skipping absent keys would silently pick up an
+        // empty style and make "apply" a no-op. Explicitly carrying
+        // `undefined` through means applying to a customized target
+        // correctly resets it back to the same default look, matching a
+        // real format-painter's "make this look exactly like that" contract.
+        const picked: Partial<ShapeNodeData> = {};
+        for (const key of STYLE_PAINT_FIELDS) (picked as Record<string, unknown>)[key] = data[key];
+        setStylePaintSource(picked);
+      } else {
+        onCommit(node.id, stylePaintSource);
+      }
+      return;
+    }
+    // Previously bypassed the highlightMode check entirely while presenting
+    // (`!isPresent && !highlightMode`), so branch highlight silently fired on
+    // every shape click in Present mode even with the toggle off — and since
+    // the toolbar (and its toggle) isn't shown while presenting, there was no
+    // way to turn it off from there either. Gating on highlightMode alone
+    // means it only ever fires in Present mode if it was already turned on
+    // before presenting started.
+    if (!highlightMode) return;
     if (highlighted && highlighted.nodeIds.has(node.id) && highlighted.nodeIds.size > 0) {
       // Clicking the currently-highlighted root again clears it.
       const isRoot = Array.from(highlighted.nodeIds)[0] === node.id;
@@ -751,7 +1211,7 @@ export function Canvas({
     const origin = pageGeomRef.current.pageOrigins.get(presentPage.id) ?? 0;
     const dims = pageGeomRef.current.pageDimensions.get(presentPage.id) ?? { width: 794, height: 1123 };
     const targetHasBezel = (presentLayoutRef.current?.bezel ?? 0) > 0;
-    const shouldDissolve = pageHadBezelRef.current || targetHasBezel;
+    const shouldDissolve = effectiveSettingsRef.current.pageTransition === 'fade' || pageHadBezelRef.current || targetHasBezel;
     // An instant cut, not an animated pan — any nonzero duration here is a
     // real spatial drag of canvas content across the fixed screen window,
     // which is exactly what looks broken. The flash (scoped to the screen
@@ -764,6 +1224,28 @@ export function Canvas({
     pageHadBezelRef.current = targetHasBezel;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isPresent, presentPageIndex, presentPage?.id]);
+
+  // Broadcasts this window's current page/step to any other presentation
+  // window (e.g. a Presenter View tab) watching the same diagram. Harmless
+  // if nothing's listening (onPresentStateChange is a no-op then).
+  useEffect(() => {
+    if (!isPresent || !presentPage) return;
+    onPresentStateChange?.({ pageId: presentPage.id, step: presentStep });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPresent, presentPage?.id, presentStep]);
+
+  // Adopts a page/step change that came from ANOTHER window (e.g. Presenter
+  // View's own prev/next controls) — only acts when it actually differs
+  // from local state, so this never fights with the write-effect above.
+  useEffect(() => {
+    if (!isPresent || !presentState) return;
+    if (presentState.pageId !== presentPage?.id) {
+      const idx = pages.findIndex(p => p.id === presentState.pageId);
+      if (idx >= 0) setPresentPageIndex(idx);
+    }
+    if (presentState.step !== presentStep) setPresentStep(presentState.step);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPresent, presentState]);
 
   // Resizing the presenting window re-fits the same page/step in place —
   // deliberately a separate effect from page-change above so it never
@@ -795,10 +1277,50 @@ export function Canvas({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [isPresent, presentStep, presentSequence.length, presentPageIndex, pages.length, onExitPresent]);
 
+  // Same immediate-local-update + debounced-persist pattern as the path-
+  // anchor nudge further down — holding an arrow key to nudge a shape
+  // shouldn't write-storm Firestore on every frame, and shouldn't push one
+  // undo entry per keystroke either — `shapeNudgeOriginalRef` remembers each
+  // shape's position from BEFORE the whole nudge burst started (only ever
+  // set once per burst; cleared when the debounce settles) so undo jumps
+  // back to before the burst, not one nudge-tick at a time.
+  const shapeNudgeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const shapeNudgePendingRef = useRef<Map<string, Node>>(new Map());
+  const shapeNudgeOriginalRef = useRef<Map<string, { x: number; y: number }>>(new Map());
+  function nudgeSelection(targets: Node[], dx: number, dy: number) {
+    const ids = new Set(targets.map(n => n.id));
+    setShapeNodes(prev => prev.map(n => {
+      if (!ids.has(n.id)) return n;
+      if (!shapeNudgeOriginalRef.current.has(n.id)) shapeNudgeOriginalRef.current.set(n.id, n.position);
+      const next = { ...n, position: { x: n.position.x + dx, y: n.position.y + dy } };
+      shapeNudgePendingRef.current.set(n.id, next);
+      return next;
+    }));
+    if (shapeNudgeTimerRef.current) clearTimeout(shapeNudgeTimerRef.current);
+    shapeNudgeTimerRef.current = setTimeout(() => {
+      const originals = new Map(shapeNudgeOriginalRef.current);
+      const finals = new Map<string, { x: number; y: number }>();
+      for (const n of shapeNudgePendingRef.current.values()) {
+        const pageId = (n.data as ShapeNodeData | undefined)?.pageId;
+        if (pageId) saveShape(diagramId, pageId, toPersistableShape(n));
+        finals.set(n.id, n.position);
+      }
+      pushHistory({
+        undo: () => { for (const [id, pos] of originals) applyPosition(id, pos); },
+        redo: () => { for (const [id, pos] of finals) applyPosition(id, pos); },
+      });
+      shapeNudgePendingRef.current.clear();
+      shapeNudgeOriginalRef.current.clear();
+    }, 400);
+  }
+
   // WASD + arrow-key viewport panning (edit mode only — presentation mode
   // already owns Space/Arrow for step navigation above). viewport.x/y are
   // already screen-space, so a constant pixel delta pans a constant on-screen
   // distance regardless of zoom — no zoom-based conversion needed here.
+  // Arrow keys (not WASD) nudge the current shape/path/group selection
+  // instead of panning, when there is one — 1px per press, 10px with Shift,
+  // matching the anchor-nudge convention below.
   //
   // The Direct Selection shortcut ('A', no modifiers) is folded into this
   // SAME handler rather than a second window listener — WASD-pan's own KeyA
@@ -807,7 +1329,9 @@ export function Canvas({
   // stopImmediatePropagation prevents a later-registered listener from
   // running, and that's a fragile ordering dependency to rely on). Deciding
   // both in one place avoids the conflict outright: 'A' toggles Direct
-  // Selection only when there's a path to edit, otherwise it still pans.
+  // Selection only when there's a path to edit, otherwise it still pans. The
+  // new arrow-key nudge follows the same reasoning to avoid double-firing
+  // against the anchor-nudge effect further down.
   useEffect(() => {
     if (isPresent) return;
     const PAN_STEP_SCREEN_PX = 60;
@@ -815,17 +1339,31 @@ export function Canvas({
       ArrowUp: { x: 0, y: -1 }, ArrowDown: { x: 0, y: 1 }, ArrowLeft: { x: -1, y: 0 }, ArrowRight: { x: 1, y: 0 },
       KeyW: { x: 0, y: -1 }, KeyS: { x: 0, y: 1 }, KeyA: { x: -1, y: 0 }, KeyD: { x: 1, y: 0 },
     };
+    const ARROW_CODES = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']);
     function onKeyDown(e: KeyboardEvent) {
       if (isTypingTarget(e.target)) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (e.code === 'KeyA' && !e.shiftKey && (editingPathId || directSelectMode)) {
         e.preventDefault();
-        handleToggleDirectSelect();
+        handleSelectTool('directSelect');
         return;
       }
       if (toolActive) return; // don't fight an in-progress path/connector/shape-placement drag
       const dir = PAN_KEYS[e.code];
       if (!dir) return;
+      // Direct Selection's own anchor-nudge effect already owns arrow keys
+      // while a path anchor is focused — defer to it instead of also moving
+      // the whole shape underneath the focused anchor.
+      const anchorFocused = directSelectMode && !!editingPathId && activeAnchorIndex !== null;
+      if (ARROW_CODES.has(e.code) && !anchorFocused) {
+        const targets = nodes.filter(n => n.selected && (n.type === 'shape' || n.type === 'path' || n.type === 'group') && !isLocked(n.id));
+        if (targets.length > 0) {
+          e.preventDefault();
+          const step = e.shiftKey ? 10 : 1;
+          nudgeSelection(targets, dir.x * step, dir.y * step);
+          return;
+        }
+      }
       e.preventDefault();
       const { x, y, zoom } = getViewport();
       setViewport({ x: x - dir.x * PAN_STEP_SCREEN_PX, y: y - dir.y * PAN_STEP_SCREEN_PX, zoom }, { duration: 0 });
@@ -833,7 +1371,7 @@ export function Canvas({
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isPresent, toolActive, editingPathId, directSelectMode]);
+  }, [isPresent, toolActive, editingPathId, directSelectMode, activeAnchorIndex, nodes]);
 
   // Accepts undefined so callers deriving `node` from a `.find()` (e.g. an
   // edge's source/target shape) don't need an unsafe cast — an edge left
@@ -841,6 +1379,22 @@ export function Canvas({
   // throw and take down every memo that iterates connectorEdges.
   function findPageIdFor(node: Node | undefined): string | undefined {
     return (node?.data as ShapeNodeData | undefined)?.pageId;
+  }
+
+  // Every brand-new shape defaults to zIndex 0 unless explicitly given one,
+  // which ties every shape ever placed on a page at the same stacking value.
+  // CSS resolves that tie by DOM/array order — but new shapes are PREPENDED
+  // to shapeNodes (so the newest is array index 0), meaning a freshly placed
+  // shape actually paints BEHIND everything placed before it: the opposite
+  // of the "newest shape lands on top" convention every drawing tool follows
+  // (and the same convention this app's own Layers panel/bring-to-front
+  // already assume). Stamping a strictly-higher zIndex at creation time
+  // makes stacking order explicit and independent of DOM order.
+  function nextZIndexForPage(pageId: string): number {
+    const zIndices = shapeNodesRef.current
+      .filter(n => (n.data as ShapeNodeData | undefined)?.pageId === pageId)
+      .map(n => n.zIndex ?? 0);
+    return (zIndices.length > 0 ? Math.max(...zIndices) : 0) + 1;
   }
 
   // Build the Firestore payload from an explicit allowlist of BOTH the node's
@@ -857,20 +1411,26 @@ export function Canvas({
       kind: d.kind,
       pageId: d.pageId,
       label: d.label,
+      richText: d.richText,
       fillColor: d.fillColor,
       strokeColor: d.strokeColor,
       strokeWidth: d.strokeWidth,
       rotation: d.rotation,
       zIndex: d.zIndex,
       revealOrder: d.revealOrder,
+      animationType: d.animationType,
+      animationDuration: d.animationDuration,
       highlightGroup: d.highlightGroup,
       dataBinding: d.dataBinding,
+      customFields: d.customFields,
+      tags: d.tags,
       link: d.link,
       imageUrl: d.imageUrl,
       locked: d.locked,
       hidden: d.hidden,
       pathAnchors: d.pathAnchors,
       pathClosed: d.pathClosed,
+      pathHoles: d.pathHoles,
       cornerRadius: d.cornerRadius,
       fontSize: d.fontSize,
       fontColor: d.fontColor,
@@ -884,6 +1444,9 @@ export function Canvas({
       verticalAlign: d.verticalAlign,
       strokeStyle: d.strokeStyle,
       effect: d.effect,
+      opacity: d.opacity,
+      blur: d.blur,
+      fillGradient: d.fillGradient,
       containerTheme: d.containerTheme,
       containerAccentColor: d.containerAccentColor,
       laneCount: d.laneCount,
@@ -907,6 +1470,11 @@ export function Canvas({
       brushBaseWidth: d.brushBaseWidth,
       brushViewBoxWidth: d.brushViewBoxWidth,
       brushViewBoxHeight: d.brushViewBoxHeight,
+      tableRows: d.tableRows,
+      tableCols: d.tableCols,
+      tableCells: d.tableCells,
+      chartType: d.chartType,
+      chartData: d.chartData,
     };
     return {
       id: node.id,
@@ -979,6 +1547,53 @@ export function Canvas({
     });
   }
 
+  function getCommittedShape(id: string): DiagramNode | undefined {
+    for (const slice of shapesSlices.current.values()) {
+      const existing = slice.get(id);
+      if (existing) return existing;
+    }
+    return undefined;
+  }
+
+  // A top-level (unparented) shape dropped so its center lands inside a
+  // top-level Container's bounds gets adopted by it — the topmost (highest
+  // zIndex) overlapping container wins if several overlap. Deliberately
+  // narrow in scope: only ever top-level shape into top-level container (no
+  // groups/containers as the dragged subject, no already-nested shapes,
+  // and no auto-release when dragged back out) — a reshuffle of existing
+  // nesting is a bigger, riskier feature than "drop a shape in, it joins."
+  function findCapturingContainer(node: Node, nextPosition: { x: number; y: number }, pageId: string): Node | undefined {
+    if (node.parentId) return undefined;
+    const kind = (node.data as ShapeNodeData | undefined)?.kind;
+    if (kind === 'container' || kind === 'group') return undefined;
+    const w = node.width ?? node.measured?.width ?? 100;
+    const h = node.height ?? node.measured?.height ?? 70;
+    const centerX = nextPosition.x + w / 2;
+    const centerY = nextPosition.y + h / 2;
+    const candidates = shapeNodes.filter(n =>
+      n.id !== node.id && !n.parentId && (n.data as ShapeNodeData | undefined)?.kind === 'container' && findPageIdFor(n) === pageId
+    );
+    const matches = candidates.filter(c => {
+      const cw = c.width ?? 100, ch = c.height ?? 70;
+      return centerX >= c.position.x && centerX <= c.position.x + cw && centerY >= c.position.y && centerY <= c.position.y + ch;
+    });
+    if (matches.length === 0) return undefined;
+    return matches.reduce((best, c) => (c.zIndex ?? 0) > (best.zIndex ?? 0) ? c : best);
+  }
+
+  function applyReparent(id: string, patch: { parentId?: string; extent?: 'parent'; position: { x: number; y: number } }) {
+    for (const slice of shapesSlices.current.values()) {
+      const existing = slice.get(id);
+      if (existing) {
+        const updated: DiagramNode = { ...existing, parentId: patch.parentId, extent: patch.extent, position: patch.position };
+        slice.set(id, updated);
+        saveShape(diagramId, existing.data.pageId, updated);
+        rebuildShapes();
+        return;
+      }
+    }
+  }
+
   const onNodesChange = useCallback((rawChanges: NodeChange[]) => {
     const changes = clampDragChanges(rawChanges);
     setShapeNodes(prev => applyNodeChanges(changes, [...frameNodes, ...prev]).filter(n => n.type !== 'pageFrame'));
@@ -988,19 +1603,41 @@ export function Canvas({
         const node = shapeNodes.find(n => n.id === change.id);
         const pageId = node && findPageIdFor(node);
         if (node && pageId) {
-          saveShape(diagramId, pageId, toPersistableShape({ ...node, position: change.position }));
+          const nextPosition = change.position;
+          const prevPosition = getCommittedShape(change.id)?.position;
+          const container = findCapturingContainer(node, nextPosition, pageId);
+          if (container) {
+            const relativePosition = { x: nextPosition.x - container.position.x, y: nextPosition.y - container.position.y };
+            applyReparent(change.id, { parentId: container.id, extent: 'parent', position: relativePosition });
+            pushHistory({
+              undo: () => applyReparent(change.id, { parentId: undefined, extent: undefined, position: prevPosition ?? nextPosition }),
+              redo: () => applyReparent(change.id, { parentId: container.id, extent: 'parent', position: relativePosition }),
+            });
+          } else {
+            saveShape(diagramId, pageId, toPersistableShape({ ...node, position: nextPosition }));
+            if (prevPosition && (prevPosition.x !== nextPosition.x || prevPosition.y !== nextPosition.y)) {
+              pushHistory({ undo: () => applyPosition(change.id, prevPosition), redo: () => applyPosition(change.id, nextPosition) });
+            }
+          }
         }
       }
       if (change.type === 'dimensions' && change.resizing === false && change.dimensions) {
         const node = shapeNodes.find(n => n.id === change.id);
         const pageId = node && findPageIdFor(node);
         if (node && pageId) {
-          saveShape(diagramId, pageId, toPersistableShape({ ...node, width: change.dimensions.width, height: change.dimensions.height }));
+          const nextSize = change.dimensions;
+          const committed = getCommittedShape(change.id);
+          const prevSize = committed ? { width: committed.width ?? 100, height: committed.height ?? 70 } : undefined;
+          saveShape(diagramId, pageId, toPersistableShape({ ...node, width: nextSize.width, height: nextSize.height }));
+          if (prevSize && (prevSize.width !== nextSize.width || prevSize.height !== nextSize.height)) {
+            pushHistory({ undo: () => applySize(change.id, prevSize), redo: () => applySize(change.id, nextSize) });
+          }
         }
       }
       if (change.type === 'remove') {
         const node = shapeNodes.find(n => n.id === change.id);
         const pageId = node && findPageIdFor(node);
+        const removedShape = getCommittedShape(change.id);
         if (pageId) deleteShape(diagramId, pageId, change.id);
         // A connector left pointing at a deleted shape becomes an orphan:
         // shapeNodes.find() for its source/target returns undefined forever
@@ -1008,12 +1645,31 @@ export function Canvas({
         // (sequenceItems, the edges render memo) on next render. Cascade the
         // deletion so no connector can outlive both of the shapes it joins.
         const orphaned = connectorEdges.filter(e => e.source === change.id || e.target === change.id);
+        // Captured now (while `shapeNodes` still resolves the about-to-be-removed
+        // shape) rather than re-resolved at undo/redo time, which could run long
+        // after this closure's `shapeNodes` snapshot has gone stale.
+        const removedEdges: { edge: Edge; pageId: string }[] = [];
         if (orphaned.length > 0) {
           setConnectorEdges(prev => prev.filter(e => !orphaned.some(o => o.id === e.id)));
           for (const edge of orphaned) {
             const edgePageId = findEdgePageId(edge);
-            if (edgePageId) deleteConnector(diagramId, edgePageId, edge.id);
+            if (edgePageId) {
+              deleteConnector(diagramId, edgePageId, edge.id);
+              removedEdges.push({ edge, pageId: edgePageId });
+            }
           }
+        }
+        if (removedShape && pageId) {
+          pushHistory({
+            undo: () => {
+              saveShape(diagramId, pageId, removedShape);
+              for (const { edge, pageId: edgePageId } of removedEdges) saveConnector(diagramId, edgePageId, edge as DiagramEdge);
+            },
+            redo: () => {
+              deleteShape(diagramId, pageId, change.id);
+              for (const { edge, pageId: edgePageId } of removedEdges) deleteConnector(diagramId, edgePageId, edge.id);
+            },
+          });
         }
       }
     }
@@ -1047,11 +1703,16 @@ export function Canvas({
       targetHandle: params.targetHandle,
       type: 'smart',
       markerEnd: { type: MarkerType.ArrowClosed, color: '#8a93a6' },
-      data: { routing: 'orthogonal' },
+      data: {
+        routing: toolDefaults.connector.routing,
+        flowAnimation: toolDefaults.connector.flowAnimation,
+        startArrow: toolDefaults.connector.startArrow,
+        endArrow: toolDefaults.connector.endArrow,
+      },
     };
     setConnectorEdges(prev => addEdge(edge, prev));
     saveConnector(diagramId, pageId, edge);
-  }, [shapeNodes, diagramId]);
+  }, [shapeNodes, diagramId, toolDefaults.connector]);
 
   function getPageIdForFlowPoint(flowPoint: { x: number; y: number }): string | undefined {
     for (const page of pages) {
@@ -1066,15 +1727,16 @@ export function Canvas({
   // composed into the wrapper's onMouseDown below) creates the shape exactly
   // there, instead of always at the viewport center. Mutually exclusive with
   // the other tool modes.
-  function beginPlacingShape(kind: ShapeKind, extraData?: Partial<ShapeNodeData>) {
-    clearOtherTools();
+  // `keepGalleryOpen` is only ever passed by the Shape Gallery panel's own
+  // onSelect — picking a shape there arms placement without also closing the
+  // panel that's browsing them, unlike every other caller (Hotspot button,
+  // Favorites strip), which should close it same as any other tool switch.
+  function beginPlacingShape(kind: ShapeKind, extraData?: Partial<ShapeNodeData>, opts?: { keepGalleryOpen?: boolean }) {
+    const keepGalleryOpen = !!opts?.keepGalleryOpen;
+    selectTool('select');
+    if (keepGalleryOpen) setShapeGalleryOpen(true);
     setPlacingShapeKind(kind);
     setPendingShapeExtraData(extraData ?? null);
-  }
-
-  function beginPlacingComment() {
-    clearOtherTools();
-    setPlacingComment(true);
   }
 
   function handleCommentPlaceMouseDown(e: React.MouseEvent) {
@@ -1147,6 +1809,37 @@ export function Canvas({
     saveComment(diagramId, comment.pageId, { ...comment, resolved: !comment.resolved });
   }
 
+  // id is 'root' for the comment itself or a reply's id — mirrors the id
+  // convention CommentThreadPanel's renderBubble already uses.
+  function handleToggleReaction(id: string, emoji: string) {
+    if (!activeCommentId || !user) return;
+    const comment = findComment(activeCommentId);
+    if (!comment) return;
+    const uid = user.uid;
+    function toggled(reactions: Record<string, string[]> | undefined): Record<string, string[]> {
+      const current = reactions?.[emoji] ?? [];
+      const nextUsers = current.includes(uid) ? current.filter(u => u !== uid) : [...current, uid];
+      const next = { ...reactions };
+      if (nextUsers.length === 0) delete next[emoji];
+      else next[emoji] = nextUsers;
+      return next;
+    }
+    if (id === 'root') {
+      saveComment(diagramId, comment.pageId, { ...comment, reactions: toggled(comment.reactions) });
+    } else {
+      saveComment(diagramId, comment.pageId, {
+        ...comment,
+        replies: comment.replies.map(r => r.id === id ? { ...r, reactions: toggled(r.reactions) } : r),
+      });
+    }
+  }
+
+  function handleMoveComment(id: string, x: number, y: number) {
+    const comment = findComment(id);
+    if (!comment) return;
+    saveComment(diagramId, comment.pageId, { ...comment, x, y });
+  }
+
   function handleDeleteActiveThread() {
     if (!activeCommentId) return;
     const comment = findComment(activeCommentId);
@@ -1166,6 +1859,7 @@ export function Canvas({
         type: 'shape',
         position: { x: flowPoint.x - width / 2, y: flowPoint.y - height / 2 },
         width, height,
+        zIndex: nextZIndexForPage(pageId),
         data: kind === 'image'
           ? { kind: 'image', pageId, imageUrl: url }
           : { kind: 'video', pageId, videoUrl: url, videoMuted: true, videoControls: true },
@@ -1180,20 +1874,31 @@ export function Canvas({
       return;
     }
     const isSquareIconLike = kind === 'icon' || kind === 'archimateElement' || kind === 'cross' || kind === 'star';
-    const width = kind === 'text' ? 120 : kind === 'hotspot' ? 140 : isSquareIconLike ? 64 : kind === 'pieChart' ? 120 : 100;
-    const height = kind === 'text' ? 32 : kind === 'hotspot' ? 90 : isSquareIconLike ? 64 : kind === 'pieChart' ? 120 : 70;
+    const width = kind === 'text' ? 120 : kind === 'hotspot' ? 140 : isSquareIconLike ? 64 : kind === 'pieChart' ? 120 : kind === 'table' ? 300 : kind === 'chart' ? 220 : 100;
+    const height = kind === 'text' ? 32 : kind === 'hotspot' ? 90 : isSquareIconLike ? 64 : kind === 'pieChart' ? 120 : kind === 'table' ? 160 : kind === 'chart' ? 150 : 70;
     const node: DiagramNode = {
       id: crypto.randomUUID(),
       type: 'shape',
       position: { x: flowPoint.x - width / 2, y: flowPoint.y - height / 2 },
       width,
       height,
-      data: { kind, pageId, label: kind === 'text' ? 'Text' : '', ...pendingShapeExtraData },
+      zIndex: nextZIndexForPage(pageId),
+      data: {
+        kind, pageId, label: kind === 'text' ? 'Text' : '',
+        ...(kind === 'table' ? {
+          tableRows: 3, tableCols: 3,
+          tableCells: [{ cells: ['', '', ''] }, { cells: ['', '', ''] }, { cells: ['', '', ''] }],
+        } : {}),
+        ...pendingShapeExtraData,
+      },
     };
     setShapeNodes(prev => [...prev, { ...node, data: { ...node.data, onCommit, onNavigateLink: navigateToLink } }]);
     saveShape(diagramId, pageId, node);
     setPlacingShapeKind(null);
     setPendingShapeExtraData(null);
+    // The gallery panel (if open) was never closed by this placement —
+    // beginPlacingShape's `keepGalleryOpen` kept it open the whole time — so
+    // there's nothing to reopen here, unlike the old modal.
   }
 
   function handleShapePlaceMouseDown(e: React.MouseEvent) {
@@ -1287,11 +1992,11 @@ export function Canvas({
     const scale = Math.min(1, maxDim / Math.max(dims.width, dims.height));
     const width = Math.round(dims.width * scale);
     const height = Math.round(dims.height * scale);
-    // Don't route through beginPlacingShape here — it calls clearOtherTools(),
+    // Don't route through beginPlacingShape here — it calls selectTool('select'),
     // which would also null out the pendingMediaPlacement we're about to set
     // (both setState calls batch together since neither is separated by an
     // await, so the clear would silently win over the set).
-    clearOtherTools();
+    selectTool('select');
     setPendingMediaPlacement({ kind: isVideo ? 'video' : 'image', url, width, height });
     setPlacingShapeKind(isVideo ? 'video' : 'image');
   }
@@ -1385,7 +2090,10 @@ export function Canvas({
       type: 'smart',
       markerEnd: { type: MarkerType.ArrowClosed, color: '#8a93a6' },
       data: {
-        routing: 'orthogonal',
+        routing: toolDefaults.connector.routing,
+        flowAnimation: toolDefaults.connector.flowAnimation,
+        startArrow: toolDefaults.connector.startArrow,
+        endArrow: toolDefaults.connector.endArrow,
         ...(dragInfo.sourceAnchorIndex !== undefined ? { sourceAnchorIndex: dragInfo.sourceAnchorIndex } : {}),
         ...(targetAnchorIndex !== undefined ? { targetAnchorIndex } : {}),
       },
@@ -1404,17 +2112,6 @@ export function Canvas({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [connectMode]);
 
-  function handleTogglePen() {
-    const wasOn = penMode;
-    clearOtherTools();
-    if (!wasOn) setPenMode(true);
-  }
-  function handleToggleBrush() {
-    const wasOn = brushMode;
-    clearOtherTools();
-    if (!wasOn) setBrushMode(true);
-  }
-
   function finalizeBrushStroke(points: BrushPoint[]) {
     setBrushDraft(null);
     if (points.length < 2) return;
@@ -1432,11 +2129,12 @@ export function Canvas({
       type: 'shape',
       position: { x: minX, y: minY },
       width, height,
+      zIndex: nextZIndexForPage(pageId),
       data: {
         kind: 'brushStroke', pageId,
-        brushPoints: localPoints, brushStyle: 'pencil', brushBaseWidth: 6,
+        brushPoints: localPoints, brushStyle: toolDefaults.brush.brushStyle, brushBaseWidth: toolDefaults.brush.brushBaseWidth,
         brushViewBoxWidth: width, brushViewBoxHeight: height,
-        strokeColor: '#1a1a2e',
+        strokeColor: toolDefaults.brush.strokeColor,
       },
     };
     setShapeNodes(prev => [...prev, { ...node, data: { ...node.data, onCommit, onNavigateLink: navigateToLink } }]);
@@ -1453,7 +2151,11 @@ export function Canvas({
   function handleBrushMouseDown(e: React.MouseEvent) {
     if (!brushMode || e.button !== 0) return;
     e.preventDefault();
-    const startFlow = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+    // Explicitly bypass snap-to-grid for every captured point, even when the
+    // user has it enabled — snapping is for placing/aligning whole shapes,
+    // not for a freehand path, where quantizing each sampled point to the
+    // grid turns a smooth stroke into a jagged, staircased one.
+    const startFlow = screenToFlowPosition({ x: e.clientX, y: e.clientY }, { snapToGrid: false });
     const native = e.nativeEvent as PointerEvent;
     const isRealPen = native.pointerType === 'pen';
     const points: BrushPoint[] = [{ x: startFlow.x, y: startFlow.y, pressure: isRealPen ? (native.pressure || 0.5) : 0.6 }];
@@ -1461,7 +2163,7 @@ export function Canvas({
     let last = { x: startFlow.x, y: startFlow.y, t: Date.now() };
 
     function onMove(ev: PointerEvent) {
-      const flow = screenToFlowPosition({ x: ev.clientX, y: ev.clientY });
+      const flow = screenToFlowPosition({ x: ev.clientX, y: ev.clientY }, { snapToGrid: false });
       const now = Date.now();
       let pressure: number;
       if (isRealPen) {
@@ -1483,11 +2185,6 @@ export function Canvas({
     }
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
-  }
-  function handleToggleConnect() {
-    const wasOn = connectMode;
-    clearOtherTools();
-    if (!wasOn) setConnectMode(true);
   }
 
   // Vector pen tool — a dedicated mutually-exclusive drawing mode (parallel
@@ -1515,7 +2212,11 @@ export function Canvas({
       position: { x: minX, y: minY },
       width: maxX - minX,
       height: maxY - minY,
-      data: { kind: 'path', pageId, pathAnchors: localAnchors, pathClosed: closed },
+      zIndex: nextZIndexForPage(pageId),
+      data: {
+        kind: 'path', pageId, pathAnchors: localAnchors, pathClosed: closed,
+        strokeColor: toolDefaults.pen.strokeColor, strokeWidth: toolDefaults.pen.strokeWidth, strokeStyle: toolDefaults.pen.strokeStyle,
+      },
     };
     setShapeNodes(prev => [...prev, { ...node, data: { ...node.data, onCommit, onNavigateLink: navigateToLink } }]);
     saveShape(diagramId, pageId, node);
@@ -1594,6 +2295,20 @@ export function Canvas({
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [brushMode]);
+
+  useEffect(() => {
+    if (!stylePaintMode) return;
+    function onKeyDown(e: KeyboardEvent) {
+      // First Escape drops the picked-up source (so the user can pick a
+      // different one); a second Escape exits the tool entirely — matches
+      // the "two-stage Escape" convention already used for Direct Selection.
+      if (e.key !== 'Escape') return;
+      if (stylePaintSource) setStylePaintSource(null);
+      else setStylePaintMode(false);
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [stylePaintMode, stylePaintSource]);
 
   // Post-creation anchor editing — selecting a path shows its anchors
   // passively (see editingPathId above); they only become interactive while
@@ -1842,6 +2557,11 @@ export function Canvas({
   const singleSelectedShape = selectedShapeIds.length === 1 ? shapeNodes.find(n => n.id === selectedShapeIds[0]) : undefined;
   const selectedEdges = connectorEdges.filter(e => e.selected);
   const singleSelectedEdge = selectedEdges.length === 1 ? selectedEdges[0] : undefined;
+  const BOOLEAN_ELIGIBLE_KINDS = new Set(['path', 'ellipse', 'rectangle', 'stickyNote', 'container']);
+  const canBooleanOp = selectedShapeIds.length === 2 && selectedShapeIds.every(id => {
+    const data = shapeNodes.find(n => n.id === id)?.data as ShapeNodeData | undefined;
+    return !!data && BOOLEAN_ELIGIBLE_KINDS.has(data.kind) && !data.rotation;
+  });
 
   function deselectAll() {
     onNodesChange(nodes.filter(n => n.selected).map(n => ({ type: 'select', id: n.id, selected: false })));
@@ -1933,6 +2653,40 @@ export function Canvas({
     await saveShape(diagramId, pageId, node);
   }
 
+  // Rows/columns are always rendered evenly split (see ShapeNode.tsx), so
+  // adding/removing one is purely a `tableCells` grid edit — no width/height
+  // array to rebalance. Goes through `onCommit` like every other shape data
+  // edit, so it gets the same debounced undo/redo entry as anything else.
+  function addTableRow(id: string) {
+    const node = shapeNodes.find(n => n.id === id);
+    const data = node?.data as ShapeNodeData | undefined;
+    if (!data || data.kind !== 'table') return;
+    const cols = data.tableCols ?? 0;
+    const cells = [...(data.tableCells ?? []), { cells: Array.from({ length: cols }, () => '') }];
+    onCommit(id, { tableRows: (data.tableRows ?? 0) + 1, tableCells: cells });
+  }
+  function removeTableRow(id: string) {
+    const node = shapeNodes.find(n => n.id === id);
+    const data = node?.data as ShapeNodeData | undefined;
+    if (!data || data.kind !== 'table' || (data.tableRows ?? 0) <= 1) return;
+    const cells = (data.tableCells ?? []).slice(0, -1);
+    onCommit(id, { tableRows: (data.tableRows ?? 1) - 1, tableCells: cells });
+  }
+  function addTableColumn(id: string) {
+    const node = shapeNodes.find(n => n.id === id);
+    const data = node?.data as ShapeNodeData | undefined;
+    if (!data || data.kind !== 'table') return;
+    const cells = (data.tableCells ?? []).map(row => ({ cells: [...row.cells, ''] }));
+    onCommit(id, { tableCols: (data.tableCols ?? 0) + 1, tableCells: cells });
+  }
+  function removeTableColumn(id: string) {
+    const node = shapeNodes.find(n => n.id === id);
+    const data = node?.data as ShapeNodeData | undefined;
+    if (!data || data.kind !== 'table' || (data.tableCols ?? 0) <= 1) return;
+    const cells = (data.tableCells ?? []).map(row => ({ cells: row.cells.slice(0, -1) }));
+    onCommit(id, { tableCols: (data.tableCols ?? 1) - 1, tableCells: cells });
+  }
+
   function handleUngroup() {
     if (!selectedGroup || isLocked(selectedGroup.id)) return;
     const pageId = findPageIdFor(selectedGroup);
@@ -1953,7 +2707,9 @@ export function Canvas({
     if (pageId) deleteShape(diagramId, pageId, selectedGroup.id);
   }
 
-  function persistZIndex(updatedNodes: Node[], targetIds: string[]) {
+  // Saves whichever of `targetIds` changed in `updatedNodes` — not tied to
+  // any one field, used by z-order, align, and distribute alike.
+  function persistNodes(updatedNodes: Node[], targetIds: string[]) {
     for (const n of updatedNodes) {
       if (!targetIds.includes(n.id)) continue;
       const pageId = findPageIdFor(n);
@@ -1961,13 +2717,205 @@ export function Canvas({
     }
   }
 
+  function getBBox(n: Node): { x: number; y: number; w: number; h: number } {
+    return { x: n.position.x, y: n.position.y, w: n.width ?? n.measured?.width ?? 100, h: n.height ?? n.measured?.height ?? 70 };
+  }
+
+  function applyZIndex(id: string, zIndex: number) {
+    for (const slice of shapesSlices.current.values()) {
+      const existing = slice.get(id);
+      if (existing) {
+        const updated: DiagramNode = { ...existing, zIndex };
+        slice.set(id, updated);
+        saveShape(diagramId, existing.data.pageId, updated);
+        rebuildShapes();
+        return;
+      }
+    }
+  }
+  function pushPositionHistory(before: Map<string, { x: number; y: number }>, after: Map<string, { x: number; y: number }>) {
+    pushHistory({
+      undo: () => { for (const [id, pos] of before) applyPosition(id, pos); },
+      redo: () => { for (const [id, pos] of after) applyPosition(id, pos); },
+    });
+  }
+  function pushZIndexHistory(before: Map<string, number>, after: Map<string, number>) {
+    pushHistory({
+      undo: () => { for (const [id, z] of before) applyZIndex(id, z); },
+      redo: () => { for (const [id, z] of after) applyZIndex(id, z); },
+    });
+  }
+
+  function alignSelected(edge: 'left' | 'hcenter' | 'right' | 'top' | 'vcenter' | 'bottom') {
+    const targetIds = selectedShapeIds.filter(id => !isLocked(id));
+    if (targetIds.length < 2) return;
+    setShapeNodes(prev => {
+      const before = new Map(prev.filter(n => targetIds.includes(n.id)).map(n => [n.id, n.position]));
+      const boxes = prev.filter(n => targetIds.includes(n.id)).map(n => ({ id: n.id, ...getBBox(n) }));
+      const minX = Math.min(...boxes.map(b => b.x));
+      const maxRight = Math.max(...boxes.map(b => b.x + b.w));
+      const minY = Math.min(...boxes.map(b => b.y));
+      const maxBottom = Math.max(...boxes.map(b => b.y + b.h));
+      const centerX = (minX + maxRight) / 2;
+      const centerY = (minY + maxBottom) / 2;
+      const next = prev.map(n => {
+        if (!targetIds.includes(n.id)) return n;
+        const box = getBBox(n);
+        let { x, y } = box;
+        if (edge === 'left') x = minX;
+        else if (edge === 'right') x = maxRight - box.w;
+        else if (edge === 'hcenter') x = centerX - box.w / 2;
+        else if (edge === 'top') y = minY;
+        else if (edge === 'bottom') y = maxBottom - box.h;
+        else if (edge === 'vcenter') y = centerY - box.h / 2;
+        return { ...n, position: { x, y } };
+      });
+      persistNodes(next, targetIds);
+      pushPositionHistory(before, new Map(next.filter(n => targetIds.includes(n.id)).map(n => [n.id, n.position])));
+      return next;
+    });
+  }
+
+  function distributeSelected(axis: 'horizontal' | 'vertical') {
+    const targetIds = selectedShapeIds.filter(id => !isLocked(id));
+    if (targetIds.length < 3) return;
+    setShapeNodes(prev => {
+      const before = new Map(prev.filter(n => targetIds.includes(n.id)).map(n => [n.id, n.position]));
+      const boxes = prev.filter(n => targetIds.includes(n.id)).map(n => ({ id: n.id, ...getBBox(n) }));
+      const sorted = [...boxes].sort((a, b) => axis === 'horizontal' ? a.x - b.x : a.y - b.y);
+      const first = sorted[0];
+      const last = sorted[sorted.length - 1];
+      const totalSize = sorted.reduce((sum, b) => sum + (axis === 'horizontal' ? b.w : b.h), 0);
+      const span = axis === 'horizontal' ? (last.x + last.w) - first.x : (last.y + last.h) - first.y;
+      const gap = (span - totalSize) / (sorted.length - 1);
+      const positions = new Map<string, { x: number; y: number }>();
+      let cursor = axis === 'horizontal' ? first.x : first.y;
+      for (const b of sorted) {
+        positions.set(b.id, axis === 'horizontal' ? { x: cursor, y: b.y } : { x: b.x, y: cursor });
+        cursor += (axis === 'horizontal' ? b.w : b.h) + gap;
+      }
+      const next = prev.map(n => positions.has(n.id) ? { ...n, position: positions.get(n.id)! } : n);
+      persistNodes(next, targetIds);
+      pushPositionHistory(before, positions);
+      return next;
+    });
+  }
+
+  // Converts a shape into an absolute-page-space bezier contour for boolean
+  // ops — real `path` shapes already have anchors; rectangle/stickyNote/
+  // container and ellipse get an on-the-fly bezier approximation (a rounded
+  // rect uses the exact same corner-radius math the shape itself renders
+  // with). Anything else (text, images, UML/icon glyphs, groups, ...) has no
+  // well-defined closed-region geometry to convert, so this returns null.
+  // Rotated shapes are also unsupported for now — handle vectors would need
+  // rotating along with each anchor point, which this doesn't do.
+  function shapeToBooleanContour(node: Node): PathContour | null {
+    const data = node.data as ShapeNodeData;
+    if (data.rotation) return null;
+    const w = node.width ?? 100, h = node.height ?? 70;
+    const toAbsolute = (a: PathAnchor): PathAnchor => ({ ...a, x: a.x + node.position.x, y: a.y + node.position.y });
+    if (data.kind === 'path') {
+      return { anchors: (data.pathAnchors ?? []).map(toAbsolute), closed: !!data.pathClosed };
+    }
+    if (data.kind === 'ellipse') {
+      return { anchors: ellipseToAnchors(w, h).map(toAbsolute), closed: true };
+    }
+    if (data.kind === 'rectangle' || data.kind === 'stickyNote' || data.kind === 'container') {
+      const r = data.cornerRadius ?? (data.kind === 'stickyNote' ? 2 : 4);
+      return { anchors: roundedRectToAnchors(w, h, r).map(toAbsolute), closed: true };
+    }
+    return null;
+  }
+
+  // Boolean path operations (union/subtract/intersect/exclude) — true
+  // curve-preserving math via paper.js (see utils/pathBoolean.ts), not a
+  // flatten-to-polygon approximation. A result with a genuine hole (e.g.
+  // subtract leaving a ring) is grouped by containment (groupContoursBy
+  // Containment) and rendered as one path shape with `pathHoles` cut out
+  // via even-odd fill-rule — a real hole, not two overlapping opaque shapes.
+  function applyBooleanOpToSelection(op: BooleanOp) {
+    const targets = selectedShapeIds.filter(id => !isLocked(id)).map(id => shapeNodes.find(n => n.id === id)).filter((n): n is Node => !!n);
+    if (targets.length !== 2) return;
+    const [nodeA, nodeB] = targets;
+    const contourA = shapeToBooleanContour(nodeA);
+    const contourB = shapeToBooleanContour(nodeB);
+    if (!contourA || !contourB) return;
+    const foundPageId = findPageIdFor(nodeA);
+    if (!foundPageId) return;
+    const pageId: string = foundPageId;
+    const results = applyBooleanOp(op, contourA, contourB);
+    if (!results) return;
+
+    const dataA = nodeA.data as ShapeNodeData;
+    // A group's hole(s) — e.g. a ring left by a subtract — get normalized
+    // into the SAME local space as their outer contour (not each into their
+    // own), so they stay correctly positioned relative to it once the group
+    // becomes a single path shape with `pathHoles`.
+    const groups = groupContoursByContainment(results);
+    const newShapes: DiagramNode[] = groups.map(({ outer, holes }) => {
+      const allAnchors = [...outer.anchors, ...holes.flatMap(h => h.anchors)];
+      const minX = Math.min(...allAnchors.map(a => a.x));
+      const minY = Math.min(...allAnchors.map(a => a.y));
+      const maxX = Math.max(...allAnchors.map(a => a.x));
+      const maxY = Math.max(...allAnchors.map(a => a.y));
+      const toLocal = (a: PathAnchor): PathAnchor => ({ x: a.x - minX, y: a.y - minY, handleIn: a.handleIn, handleOut: a.handleOut });
+      const localAnchors = outer.anchors.map(toLocal);
+      const localHoles = holes.map(h => ({ anchors: h.anchors.map(toLocal), closed: h.closed }));
+      return {
+        id: crypto.randomUUID(),
+        type: 'path',
+        position: { x: minX, y: minY },
+        width: maxX - minX,
+        height: maxY - minY,
+        zIndex: nextZIndexForPage(pageId),
+        data: {
+          kind: 'path', pageId, pathAnchors: localAnchors, pathClosed: outer.closed,
+          pathHoles: localHoles.length > 0 ? localHoles : undefined,
+          fillColor: dataA.fillColor, strokeColor: dataA.strokeColor, strokeWidth: dataA.strokeWidth,
+          effect: dataA.effect, opacity: dataA.opacity, blur: dataA.blur, fillGradient: dataA.fillGradient,
+        },
+      };
+    });
+
+    const removedIds = new Set([nodeA.id, nodeB.id]);
+    const removedShapes = [nodeA, nodeB].map(n => getCommittedShape(n.id)).filter((n): n is DiagramNode => !!n);
+    const removedEdges = connectorEdges.filter(e => removedIds.has(e.source) || removedIds.has(e.target));
+    const removedEdgePages = removedEdges.map(e => ({ edge: e as DiagramEdge, pageId: findEdgePageId(e) ?? pageId }));
+
+    function commitResult() {
+      for (const id of removedIds) deleteShape(diagramId, pageId, id);
+      for (const { edge, pageId: ep } of removedEdgePages) deleteConnector(diagramId, ep, edge.id);
+      for (const s of newShapes) saveShape(diagramId, pageId, s);
+      setShapeNodes(prev => [
+        ...prev.filter(n => !removedIds.has(n.id)),
+        ...newShapes.map(s => ({ ...s, data: { ...s.data, onCommit, onNavigateLink: navigateToLink } })),
+      ]);
+      setConnectorEdges(prev => prev.filter(e => !removedEdges.some(re => re.id === e.id)));
+    }
+    function revertResult() {
+      for (const s of newShapes) deleteShape(diagramId, pageId, s.id);
+      for (const s of removedShapes) saveShape(diagramId, pageId, s);
+      for (const { edge, pageId: ep } of removedEdgePages) saveConnector(diagramId, ep, edge);
+      setShapeNodes(prev => [
+        ...prev.filter(n => !newShapes.some(s => s.id === n.id)),
+        ...removedShapes.map(s => ({ ...s, data: { ...s.data, onCommit, onNavigateLink: navigateToLink } })),
+      ]);
+      setConnectorEdges(prev => [...prev, ...removedEdges]);
+    }
+
+    commitResult();
+    pushHistory({ undo: revertResult, redo: commitResult });
+  }
+
   function bringToFront() {
     const targets = selectedShapeIds.filter(id => !isLocked(id));
     if (targets.length === 0) return;
     setShapeNodes(prev => {
+      const before = new Map(prev.filter(n => targets.includes(n.id)).map(n => [n.id, n.zIndex ?? 0]));
       const maxZ = Math.max(0, ...prev.map(n => n.zIndex ?? 0));
       const next = prev.map(n => targets.includes(n.id) ? { ...n, zIndex: maxZ + 1 } : n);
-      persistZIndex(next, targets);
+      persistNodes(next, targets);
+      pushZIndexHistory(before, new Map(targets.map(id => [id, maxZ + 1])));
       return next;
     });
   }
@@ -1975,9 +2923,11 @@ export function Canvas({
     const targets = selectedShapeIds.filter(id => !isLocked(id));
     if (targets.length === 0) return;
     setShapeNodes(prev => {
+      const before = new Map(prev.filter(n => targets.includes(n.id)).map(n => [n.id, n.zIndex ?? 0]));
       const minZ = Math.min(0, ...prev.map(n => n.zIndex ?? 0));
       const next = prev.map(n => targets.includes(n.id) ? { ...n, zIndex: minZ - 1 } : n);
-      persistZIndex(next, targets);
+      persistNodes(next, targets);
+      pushZIndexHistory(before, new Map(targets.map(id => [id, minZ - 1])));
       return next;
     });
   }
@@ -2067,6 +3017,11 @@ export function Canvas({
     for (const s of clip.shapes) idMap.set(s.id, crypto.randomUUID());
 
     const destDims = pageDimensions.get(destPageId);
+    // Pushes the whole pasted set above everything already on the
+    // destination page while preserving their relative stacking order among
+    // themselves (same reasoning as nextZIndexForPage — a pasted copy should
+    // land on top, not tie with and lose to older shapes on DOM order).
+    const zIndexBase = nextZIndexForPage(destPageId);
     const newShapes: DiagramNode[] = clip.shapes.map(s => {
       const newParentId = s.parentId ? idMap.get(s.parentId) : undefined;
       const isTopLevel = !newParentId;
@@ -2087,6 +3042,7 @@ export function Canvas({
         parentId: newParentId,
         extent: newParentId ? ('parent' as const) : undefined,
         position,
+        zIndex: (s.zIndex ?? 0) + zIndexBase,
         data: { ...s.data, pageId: destPageId },
       };
     });
@@ -2117,6 +3073,9 @@ export function Canvas({
       if (e.key === 'c') { e.preventDefault(); handleCopy(); }
       else if (e.key === 'x') { e.preventDefault(); handleCut(); }
       else if (e.key === 'v') { e.preventDefault(); void handlePaste(); }
+      else if (e.key === 'd') { e.preventDefault(); handleCopy(); void handlePaste(); }
+      else if (e.key.toLowerCase() === 'z' && e.shiftKey) { e.preventDefault(); redo(); }
+      else if (e.key.toLowerCase() === 'z') { e.preventDefault(); undo(); }
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
@@ -2125,22 +3084,84 @@ export function Canvas({
 
   const [guides, setGuides] = useState<GuideLines | null>(null);
   const [dataPanelOpen, setDataPanelOpen] = useState(false);
+  const [validationPanelOpen, setValidationPanelOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [layersPanelOpen, setLayersPanelOpen] = useState(false);
+  const [pageSettingsPanelOpen, setPageSettingsPanelOpen] = useState(false);
+  const [gridRulersPanelOpen, setGridRulersPanelOpen] = useState(false);
+  const [tagsPanelOpen, setTagsPanelOpen] = useState(false);
 
-  const drawerOpen = !!singleSelectedShape || dataPanelOpen || animationPanelOpen || !!activeCommentId || !!draftComment;
-  // Re-fit only on the closed→open transition (a shape newly selected, or a
-  // panel newly opened) — not continuously on every selection change, which
-  // would fight the user's own manual zoom/pan while they're actively
-  // clicking between shapes with the drawer already open.
-  const wasDrawerOpenRef = useRef(false);
+  // Derived, not stored — computed fresh every render from the existing
+  // booleans above (cheap, same convention as toolActive itself). Used only
+  // by the Toolbar (active-button highlighting) and the tool-settings panel
+  // dispatcher; every other existing direct read of penMode/brushMode/etc.
+  // throughout this file is untouched.
+  const activeToolId: ToolId | null = (() => {
+    if (directSelectMode) return 'directSelect';
+    if (connectMode) return 'connect';
+    if (placingComment) return 'comment';
+    if (highlightMode) return 'highlight';
+    if (placingShapeKind === 'hotspot') return 'hotspot';
+    if (placingShapeKind === 'image' || placingShapeKind === 'video') return 'media';
+    if (placingShapeKind) return 'shapes';
+    if (penMode) return 'pen';
+    if (brushMode) return 'brush';
+    if (stylePaintMode) return 'stylePaint';
+    if (layersPanelOpen) return 'layers';
+    if (animationPanelOpen) return 'animation';
+    if (dataPanelOpen) return 'data';
+    if (validationPanelOpen) return 'validation';
+    if (pageSettingsPanelOpen) return 'pageSettings';
+    if (gridRulersPanelOpen) return 'gridRulers';
+    if (tagsPanelOpen) return 'tags';
+    if (shapeGalleryOpen) return 'shapeGallery';
+    return null;
+  })();
+
+  function handleSelectTool(toolId: ToolId) {
+    selectTool(activeToolId === toolId ? 'select' : toolId);
+  }
+
+  const [shortcutsHelpOpen, setShortcutsHelpOpen] = useState(false);
+  // Snap-to-grid was previously always-on at a fixed 8px — now a user toggle
+  // plus a choice of increment. The visible dot grid is drawn at 2x the
+  // actual snap increment (matching the old fixed 16px-dots/8px-snap ratio),
+  // so it marks every other real snap point rather than every one.
+  const [snapEnabled, setSnapEnabled] = useState(true);
+  const [gridSize, setGridSize] = useState(8);
+  const [showRulers, setShowRulers] = useState(false);
+
+  // '?' (Shift+/) opens the shortcuts help overlay — no modifier key, so it
+  // needs its own listener rather than folding into the Cmd/Ctrl-gated
+  // clipboard/undo handler below.
   useEffect(() => {
-    if (drawerOpen && !wasDrawerOpenRef.current && activePageId) {
-      fitToPage(activePageId, { duration: 300 }, 316);
+    if (isPresent) return;
+    function onKeyDown(e: KeyboardEvent) {
+      if (isTypingTarget(e.target)) return;
+      if (e.key === '?') { e.preventDefault(); setShortcutsHelpOpen(o => !o); }
     }
-    wasDrawerOpenRef.current = drawerOpen;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [drawerOpen]);
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isPresent]);
+
+
+  // Gated on validationPanelOpen so this only ever computes while the panel
+  // is actually visible — not a live/reactive validator re-scanning on
+  // every edit (see ValidationPanel's own doc comment for why).
+  const validationIssues = useMemo(
+    () => (validationPanelOpen ? computeValidationIssues(shapeNodes, connectorEdges) : []),
+    [validationPanelOpen, shapeNodes, connectorEdges],
+  );
+
+  function handleValidationSelect(shapeId: string) {
+    handleLayerSelect(shapeId, false);
+    const target = shapeNodesRef.current.find(n => n.id === shapeId);
+    if (target) {
+      const w = target.width ?? target.measured?.width ?? 100;
+      const h = target.height ?? target.measured?.height ?? 70;
+      setCenter(target.position.x + w / 2, target.position.y + h / 2, { zoom: 1.2, duration: 500 });
+    }
+  }
 
   function handleLayerSelect(id: string, additive: boolean) {
     const changes: NodeChange[] = additive
@@ -2316,16 +3337,33 @@ export function Canvas({
           // canvas-pan handlers below, and this app has no other keyboard-nav
           // affordances built around node focus.
           disableKeyboardA11y={!isPresent}
-          snapToGrid={!isPresent}
-          snapGrid={[8, 8]}
+          snapToGrid={!isPresent && snapEnabled}
+          snapGrid={[gridSize, gridSize]}
           // Presenting is a slide deck, not a Miro board — no free panning or
           // zooming. The camera moves only programmatically (step/page nav,
           // hyperlink/hotspot jumps), never by the viewer dragging or scrolling.
           panOnDrag={isPresent ? false : [1, 2]}
           zoomOnScroll={!isPresent}
           zoomOnPinch={!isPresent}
-          zoomOnDoubleClick={!isPresent && !toolActive}
+          // Explicitly disabled — camera zoom/pan should only ever change from
+          // the user's own explicit action (scroll/pinch/drag, or the various
+          // programmatic setCenter calls in this file), never as a side
+          // effect of double-clicking a shape to rename it.
+          zoomOnDoubleClick={false}
           selectionOnDrag={!isPresent && !toolActive}
+          // Plain-drag-on-empty-canvas already starts a selection box via
+          // selectionOnDrag above, so RF's default Shift-triggered selection
+          // mode is redundant — and actively harmful, since it hijacks any
+          // Shift+drag (e.g. Shift-drag a resize handle for aspect-ratio
+          // lock) into a marquee-select that clears the current selection
+          // mid-drag instead of resizing.
+          selectionKeyCode={null}
+          // Users reach for either modifier to add a shape to the current
+          // selection — RF's own default only recognizes Meta/Control (never
+          // Shift), so Shift-click silently replaced the selection instead
+          // of extending it.
+          multiSelectionKeyCode={['Shift', 'Meta', 'Control']}
+          selectNodesOnDrag={false}
           nodesDraggable={!isPresent && !toolActive}
           nodesConnectable={!isPresent && !toolActive}
           elementsSelectable={!isPresent && !toolActive}
@@ -2337,7 +3375,7 @@ export function Canvas({
           proOptions={{ hideAttribution: true }}
           style={isPresent ? { background: 'transparent' } : undefined}
         >
-          {!isPresent && <Background color="#d8dbe6" gap={16} />}
+          {!isPresent && <Background color="#d8dbe6" gap={gridSize * 2} />}
           {!isPresent && <Controls showInteractive={false} />}
           <AlignmentGuidesOverlay guides={guides} />
           <RemoteCursorsLayer peers={peers} shapeNodes={shapeNodes} />
@@ -2377,19 +3415,19 @@ export function Canvas({
         }}>
           <div style={{ display: 'flex', gap: 6 }}>
             <Tooltip title="Exit presentation (Esc)">
-              <Button shape="circle" icon={<CloseCircleOutlined />} onClick={onExitPresent} />
+              <Button shape="circle" icon={<IconExit />} onClick={onExitPresent} />
             </Tooltip>
             <Tooltip title={osFullscreen ? 'Exit full screen' : 'Full screen — hide the browser window chrome, like PowerPoint presentation mode'}>
               <Button
                 shape="circle" type={osFullscreen ? 'primary' : 'default'}
-                icon={osFullscreen ? <FullscreenExitOutlined /> : <FullscreenOutlined />}
+                icon={osFullscreen ? <IconFullscreenExit /> : <IconFullscreenEnter />}
                 onClick={toggleOsFullscreen}
               />
             </Tooltip>
             <Tooltip title={fullscreenOverride ? 'Restore frame' : 'Fill screen (skip the device frame for this page — great for a landscape desktop/deck page)'}>
               <Button
                 shape="circle" type={fullscreenOverride ? 'primary' : 'default'}
-                icon={<BorderOutlined />}
+                icon={<IconFillScreen />}
                 onClick={() => setFullscreenOverride(v => !v)}
               />
             </Tooltip>
@@ -2428,11 +3466,23 @@ export function Canvas({
                       onChangeComplete={c => onUpdatePresentationSettings?.({ frameColor: c.toHexString() })}
                     />
                   </div>
+                  <div>
+                    <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Page transition</div>
+                    <Select
+                      size="small" style={{ width: '100%' }}
+                      value={effectivePresentationSettings.pageTransition ?? 'none'}
+                      options={[
+                        { value: 'none', label: 'None (pan)' },
+                        { value: 'fade', label: 'Fade' },
+                      ]}
+                      onChange={v => onUpdatePresentationSettings?.({ pageTransition: v })}
+                    />
+                  </div>
                 </div>
               }
             >
               <Tooltip title="Presentation frame settings">
-                <Button shape="circle" icon={<SettingOutlined />} type={presentSettingsOpen ? 'primary' : 'default'} />
+                <Button shape="circle" icon={<IconSettingsGear />} type={presentSettingsOpen ? 'primary' : 'default'} />
               </Tooltip>
             </Popover>
           </div>
@@ -2445,7 +3495,7 @@ export function Canvas({
           <div style={{ display: 'flex', gap: 6 }}>
             <Tooltip title="Back (←)">
               <Button
-                shape="circle" icon={<LeftOutlined />}
+                shape="circle" icon={<IconChevronLeft />}
                 onClick={() => {
                   if (presentStep > -1) setPresentStep(s => s - 1);
                   else if (presentPageIndex > 0) setPresentPageIndex(i => i - 1);
@@ -2454,7 +3504,7 @@ export function Canvas({
             </Tooltip>
             <Tooltip title="Next (→ / Space)">
               <Button
-                shape="circle" type="primary" icon={<RightOutlined />}
+                shape="circle" type="primary" icon={<IconChevronRight />}
                 onClick={() => {
                   if (presentStep < presentSequence.length - 1) setPresentStep(s => s + 1);
                   else if (presentPageIndex < pages.length - 1) setPresentPageIndex(i => i + 1);
@@ -2465,45 +3515,52 @@ export function Canvas({
         </div>
       )}
 
-      {!isPresent && (
+      {!isPresent && toolbarSlot && createPortal(
         <Toolbar
-          leftOffset={layersPanelOpen ? 276 : 16}
-          isSelectMode={!toolActive}
-          onSelectTool={clearOtherTools}
-          onOpenShapeGallery={() => setShapeGalleryOpen(true)}
-          isPlacingBasicShape={!!placingShapeKind && placingShapeKind !== 'hotspot' && placingShapeKind !== 'image' && placingShapeKind !== 'video'}
-          penMode={penMode}
-          onTogglePen={handleTogglePen}
-          brushMode={brushMode}
-          onToggleBrush={handleToggleBrush}
-          directSelectMode={directSelectMode}
-          onToggleDirectSelect={handleToggleDirectSelect}
+          onUndo={undo}
+          onRedo={redo}
+          activeTool={activeToolId}
+          onSelectTool={handleSelectTool}
           directSelectDisabled={!editingPathId && !directSelectMode}
-          connectMode={connectMode}
-          onToggleConnect={handleToggleConnect}
-          isPlacingHotspot={placingShapeKind === 'hotspot'}
           onStartPlacingHotspot={() => beginPlacingShape('hotspot')}
           onUploadMedia={handleUploadMedia}
           onInsertContainer={handleInsertContainer}
-          isPlacingComment={placingComment}
-          onStartPlacingComment={beginPlacingComment}
-          layersPanelOpen={layersPanelOpen}
-          onToggleLayers={() => setLayersPanelOpen(o => !o)}
-          highlightMode={highlightMode}
-          onToggleHighlight={() => { setHighlightMode(m => !m); setHighlighted(null); }}
-          animationPanelOpen={animationPanelOpen}
-          onToggleAnimation={() => { setAnimationPanelOpen(o => !o); setDataPanelOpen(false); setRevealStep(-1); }}
-          dataPanelOpen={dataPanelOpen}
-          onToggleData={() => { setDataPanelOpen(o => !o); setAnimationPanelOpen(false); }}
           onOpenExport={() => setExportOpen(true)}
+          onOpenShortcuts={() => setShortcutsHelpOpen(true)}
+        />,
+        toolbarSlot,
+      )}
+      {!isPresent && (
+        <ToolSettingsPanel
+          activeToolId={activeToolId}
+          hasSingleSelectedShape={!!singleSelectedShape}
+          onClose={() => selectTool('select')}
+          penDefaults={toolDefaults.pen}
+          onPenChange={updatePenDefaults}
+          brushDefaults={toolDefaults.brush}
+          onBrushChange={updateBrushDefaults}
+          connectDefaults={toolDefaults.connector}
+          onConnectChange={updateConnectorDefaults}
+          stylePaintSource={stylePaintSource}
+          onStylePaintClear={() => setStylePaintSource(null)}
+          shapeGalleryOpen={shapeGalleryOpen}
+          onSelectShape={(kind, extraData) => beginPlacingShape(kind, extraData, { keepGalleryOpen: true })}
+          isFavoriteShape={isFavorite}
+          favoritesFull={favorites.length >= MAX_FAVORITE_SHAPES}
+          onToggleFavoriteShape={toggleFavorite}
+          snapEnabled={snapEnabled}
+          onToggleSnap={setSnapEnabled}
+          gridSize={gridSize}
+          onGridSizeChange={setGridSize}
+          showRulers={showRulers}
+          onToggleRulers={setShowRulers}
+          allTags={allTags}
+          hiddenTags={hiddenTags}
+          onToggleTagVisibility={toggleTagVisibility}
         />
       )}
       {!isPresent && (
-        <ShapeGalleryModal
-          open={shapeGalleryOpen}
-          onClose={() => setShapeGalleryOpen(false)}
-          onSelect={(kind, extraData) => beginPlacingShape(kind, extraData)}
-        />
+        <FavoriteShapesPanel favorites={favorites} activeKind={placingShapeKind} onPlace={beginPlacingShape} />
       )}
       {!isPresent && (
         <ShapeStampCursor kind={placingShapeKind} imageUrl={pendingMediaPlacement?.kind === 'image' ? pendingMediaPlacement.url : undefined} iconName={pendingShapeExtraData?.iconName} pos={stampScreenPos} />
@@ -2518,7 +3575,7 @@ export function Canvas({
           }}
         />
       )}
-      {!isPresent && layersPanelOpen && (
+      {!isPresent && layersPanelOpen && !singleSelectedShape && (
         <LayersPanel
           shapeNodes={shapeNodes}
           activePageId={activePageId}
@@ -2533,18 +3590,39 @@ export function Canvas({
           onClose={() => setLayersPanelOpen(false)}
         />
       )}
-      {/* Hidden entirely (not just shifted) while a drawer covers the right
-          side — there isn't room for it, and rightOffset would either
-          overlap the drawer or crowd the remaining space. */}
-      {!isPresent && !drawerOpen && (
+      {!isPresent && (
         <PageNavigatorRail
           diagramId={diagramId}
-          pages={pages} pageOrigins={pageOrigins} pageDimensions={pageDimensions}
-          rightOffset={16}
+          pages={pages} masterPages={masterPages} pageOrigins={pageOrigins} pageDimensions={pageDimensions}
+          shapeNodes={shapeNodes}
           onSelectPage={pageId => fitToPage(pageId, { duration: 300 })}
+          onInsertPageAt={afterOrder => onInsertPageAt?.(afterOrder)}
+          onReorderPages={handleReorderPagesWithShapes}
+          onOpenPageSettings={() => selectTool('pageSettings')}
         />
       )}
+      {!isPresent && pageSettingsPanelOpen && activePageId && (() => {
+        const activePage = pages.find(p => p.id === activePageId);
+        if (!activePage) return null;
+        return (
+          <PageSettingsPanel
+            diagramId={diagramId}
+            page={activePage}
+            pages={pages}
+            masterPages={masterPages}
+            pageOrigin={pageOrigins.get(activePageId) ?? 0}
+            pageShapes={shapeNodes.filter(n => (n.data as ShapeNodeData).pageId === activePageId)}
+            onResizePageContent={handleResizePageContent}
+            onClose={() => setPageSettingsPanelOpen(false)}
+          />
+        );
+      })()}
+      {!isPresent && showRulers && <RulerOverlay railWidth={168} />}
 
+
+      {!isPresent && (
+        <ShortcutsHelpModal open={shortcutsHelpOpen} onClose={() => setShortcutsHelpOpen(false)} />
+      )}
 
       {!isPresent && (
         <ExportModal
@@ -2559,7 +3637,7 @@ export function Canvas({
         />
       )}
 
-      {!isPresent && singleSelectedShape && (
+      {!isPresent && singleSelectedShape && !gridRulersPanelOpen && !tagsPanelOpen && (
         <ShapePropertiesPanel
           node={singleSelectedShape}
           pages={pages}
@@ -2568,6 +3646,8 @@ export function Canvas({
           connectorEdges={connectorEdges}
           onChange={patch => onCommit(singleSelectedShape.id, patch)}
           onResize={(w, h) => handleResizeShape(singleSelectedShape.id, w, h)}
+          onMove={(x, y) => handleMoveShape(singleSelectedShape.id, x, y)}
+          pageOrigin={pageOrigins.get(findPageIdFor(singleSelectedShape) ?? '') ?? 0}
           onDeleteEdge={id => onEdgesChange([{ type: 'remove', id }])}
           onClose={deselectAll}
         />
@@ -2582,17 +3662,27 @@ export function Canvas({
         />
       )}
 
+      {validationPanelOpen && !singleSelectedShape && (
+        <ValidationPanel
+          issues={validationIssues}
+          onSelectIssue={handleValidationSelect}
+          onClose={() => setValidationPanelOpen(false)}
+        />
+      )}
+
       {!isPresent && (draftComment || activeCommentId) && (
         <CommentThreadPanel
           comment={activeCommentId ? findComment(activeCommentId) ?? null : null}
           draft={draftComment}
           currentUserId={user?.uid ?? ''}
           currentUserSeed={user?.email ?? user?.uid ?? ''}
+          members={members}
           onPost={handlePostComment}
           onReply={handleReplyToComment}
           onEditComment={handleEditActiveComment}
           onEditReply={handleEditActiveReply}
           onDeleteReply={handleDeleteActiveReply}
+          onToggleReaction={handleToggleReaction}
           onToggleResolved={handleToggleActiveResolved}
           onDeleteThread={handleDeleteActiveThread}
           onClose={() => { setDraftComment(null); setActiveCommentId(null); }}
@@ -2606,41 +3696,80 @@ export function Canvas({
           onStepChange={setRevealStep}
           onToggleSequenced={handleToggleSequenced}
           onReorder={handleReorderSequence}
+          onChangeAnimation={handleChangeAnimation}
           onClose={() => { setAnimationPanelOpen(false); setRevealStep(-1); }}
         />
       )}
 
       {selectedShapeIds.length > 0 && (
         <div style={{
-          position: 'absolute', top: 12, left: '50%', transform: 'translateX(-50%)', zIndex: 20,
-          background: '#fff', borderRadius: 8, padding: 6, display: 'flex', gap: 4,
+          position: 'absolute', top: 64, left: '50%', transform: 'translateX(-50%)', zIndex: 20,
+          background: '#fff', borderRadius: 8, padding: 6, display: 'flex', alignItems: 'center', gap: 4,
           boxShadow: '0 2px 8px rgba(0,0,0,0.12)',
         }}>
           {selectedShapeIds.length >= 2 && (
-            <Tooltip title="Group"><Button size="small" icon={<GroupOutlined />} onClick={handleGroup} /></Tooltip>
+            <>
+              <Tooltip title="Align left"><Button size="small" icon={<IconAlignLeft />} onClick={() => alignSelected('left')} /></Tooltip>
+              <Tooltip title="Align center"><Button size="small" icon={<IconAlignCenter />} onClick={() => alignSelected('hcenter')} /></Tooltip>
+              <Tooltip title="Align right"><Button size="small" icon={<IconAlignRight />} onClick={() => alignSelected('right')} /></Tooltip>
+              <Tooltip title="Align top"><Button size="small" icon={<IconAlignTop />} onClick={() => alignSelected('top')} /></Tooltip>
+              <Tooltip title="Align middle"><Button size="small" icon={<IconAlignMiddle />} onClick={() => alignSelected('vcenter')} /></Tooltip>
+              <Tooltip title="Align bottom"><Button size="small" icon={<IconAlignBottom />} onClick={() => alignSelected('bottom')} /></Tooltip>
+            </>
           )}
-          <Tooltip title={selectedShapeIds.length >= 2 ? 'Wrap in container' : 'Insert container'}>
-            <Button size="small" icon={<BorderOuterOutlined />} onClick={handleInsertContainer} />
+          {selectedShapeIds.length >= 3 && (
+            <>
+              <Tooltip title="Distribute horizontally"><Button size="small" icon={<IconDistributeH />} onClick={() => distributeSelected('horizontal')} /></Tooltip>
+              <Tooltip title="Distribute vertically"><Button size="small" icon={<IconDistributeV />} onClick={() => distributeSelected('vertical')} /></Tooltip>
+            </>
+          )}
+          {canBooleanOp && (
+            <>
+              <div style={{ width: 1, alignSelf: 'stretch', background: '#e6e8ef', margin: '0 2px' }} />
+              <Tooltip title="Union"><Button size="small" icon={<IconBooleanUnion />} onClick={() => applyBooleanOpToSelection('unite')} /></Tooltip>
+              <Tooltip title="Subtract"><Button size="small" icon={<IconBooleanSubtract />} onClick={() => applyBooleanOpToSelection('subtract')} /></Tooltip>
+              <Tooltip title="Intersect"><Button size="small" icon={<IconBooleanIntersect />} onClick={() => applyBooleanOpToSelection('intersect')} /></Tooltip>
+              <Tooltip title="Exclude"><Button size="small" icon={<IconBooleanExclude />} onClick={() => applyBooleanOpToSelection('exclude')} /></Tooltip>
+            </>
+          )}
+          {singleSelectedShape?.data.kind === 'table' && (
+            <>
+              <div style={{ width: 1, alignSelf: 'stretch', background: '#e6e8ef', margin: '0 2px' }} />
+              <Tooltip title="Add row"><Button size="small" icon={<IconAddRow />} onClick={() => addTableRow(singleSelectedShape.id)} /></Tooltip>
+              <Tooltip title="Remove row"><Button size="small" icon={<IconRemoveRow />} onClick={() => removeTableRow(singleSelectedShape.id)} /></Tooltip>
+              <Tooltip title="Add column"><Button size="small" icon={<IconAddColumn />} onClick={() => addTableColumn(singleSelectedShape.id)} /></Tooltip>
+              <Tooltip title="Remove column"><Button size="small" icon={<IconRemoveColumn />} onClick={() => removeTableColumn(singleSelectedShape.id)} /></Tooltip>
+            </>
+          )}
+          {selectedShapeIds.length >= 2 && <div style={{ width: 1, alignSelf: 'stretch', background: '#e6e8ef', margin: '0 2px' }} />}
+          {selectedShapeIds.length >= 2 && (
+            <Tooltip title="Group (organize only — no fill or border)"><Button size="small" icon={<IconGroup />} onClick={handleGroup} /></Tooltip>
+          )}
+          <Tooltip title={selectedShapeIds.length >= 2 ? 'Wrap in container (a styleable frame — background, border theme, swimlane)' : 'Insert container (a styleable frame — background, border theme, swimlane)'}>
+            <Button size="small" icon={<IconContainer />} onClick={handleInsertContainer} />
           </Tooltip>
-          <Tooltip title="Bring to front"><Button size="small" icon={<VerticalAlignTopOutlined />} onClick={bringToFront} /></Tooltip>
-          <Tooltip title="Send to back"><Button size="small" icon={<VerticalAlignBottomOutlined />} onClick={sendToBack} /></Tooltip>
-          <Tooltip title="Delete"><Button size="small" danger icon={<DeleteOutlined />} onClick={deleteSelected} /></Tooltip>
+          <Tooltip title="Bring to front"><Button size="small" icon={<IconBringToFront />} onClick={bringToFront} /></Tooltip>
+          <Tooltip title="Send to back"><Button size="small" icon={<IconSendToBack />} onClick={sendToBack} /></Tooltip>
+          <Tooltip title="Duplicate"><Button size="small" icon={<IconDuplicate />} onClick={() => { handleCopy(); void handlePaste(); }} /></Tooltip>
+          <Tooltip title="Delete"><Button size="small" danger icon={<IconDelete />} onClick={deleteSelected} /></Tooltip>
         </div>
       )}
 
       {selectedGroup && (
         <div style={{
-          position: 'absolute', top: 12, left: '50%', transform: 'translateX(-50%)', zIndex: 20,
+          position: 'absolute', top: 64, left: '50%', transform: 'translateX(-50%)', zIndex: 20,
           background: '#fff', borderRadius: 8, padding: 6, display: 'flex', gap: 4,
           boxShadow: '0 2px 8px rgba(0,0,0,0.12)',
         }}>
-          <Tooltip title="Ungroup"><Button size="small" icon={<UngroupOutlined />} onClick={handleUngroup} /></Tooltip>
+          <Tooltip title="Ungroup"><Button size="small" icon={<IconUngroup />} onClick={handleUngroup} /></Tooltip>
         </div>
       )}
 
       {singleSelectedEdge && (
         <div style={{
-          position: 'absolute', top: 12, left: '50%', transform: 'translateX(-50%)', zIndex: 20,
+          // Sits below the main toolbar (also top-center-docked now that
+          // it's a horizontal bar) rather than sharing its exact position.
+          position: 'absolute', top: 64, left: '50%', transform: 'translateX(-50%)', zIndex: 20,
           background: '#fff', borderRadius: 8, padding: 6, display: 'flex', alignItems: 'center', gap: 8,
           boxShadow: '0 2px 8px rgba(0,0,0,0.12)',
         }}>
@@ -2655,6 +3784,18 @@ export function Canvas({
             value={(singleSelectedEdge.data as SmartEdgeData | undefined)?.flowAnimation ?? 'none'}
             options={[{ value: 'none', label: 'No animation' }, { value: 'dash', label: 'Flow (dash)' }, { value: 'dot', label: 'Flow (dot)' }]}
             onChange={v => onEdgeCommit(singleSelectedEdge.id, { flowAnimation: v })}
+          />
+          <Select
+            size="small" style={{ width: 110 }}
+            value={(singleSelectedEdge.data as SmartEdgeData | undefined)?.startArrow ?? 'none'}
+            options={[{ value: 'none', label: 'Start: None' }, { value: 'arrow', label: 'Start: Arrow' }, { value: 'arrowClosed', label: 'Start: Filled' }]}
+            onChange={v => onEdgeCommit(singleSelectedEdge.id, { startArrow: v })}
+          />
+          <Select
+            size="small" style={{ width: 110 }}
+            value={(singleSelectedEdge.data as SmartEdgeData | undefined)?.endArrow ?? 'arrowClosed'}
+            options={[{ value: 'none', label: 'End: None' }, { value: 'arrow', label: 'End: Arrow' }, { value: 'arrowClosed', label: 'End: Filled' }]}
+            onChange={v => onEdgeCommit(singleSelectedEdge.id, { endArrow: v })}
           />
         </div>
       )}

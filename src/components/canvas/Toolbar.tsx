@@ -1,52 +1,40 @@
 import { useRef } from 'react';
 import { Tooltip } from 'antd';
 import {
-  AppstoreOutlined, EditOutlined, NodeIndexOutlined, ArrowRightOutlined, AimOutlined, PictureOutlined,
-  BlockOutlined, BranchesOutlined, PlaySquareOutlined, DatabaseOutlined, DownloadOutlined, BorderOuterOutlined,
-  SelectOutlined, MessageOutlined, HighlightOutlined,
-} from '@ant-design/icons';
+  IconShapes, IconPenTool, IconDirectSelect, IconConnector, IconHotspot, IconImage,
+  IconLayers, IconBranchHighlight, IconAnimationPanel, IconVariables, IconExport, IconContainer,
+  IconSelect, IconComment, IconBrush, IconStylePaint, IconUndo, IconRedo, IconHelp,
+  IconRulerGrid, IconTags, IconValidation, IconSettingsGear,
+} from '../icons';
+import type { ToolId } from '../../types/tools';
 
 interface Props {
-  leftOffset?: number;
+  // History
+  onUndo: () => void;
+  onRedo: () => void;
 
-  // Create
-  isSelectMode: boolean;
-  onSelectTool: () => void;
-  onOpenShapeGallery: () => void;
-  isPlacingBasicShape: boolean;
-  penMode: boolean;
-  onTogglePen: () => void;
-  brushMode: boolean;
-  onToggleBrush: () => void;
-  directSelectMode: boolean;
-  onToggleDirectSelect: () => void;
+  // Every toggleable button (drawing tool or right-side panel) shares one
+  // active slot — see selectTool()/ToolId in Canvas.tsx.
+  activeTool: ToolId | null;
+  onSelectTool: (id: ToolId) => void;
   directSelectDisabled: boolean;
-  connectMode: boolean;
-  onToggleConnect: () => void;
-  isPlacingHotspot: boolean;
+
+  // These arm placement with data a plain ToolId can't carry (a file, an
+  // icon kind), so they stay their own callbacks rather than going through
+  // onSelectTool.
   onStartPlacingHotspot: () => void;
   onUploadMedia: (file: File) => void;
   onInsertContainer: () => void;
-  isPlacingComment: boolean;
-  onStartPlacingComment: () => void;
 
-  // View / data
-  layersPanelOpen: boolean;
-  onToggleLayers: () => void;
-  highlightMode: boolean;
-  onToggleHighlight: () => void;
-  animationPanelOpen: boolean;
-  onToggleAnimation: () => void;
-  dataPanelOpen: boolean;
-  onToggleData: () => void;
   onOpenExport: () => void;
+  onOpenShortcuts: () => void;
 }
 
 function ToolButton({
   active, disabled, onClick, title, children,
 }: { active?: boolean; disabled?: boolean; onClick: () => void; title: string; children: React.ReactNode }) {
   return (
-    <Tooltip title={title} placement="right">
+    <Tooltip title={title} placement="bottom">
       <button
         onClick={onClick}
         disabled={disabled}
@@ -63,66 +51,71 @@ function ToolButton({
 }
 
 function Divider() {
-  return <div style={{ height: 1, background: '#e6e8ef', margin: '2px 4px' }} />;
+  return <div style={{ width: 1, background: '#e6e8ef', margin: '4px 2px' }} />;
 }
 
 // Replaces ShapePalette.tsx — merges the old left-side shape palette AND the
 // old top-right icon cluster (pen/layers/branch-highlight/animation/data/
 // export) into one toolbar. All the underlying state stays owned by
 // Canvas.tsx exactly as it was; this component only renders buttons.
+//
+// Rendered into a slot inside the document header (via portal from
+// Canvas.tsx) rather than floating over the canvas, so it needs no
+// positioning of its own — just an inline row of buttons.
 export function Toolbar({
-  leftOffset = 16,
-  isSelectMode, onSelectTool,
-  onOpenShapeGallery, isPlacingBasicShape, penMode, onTogglePen, brushMode, onToggleBrush,
-  directSelectMode, onToggleDirectSelect, directSelectDisabled,
-  connectMode, onToggleConnect,
-  isPlacingHotspot, onStartPlacingHotspot, onUploadMedia, onInsertContainer,
-  isPlacingComment, onStartPlacingComment,
-  layersPanelOpen, onToggleLayers, highlightMode, onToggleHighlight,
-  animationPanelOpen, onToggleAnimation, dataPanelOpen, onToggleData, onOpenExport,
+  onUndo, onRedo,
+  activeTool, onSelectTool, directSelectDisabled,
+  onStartPlacingHotspot, onUploadMedia, onInsertContainer,
+  onOpenExport, onOpenShortcuts,
 }: Props) {
   const fileRef = useRef<HTMLInputElement>(null);
 
   return (
-    <div style={{
-      position: 'absolute', top: '50%', left: leftOffset, transform: 'translateY(-50%)',
-      transition: 'left 0.15s',
-      display: 'flex', flexDirection: 'column', gap: 6, zIndex: 10,
-      background: 'rgba(255,255,255,0.95)', borderRadius: 10, padding: 8,
-      boxShadow: '0 2px 8px rgba(0,0,0,0.08)',
-    }}>
-      <ToolButton title="Select — click shapes, or drag to select multiple" active={isSelectMode} onClick={onSelectTool}>
-        <SelectOutlined />
+    <div style={{ display: 'flex', flexDirection: 'row', gap: 6 }}>
+      <ToolButton title="Undo (Cmd/Ctrl+Z)" onClick={onUndo}>
+        <IconUndo />
       </ToolButton>
-      <ToolButton title="Shapes — click, then click the canvas to place" active={isPlacingBasicShape} onClick={onOpenShapeGallery}>
-        <AppstoreOutlined />
+      <ToolButton title="Redo (Cmd/Ctrl+Shift+Z)" onClick={onRedo}>
+        <IconRedo />
       </ToolButton>
-      <ToolButton title={penMode ? 'Exit pen tool (Esc)' : 'Pen tool — click to place points, drag to curve, click near start to close'} active={penMode} onClick={onTogglePen}>
-        <EditOutlined />
-      </ToolButton>
-      <ToolButton title={brushMode ? 'Exit brush tool (Esc)' : 'Brush — freehand stroke with pressure-sensitive width'} active={brushMode} onClick={onToggleBrush}>
-        <HighlightOutlined />
+
+      <Divider />
+
+      <ToolButton title="Select — click shapes, or drag to select multiple" active={activeTool === null} onClick={() => onSelectTool('select')}>
+        <IconSelect />
       </ToolButton>
       <ToolButton
-        title={directSelectDisabled ? 'Direct Selection — select a path first (A)' : directSelectMode ? 'Exit Direct Selection (Esc)' : 'Direct Selection — edit anchor points (A)'}
-        active={directSelectMode} disabled={directSelectDisabled} onClick={onToggleDirectSelect}
+        title={directSelectDisabled ? 'Direct Selection — select a path first (A)' : activeTool === 'directSelect' ? 'Exit Direct Selection (Esc)' : 'Direct Selection — edit anchor points (A)'}
+        active={activeTool === 'directSelect'} disabled={directSelectDisabled} onClick={() => onSelectTool('directSelect')}
       >
-        <NodeIndexOutlined />
+        <IconDirectSelect />
       </ToolButton>
-      <ToolButton title={connectMode ? 'Exit arrow tool (Esc)' : 'Arrow tool — click-drag from one shape to another to connect them'} active={connectMode} onClick={onToggleConnect}>
-        <ArrowRightOutlined />
+
+      <Divider />
+
+      <ToolButton title="Shapes — browse the shape library" active={activeTool === 'shapeGallery' || activeTool === 'shapes'} onClick={() => onSelectTool('shapeGallery')}>
+        <IconShapes />
       </ToolButton>
-      <ToolButton title="Hotspot — clickable link region for prototyping" active={isPlacingHotspot} onClick={onStartPlacingHotspot}>
-        <AimOutlined />
+      <ToolButton title={activeTool === 'pen' ? 'Exit pen tool (Esc)' : 'Pen tool — click to place points, drag to curve, click near start to close'} active={activeTool === 'pen'} onClick={() => onSelectTool('pen')}>
+        <IconPenTool />
       </ToolButton>
-      <ToolButton title="Container — a themeable box shapes can be grouped inside (select 2+ shapes first to wrap them, or click with nothing selected to place an empty one)" onClick={onInsertContainer}>
-        <BorderOuterOutlined />
+      <ToolButton title={activeTool === 'brush' ? 'Exit brush tool (Esc)' : 'Brush — freehand stroke with pressure-sensitive width'} active={activeTool === 'brush'} onClick={() => onSelectTool('brush')}>
+        <IconBrush />
       </ToolButton>
-      <ToolButton title="Comment — click the canvas to drop a comment pin" active={isPlacingComment} onClick={onStartPlacingComment}>
-        <MessageOutlined />
+      <ToolButton
+        title={activeTool === 'stylePaint' ? 'Exit Style Paint (Esc)' : 'Style Paint — click a shape to copy its look, then click others to apply it'}
+        active={activeTool === 'stylePaint'} onClick={() => onSelectTool('stylePaint')}
+      >
+        <IconStylePaint />
       </ToolButton>
-      <ToolButton title="Image / Video / SVG" onClick={() => fileRef.current?.click()}>
-        <PictureOutlined />
+      <ToolButton title="Container — a styleable frame (background, border theme, swimlane) shapes can be grouped inside (select 2+ shapes first to wrap them, or click with nothing selected to place an empty one)" onClick={onInsertContainer}>
+        <IconContainer />
+      </ToolButton>
+      <ToolButton title="Hotspot — clickable link region for prototyping" active={activeTool === 'hotspot'} onClick={onStartPlacingHotspot}>
+        <IconHotspot />
+      </ToolButton>
+      <ToolButton title="Image / Video / SVG" active={activeTool === 'media'} onClick={() => fileRef.current?.click()}>
+        <IconImage />
       </ToolButton>
       <input
         ref={fileRef}
@@ -138,20 +131,47 @@ export function Toolbar({
 
       <Divider />
 
-      <ToolButton title="Layers" active={layersPanelOpen} onClick={onToggleLayers}>
-        <BlockOutlined />
+      <ToolButton title={activeTool === 'connect' ? 'Exit arrow tool (Esc)' : 'Arrow tool — click-drag from one shape to another to connect them'} active={activeTool === 'connect'} onClick={() => onSelectTool('connect')}>
+        <IconConnector />
       </ToolButton>
-      <ToolButton title={highlightMode ? 'Exit branch highlight' : 'Branch highlight — click a shape to trace its downstream path'} active={highlightMode} onClick={onToggleHighlight}>
-        <BranchesOutlined />
+      <ToolButton title="Comment — click the canvas to drop a comment pin" active={activeTool === 'comment'} onClick={() => onSelectTool('comment')}>
+        <IconComment />
       </ToolButton>
-      <ToolButton title="Animation" active={animationPanelOpen} onClick={onToggleAnimation}>
-        <PlaySquareOutlined />
+
+      <Divider />
+
+      <ToolButton title="Layers" active={activeTool === 'layers'} onClick={() => onSelectTool('layers')}>
+        <IconLayers />
       </ToolButton>
-      <ToolButton title="Data" active={dataPanelOpen} onClick={onToggleData}>
-        <DatabaseOutlined />
+      <ToolButton title="Animation" active={activeTool === 'animation'} onClick={() => onSelectTool('animation')}>
+        <IconAnimationPanel />
+      </ToolButton>
+      <ToolButton title="Data — named variables (used by data-binding and CSV import)" active={activeTool === 'data'} onClick={() => onSelectTool('data')}>
+        <IconVariables />
+      </ToolButton>
+      <ToolButton title="Check Diagram" active={activeTool === 'validation'} onClick={() => onSelectTool('validation')}>
+        <IconValidation />
+      </ToolButton>
+      <ToolButton title="Page settings — size, margins, master, header/footer, page numbers" active={activeTool === 'pageSettings'} onClick={() => onSelectTool('pageSettings')}>
+        <IconSettingsGear />
+      </ToolButton>
+
+      <Divider />
+
+      <ToolButton title={activeTool === 'highlight' ? 'Exit branch highlight' : 'Branch highlight — click a shape to trace its downstream path'} active={activeTool === 'highlight'} onClick={() => onSelectTool('highlight')}>
+        <IconBranchHighlight />
+      </ToolButton>
+      <ToolButton title="Grid & rulers" active={activeTool === 'gridRulers'} onClick={() => onSelectTool('gridRulers')}>
+        <IconRulerGrid />
+      </ToolButton>
+      <ToolButton title="Tags" active={activeTool === 'tags'} onClick={() => onSelectTool('tags')}>
+        <IconTags />
       </ToolButton>
       <ToolButton title="Export" onClick={onOpenExport}>
-        <DownloadOutlined />
+        <IconExport />
+      </ToolButton>
+      <ToolButton title="Keyboard shortcuts (?)" onClick={onOpenShortcuts}>
+        <IconHelp />
       </ToolButton>
     </div>
   );

@@ -1,4 +1,4 @@
-import { UserOutlined } from '@ant-design/icons';
+import { IconPersonFallback } from './icons';
 import type { ShapeKind, ShapeNodeData } from '../types/shapes';
 import { CURATED_ICON_CATEGORIES, getAntdIconComponent, iconDisplayName } from '../utils/iconRegistry';
 
@@ -34,6 +34,8 @@ const BASE_CATALOG: ShapeCatalogEntry[] = [
   { kind: 'star', label: 'Star', category: 'Complex', preview: {} },
   { kind: 'document', label: 'Document', category: 'Complex', preview: {} },
   { kind: 'pieChart', label: 'Pie chart', category: 'Complex', preview: {} },
+  { kind: 'table', label: 'Table', category: 'Complex', preview: {} },
+  { kind: 'chart', label: 'Bar/line chart', category: 'Complex', preview: {} },
 ];
 
 const ICON_CATALOG: ShapeCatalogEntry[] = CURATED_ICON_CATEGORIES.flatMap(({ icons }) =>
@@ -85,7 +87,7 @@ const ARCHIMATE_LAYER_COLORS: Record<string, string> = {
 // old palette's text button rendered as an unclear thin bar.
 export function ShapeSwatch({ kind, preview, extraData }: { kind: ShapeKind; preview: React.CSSProperties; extraData?: Partial<ShapeNodeData> }) {
   if (kind === 'text') return <span style={{ fontSize: 18, fontWeight: 700, color: '#555' }}>T</span>;
-  if (kind === 'umlActor') return <UserOutlined style={{ fontSize: 22, color: '#8CA3E8' }} />;
+  if (kind === 'umlActor') return <IconPersonFallback style={{ fontSize: 22, color: '#8CA3E8' }} />;
   if (kind === 'icon') {
     const IconComponent = extraData?.iconName ? getAntdIconComponent(extraData.iconName) : undefined;
     return IconComponent ? <IconComponent style={{ fontSize: 22, color: '#5B6B99' }} /> : <span style={{ width: 26, height: 26, display: 'block', background: '#8CA3E8' }} />;
@@ -123,6 +125,27 @@ export function ShapeSwatch({ kind, preview, extraData }: { kind: ShapeKind; pre
       <svg width="24" height="24" viewBox="0 0 24 24">
         <circle cx="12" cy="12" r="10" fill="#e6e8ef" />
         <path d="M12 12 L12 2 A10 10 0 0 1 20.5 17 Z" fill="#8CA3E8" />
+      </svg>
+    );
+  }
+  if (kind === 'chart') {
+    return (
+      <svg width="26" height="22" viewBox="0 0 26 22">
+        <line x1="1" y1="21" x2="25" y2="21" stroke="#c4c9d6" strokeWidth="1" />
+        <rect x="3" y="12" width="5" height="9" fill="#8CA3E8" />
+        <rect x="11" y="6" width="5" height="15" fill="#8CD9A8" />
+        <rect x="19" y="9" width="5" height="12" fill="#FFD97A" />
+      </svg>
+    );
+  }
+  if (kind === 'table') {
+    return (
+      <svg width="26" height="22" viewBox="0 0 26 22">
+        <rect x="1" y="1" width="24" height="20" fill="none" stroke="#5B6B99" strokeWidth="1.5" />
+        <line x1="1" y1="8" x2="25" y2="8" stroke="#5B6B99" strokeWidth="1" />
+        <line x1="1" y1="15" x2="25" y2="15" stroke="#5B6B99" strokeWidth="1" />
+        <line x1="9.5" y1="1" x2="9.5" y2="21" stroke="#5B6B99" strokeWidth="1" />
+        <line x1="17" y1="1" x2="17" y2="21" stroke="#5B6B99" strokeWidth="1" />
       </svg>
     );
   }

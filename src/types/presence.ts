@@ -12,4 +12,5 @@ export interface PresenceRecord {
   selectedShapeIds: string[];
   dragPreview: DragPreview | null;
   lastActive: number;
+  mode: 'edit' | 'present';
 }

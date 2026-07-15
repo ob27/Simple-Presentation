@@ -12,7 +12,7 @@ function colorForUid(uid: string): string {
   return `hsl(${hash % 360}, 70%, 50%)`;
 }
 
-export function usePresence(diagramId: string, user: User | null) {
+export function usePresence(diagramId: string, user: User | null, mode: 'edit' | 'present' = 'edit') {
   const sessionId = useRef(crypto.randomUUID()).current;
   const [peers, setPeers] = useState<PresenceRecord[]>([]);
   const lastCursorWrite = useRef(0);
@@ -36,6 +36,7 @@ export function usePresence(diagramId: string, user: User | null) {
       selectedShapeIds: [],
       dragPreview: null,
       lastActive: Date.now(),
+      mode,
     };
     set(myRef, initial);
     onDisconnect(myRef).remove();
@@ -51,7 +52,17 @@ export function usePresence(diagramId: string, user: User | null) {
       snap.forEach(child => {
         if (child.key === sessionId) return;
         const val = child.val() as PresenceRecord;
-        if (val) all.push(val);
+        if (!val) return;
+        // Never show the current account's own cursor, even from a second
+        // tab/window signed in as the same user — a "peer" is only ever
+        // someone else. Two tabs of the same account get two different
+        // sessionIds, so the session-key check above doesn't catch this.
+        if (val.uid === user.uid) return;
+        // While presenting, a remote cursor is only meaningful if that
+        // person is actively editing — another viewer's inert pointer over
+        // their own fullscreen view isn't useful the way a co-editor's is.
+        if (mode === 'present' && val.mode !== 'edit') return;
+        all.push(val);
       });
       rawPeers.current = all;
       applyStaleFilter();
@@ -65,7 +76,7 @@ export function usePresence(diagramId: string, user: User | null) {
       remove(myRef).catch(() => {});
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [diagramId, user?.uid]);
+  }, [diagramId, user?.uid, mode]);
 
   const updateCursor = useCallback((x: number, y: number) => {
     if (!user) return;

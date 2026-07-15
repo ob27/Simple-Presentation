@@ -17,6 +17,7 @@ export const DEFAULT_PRESENTATION_SETTINGS: PresentationSettings = {
   frameMode: 'auto',
   roundedCorners: true,
   frameColor: '#0d0d10',
+  pageTransition: 'none',
 };
 
 export type FrameKind = 'phone' | 'tablet' | 'watch' | 'monitor' | 'slide';

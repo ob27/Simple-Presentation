@@ -1,4 +1,4 @@
-import { VideoCameraOutlined } from '@ant-design/icons';
+import { IconVideoCamera } from '../icons';
 import { ShapeSwatch, getShapePreviewStyle } from '../ShapeSwatch';
 import { getAntdIconComponent } from '../../utils/iconRegistry';
 import type { ShapeKind } from '../../types/shapes';
@@ -30,7 +30,7 @@ export function ShapeStampCursor({ kind, imageUrl, iconName, pos }: Props) {
       {kind === 'image' && imageUrl ? (
         <img src={imageUrl} style={{ width: 28, height: 28, objectFit: 'cover', borderRadius: 4 }} />
       ) : kind === 'video' ? (
-        <VideoCameraOutlined style={{ fontSize: 22, color: '#7C93E8' }} />
+        <IconVideoCamera style={{ fontSize: 22, color: '#7C93E8' }} />
       ) : kind === 'hotspot' ? (
         <span style={{ width: 26, height: 20, display: 'block', border: '1.5px dashed #ff5fc4', borderRadius: 3, background: 'rgba(255, 95, 196, 0.12)' }} />
       ) : IconComponent ? (
