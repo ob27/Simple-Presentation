@@ -20,6 +20,7 @@ import { FolderMembersModal } from '../components/FolderMembersModal';
 import { TemplateGalleryModal } from '../components/TemplateGalleryModal';
 import { WorkspaceSettingsDrawer } from '../components/WorkspaceSettingsDrawer';
 import { CommentAvatar } from '../components/canvas/CommentAvatar';
+import { NotificationBell } from '../components/NotificationBell';
 
 const UNGROUPED_KEY = '__ungrouped__';
 const DEFAULT_WORKSPACE_SETTINGS: WorkspaceSettings = { navLogoUrl: null, navBgColor: '#1a1a2e' };
@@ -300,6 +301,7 @@ export function Dashboard() {
           </span>
         )}
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          {user && <NotificationBell uid={user.uid} />}
           <Dropdown
             trigger={['click']}
             menu={{
