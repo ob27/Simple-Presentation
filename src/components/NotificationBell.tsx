@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Drawer, List, Avatar, Tag, Button, Typography, Empty, Badge, Popconfirm } from 'antd';
+import { Drawer, List, Avatar, Tag, Button, Typography, Empty, Badge, Popconfirm, Select } from 'antd';
 import {
   BellOutlined, CheckCircleOutlined, WarningOutlined, InfoCircleOutlined,
   ExclamationCircleOutlined, CloseOutlined, DeleteOutlined,
@@ -113,12 +113,12 @@ export function NotificationBell({ uid }: Props) {
         closeIcon={<CloseOutlined style={{ fontSize: 14 }} />}
         styles={{ header: { borderBottom: '1px solid #f0f0f0', padding: '16px 20px' }, body: { padding: 0 } }}
       >
-        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', padding: '12px 20px', borderBottom: '1px solid #f0f0f0' }}>
-          {PRODUCT_FILTERS.map(f => (
-            <Tag.CheckableTag key={f.key} checked={filter === f.key} onChange={() => setFilter(f.key)}>
-              {f.label}
-            </Tag.CheckableTag>
-          ))}
+        <div style={{ padding: '12px 20px', borderBottom: '1px solid #f0f0f0' }}>
+          <Select
+            size="small" style={{ width: '100%' }}
+            value={filter} onChange={setFilter}
+            options={PRODUCT_FILTERS.map(f => ({ value: f.key, label: f.label }))}
+          />
         </div>
 
         {filtered.length === 0 ? (
