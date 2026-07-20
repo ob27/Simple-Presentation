@@ -3086,6 +3086,13 @@ export function Canvas({
   const [dataPanelOpen, setDataPanelOpen] = useState(false);
   const [validationPanelOpen, setValidationPanelOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
+  // While an export capture is running, force EVERY node to mount regardless
+  // of the live camera position — onlyRenderVisibleElements otherwise culls
+  // any page's shapes that aren't under the current viewport, which is what
+  // made multi-page PDF/PPTX export (and single-page export of a non-active
+  // page) silently capture blank pages for everything but the page the user
+  // happened to be looking at.
+  const [isExporting, setIsExporting] = useState(false);
   const [layersPanelOpen, setLayersPanelOpen] = useState(false);
   const [pageSettingsPanelOpen, setPageSettingsPanelOpen] = useState(false);
   const [gridRulersPanelOpen, setGridRulersPanelOpen] = useState(false);
@@ -3328,7 +3335,7 @@ export function Canvas({
           onNodeDrag={isPresent ? undefined : onNodeDrag}
           onNodeDragStop={isPresent ? undefined : onNodeDragStop}
           connectionMode={ConnectionMode.Loose}
-          onlyRenderVisibleElements
+          onlyRenderVisibleElements={!isExporting}
           minZoom={0.1}
           maxZoom={2}
           // Disables RF's own per-node tabIndex/keyboard-a11y layer (Space
@@ -3634,6 +3641,7 @@ export function Canvas({
           pageDimensions={pageDimensions}
           shapeNodes={shapeNodes}
           connectorEdges={connectorEdges}
+          onExportingChange={setIsExporting}
         />
       )}
 
