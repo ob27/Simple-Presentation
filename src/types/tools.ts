@@ -7,6 +7,7 @@ export type ToolId =
   | 'select'
   | 'directSelect'
   | 'shapes'
+  | 'text'
   | 'pen'
   | 'brush'
   | 'stylePaint'

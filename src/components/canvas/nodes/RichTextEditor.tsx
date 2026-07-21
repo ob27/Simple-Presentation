@@ -161,6 +161,20 @@ export function RichTextEditor({ paragraphs, baseStyle, baseColorHex, textAlign,
         className="nodrag nopan"
         onKeyDown={e => {
           if (e.key === 'Escape') { cancelledRef.current = true; onCancel(); }
+          // Only steal Tab when the caret is inside a list item — nests (or
+          // un-nests) it into a real sub-list via the browser's own
+          // execCommand, which already knows how to restructure <li>/<ul>
+          // correctly for a contentEditable. Outside a list, Tab is left
+          // alone so it still does its normal focus-move thing.
+          if (e.key === 'Tab') {
+            const sel = window.getSelection();
+            const anchor = sel?.anchorNode;
+            const anchorEl = anchor instanceof Element ? anchor : anchor?.parentElement;
+            if (anchorEl?.closest('li')) {
+              e.preventDefault();
+              document.execCommand(e.shiftKey ? 'outdent' : 'indent');
+            }
+          }
           e.stopPropagation();
         }}
         style={{

@@ -5,7 +5,7 @@ import {
   MarkerType, ConnectionMode, useReactFlow, type Node, type Edge, type NodeTypes, type EdgeTypes,
   type OnConnect, type NodeChange, type EdgeChange,
 } from '@xyflow/react';
-import { Button, Tooltip, Select, Popover, Switch, ColorPicker } from 'antd';
+import { Button, Tooltip, Select, Popover, Switch, ColorPicker, Modal, Progress } from 'antd';
 import {
   IconDelete, IconAlignTop, IconAlignBottom, IconAlignMiddle,
   IconAlignLeft, IconAlignCenter, IconAlignRight, IconDistributeH, IconDistributeV,
@@ -65,10 +65,13 @@ import { resolveStyle } from '../../utils/shapeStyleResolver';
 import { computeDownstream } from '../../utils/graphTraversal';
 import { computePresentationLayout, DEFAULT_PRESENTATION_SETTINGS } from '../../utils/presentationFrame';
 import { uploadDiagramImage, uploadDiagramMedia, getImageDimensions, getVideoDimensions } from '../../utils/imageUpload';
+import { downsampleImageFile, formatBytes } from '../../utils/imageDownsample';
+import { exportPageAsImage } from '../../utils/exportImage';
+import { THUMB_MAX_WIDTH, THUMB_MAX_HEIGHT } from './PageNavigatorRail';
 import type { DiagramVariable } from '../../types/variables';
 import {
   subscribeShapes, subscribeConnectors, saveShape, deleteShape, saveConnector, deleteConnector,
-  subscribeVariables, upsertVariable, deleteVariable, updatePage,
+  subscribeVariables, upsertVariable, deleteVariable, updatePage, duplicatePage,
   subscribeComments, saveComment, deleteComment,
 } from '../../store';
 import type { DiagramComment } from '../../types/comments';
@@ -773,7 +776,10 @@ export function Canvas({
   const { favorites, isFavorite, toggleFavorite } = useFavoriteShapes();
   const { defaults: toolDefaults, updatePenDefaults, updateBrushDefaults, updateConnectorDefaults } = useToolDefaults();
   const [placingShapeKind, setPlacingShapeKind] = useState<ShapeKind | null>(null);
-  const [pendingMediaPlacement, setPendingMediaPlacement] = useState<{ kind: 'image' | 'video'; url: string; width: number; height: number } | null>(null);
+  const [pendingMediaPlacement, setPendingMediaPlacement] = useState<{
+    kind: 'image' | 'video'; url: string; width: number; height: number; fileSizeBytes?: number; downsampled?: boolean;
+  } | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<{ fileName: string; percent: number } | null>(null);
   // Carries per-placement data the gallery can't express via `kind` alone —
   // e.g. which icon glyph or ArchiMate element type was picked.
   const [pendingShapeExtraData, setPendingShapeExtraData] = useState<Partial<ShapeNodeData> | null>(null);
@@ -823,6 +829,35 @@ export function Canvas({
   const [highlighted, setHighlighted] = useState<{ nodeIds: Set<string>; edgeIds: Set<string> } | null>(null);
 
   const toolActive = penMode || connectMode || directSelectMode || brushMode || stylePaintMode || highlightMode || !!placingShapeKind;
+
+  // Holding Spacebar grab-pans the camera — including over shapes, not just
+  // empty canvas — by temporarily disabling node dragging/selection and
+  // switching React Flow's left-drag behavior to pan instead. A held key
+  // (not a toggle) so it can't be left on by accident; released the moment
+  // focus moves to a text input so it never fights normal typing/space bar
+  // use there.
+  const [isSpaceDown, setIsSpaceDown] = useState(false);
+  const [isSpaceDragging, setIsSpaceDragging] = useState(false);
+  useEffect(() => {
+    if (isPresent) return;
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.code !== 'Space' || isTypingTarget(e.target) || e.repeat) return;
+      e.preventDefault(); // stops the page from scrolling on Space
+      setIsSpaceDown(true);
+    }
+    function onKeyUp(e: KeyboardEvent) {
+      if (e.code === 'Space') setIsSpaceDown(false);
+    }
+    function onBlur() { setIsSpaceDown(false); }
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onBlur);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onBlur);
+    };
+  }, [isPresent]);
 
   // The one shared reset+activate function behind every toolbar button
   // (drawing modes AND right-side panels alike) — replaces what used to be
@@ -1055,8 +1090,10 @@ export function Canvas({
         // gates — otherwise clicking a shape's body while the Arrow/Pen tool
         // is active drags the shape instead of starting a connector/path, and
         // shapes stay movable while presenting since the global prop alone
-        // isn't enough to block it.
-        draggable: !locked && !toolActive && !isPresent,
+        // isn't enough to block it. Also gated on isSpaceDown so holding
+        // Space grab-pans the camera even when the cursor starts a drag over
+        // a shape, instead of moving that shape.
+        draggable: !locked && !toolActive && !isPresent && !isSpaceDown,
         connectable: !locked && !isPresent,
       };
     });
@@ -1853,7 +1890,7 @@ export function Canvas({
     if (!pageId) return;
     if (kind === 'image' || kind === 'video') {
       if (!pendingMediaPlacement) return;
-      const { url, width, height } = pendingMediaPlacement;
+      const { url, width, height, fileSizeBytes, downsampled } = pendingMediaPlacement;
       const node: DiagramNode = {
         id: crypto.randomUUID(),
         type: 'shape',
@@ -1861,7 +1898,7 @@ export function Canvas({
         width, height,
         zIndex: nextZIndexForPage(pageId),
         data: kind === 'image'
-          ? { kind: 'image', pageId, imageUrl: url }
+          ? { kind: 'image', pageId, imageUrl: url, fileSizeBytes, downsampled }
           : { kind: 'video', pageId, videoUrl: url, videoMuted: true, videoControls: true },
       };
       setShapeNodes(prev => [...prev, { ...node, data: { ...node.data, onCommit, onNavigateLink: navigateToLink } }]);
@@ -1984,10 +2021,34 @@ export function Canvas({
 
   async function handleUploadMedia(file: File) {
     const isVideo = file.type.startsWith('video/');
-    const [dims, url] = await Promise.all([
+    // SVGs are already vector/tiny — rasterizing one through the downsample
+    // canvas would only make it worse, so they're excluded alongside video.
+    const isDownsamplable = !isVideo && file.type !== 'image/svg+xml';
+
+    let fileToUpload: File | Blob = file;
+    let downsampled = false;
+    if (isDownsamplable) {
+      downsampled = await new Promise<boolean>(resolve => {
+        Modal.confirm({
+          title: 'Downsample this image?',
+          content: `This image is ${formatBytes(file.size)}. Downsampling can significantly reduce storage use, usually with little visible quality loss. You can also downsample it later from the shape's Settings tab.`,
+          okText: 'Downsample', cancelText: 'Keep original',
+          onOk: () => resolve(true),
+          onCancel: () => resolve(false),
+        });
+      });
+      if (downsampled) fileToUpload = await downsampleImageFile(file);
+    }
+
+    setUploadProgress({ fileName: file.name, percent: 0 });
+    const [dims, upload] = await Promise.all([
       isVideo ? getVideoDimensions(file) : getImageDimensions(file),
-      isVideo ? uploadDiagramMedia(diagramId, file, 'diagramVideos') : uploadDiagramImage(diagramId, file),
+      isVideo
+        ? uploadDiagramMedia(diagramId, fileToUpload, 'diagramVideos', percent => setUploadProgress({ fileName: file.name, percent }))
+        : uploadDiagramImage(diagramId, fileToUpload, percent => setUploadProgress({ fileName: file.name, percent })),
     ]);
+    setUploadProgress(null);
+
     const maxDim = 320;
     const scale = Math.min(1, maxDim / Math.max(dims.width, dims.height));
     const width = Math.round(dims.width * scale);
@@ -1997,7 +2058,10 @@ export function Canvas({
     // (both setState calls batch together since neither is separated by an
     // await, so the clear would silently win over the set).
     selectTool('select');
-    setPendingMediaPlacement({ kind: isVideo ? 'video' : 'image', url, width, height });
+    setPendingMediaPlacement({
+      kind: isVideo ? 'video' : 'image', url: upload.url, width, height,
+      fileSizeBytes: isDownsamplable ? upload.sizeBytes : undefined, downsampled: isDownsamplable ? downsampled : undefined,
+    });
     setPlacingShapeKind(isVideo ? 'video' : 'image');
   }
 
@@ -2937,6 +3001,37 @@ export function Canvas({
 
   const activePageId = useActivePageId(pages, pageOrigins, pageDimensions);
 
+  // Real (but bandwidth-free) page-navigator thumbnails: a session-scoped,
+  // in-memory-only cache of small raster snapshots, keyed by pageId — never
+  // uploaded/persisted anywhere, so this costs no storage or bandwidth.
+  // Only the ACTIVE page is ever snapshotted (onlyRenderVisibleElements
+  // already keeps exactly that page's nodes mounted, unlike PDF export's
+  // "every page" case, which needed to temporarily disable that culling).
+  // Pages never visited this session simply keep showing PageNavigatorRail's
+  // existing rough SVG approximation.
+  const [pageSnapshots, setPageSnapshots] = useState<Map<string, string>>(new Map());
+  useEffect(() => {
+    if (isPresent || !activePageId) return;
+    const dims = pageDimensions.get(activePageId);
+    const origin = pageOrigins.get(activePageId);
+    if (!dims || origin === undefined) return;
+    const timer = setTimeout(() => {
+      const scale = Math.min(THUMB_MAX_WIDTH / dims.width, THUMB_MAX_HEIGHT / dims.height);
+      exportPageAsImage({ x: 0, y: origin, width: dims.width, height: dims.height }, 'png', scale)
+        .then(dataUrl => setPageSnapshots(prev => new Map(prev).set(activePageId, dataUrl)))
+        .catch(() => {});
+    }, 1500);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activePageId, shapeNodes, pageDimensions, pageOrigins, isPresent]);
+
+  async function handleDuplicatePage(pageId: string) {
+    const sourcePage = pages.find(p => p.id === pageId);
+    if (!sourcePage) return;
+    const newPage = await duplicatePage(diagramId, sourcePage, pages);
+    fitToPage(newPage.id, { duration: 300 });
+  }
+
   // In-memory clipboard (a ref, not the OS Clipboard API — this is a
   // real-time collaborative Firestore-backed canvas with no cross-tab/app
   // paste requirement, and the async permission-gated Clipboard API adds
@@ -3110,6 +3205,7 @@ export function Canvas({
     if (highlightMode) return 'highlight';
     if (placingShapeKind === 'hotspot') return 'hotspot';
     if (placingShapeKind === 'image' || placingShapeKind === 'video') return 'media';
+    if (placingShapeKind === 'text') return 'text';
     if (placingShapeKind) return 'shapes';
     if (penMode) return 'pen';
     if (brushMode) return 'brush';
@@ -3320,7 +3416,11 @@ export function Canvas({
         the screen rect with opaque panels matching the ambient background,
         so other pages stacked in flow-space are hidden, not resized around.
       */}
-      <div style={{ width: '100%', height: '100%' }}>
+      <div
+        style={{ width: '100%', height: '100%', cursor: isSpaceDown ? (isSpaceDragging ? 'grabbing' : 'grab') : undefined }}
+        onMouseDown={() => { if (isSpaceDown) setIsSpaceDragging(true); }}
+        onMouseUp={() => setIsSpaceDragging(false)}
+      >
         <ReactFlow
           nodes={nodes}
           edges={edges}
@@ -3349,7 +3449,7 @@ export function Canvas({
           // Presenting is a slide deck, not a Miro board — no free panning or
           // zooming. The camera moves only programmatically (step/page nav,
           // hyperlink/hotspot jumps), never by the viewer dragging or scrolling.
-          panOnDrag={isPresent ? false : [1, 2]}
+          panOnDrag={isPresent ? false : isSpaceDown ? true : [1, 2]}
           zoomOnScroll={!isPresent}
           zoomOnPinch={!isPresent}
           // Explicitly disabled — camera zoom/pan should only ever change from
@@ -3357,7 +3457,7 @@ export function Canvas({
           // programmatic setCenter calls in this file), never as a side
           // effect of double-clicking a shape to rename it.
           zoomOnDoubleClick={false}
-          selectionOnDrag={!isPresent && !toolActive}
+          selectionOnDrag={!isPresent && !toolActive && !isSpaceDown}
           // Plain-drag-on-empty-canvas already starts a selection box via
           // selectionOnDrag above, so RF's default Shift-triggered selection
           // mode is redundant — and actively harmful, since it hijacks any
@@ -3371,7 +3471,7 @@ export function Canvas({
           // of extending it.
           multiSelectionKeyCode={['Shift', 'Meta', 'Control']}
           selectNodesOnDrag={false}
-          nodesDraggable={!isPresent && !toolActive}
+          nodesDraggable={!isPresent && !toolActive && !isSpaceDown}
           nodesConnectable={!isPresent && !toolActive}
           elementsSelectable={!isPresent && !toolActive}
           // Suppressed while Direct Selection is active — Delete/Backspace
@@ -3530,6 +3630,7 @@ export function Canvas({
           onSelectTool={handleSelectTool}
           directSelectDisabled={!editingPathId && !directSelectMode}
           onStartPlacingHotspot={() => beginPlacingShape('hotspot')}
+          onStartPlacingText={() => beginPlacingShape('text')}
           onUploadMedia={handleUploadMedia}
           onInsertContainer={handleInsertContainer}
           onOpenExport={() => setExportOpen(true)}
@@ -3602,10 +3703,12 @@ export function Canvas({
           diagramId={diagramId}
           pages={pages} masterPages={masterPages} pageOrigins={pageOrigins} pageDimensions={pageDimensions}
           shapeNodes={shapeNodes}
+          pageSnapshots={pageSnapshots}
           onSelectPage={pageId => fitToPage(pageId, { duration: 300 })}
           onInsertPageAt={afterOrder => onInsertPageAt?.(afterOrder)}
           onReorderPages={handleReorderPagesWithShapes}
           onOpenPageSettings={() => selectTool('pageSettings')}
+          onDuplicatePage={handleDuplicatePage}
         />
       )}
       {!isPresent && pageSettingsPanelOpen && activePageId && (() => {
@@ -3645,9 +3748,23 @@ export function Canvas({
         />
       )}
 
+      {uploadProgress && (
+        <div style={{
+          position: 'absolute', bottom: 16, right: 16, zIndex: 30, background: '#fff',
+          border: '1px solid #e6e8ef', borderRadius: 8, boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
+          padding: '10px 14px', width: 220,
+        }}>
+          <div style={{ fontSize: 12, color: '#555', marginBottom: 6, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            Uploading {uploadProgress.fileName}…
+          </div>
+          <Progress percent={Math.round(uploadProgress.percent)} size="small" />
+        </div>
+      )}
+
       {!isPresent && singleSelectedShape && !gridRulersPanelOpen && !tagsPanelOpen && (
         <ShapePropertiesPanel
           node={singleSelectedShape}
+          diagramId={diagramId}
           pages={pages}
           allShapes={shapeNodes}
           variables={variables}

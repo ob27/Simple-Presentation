@@ -101,6 +101,13 @@ export interface RichTextRun {
 export interface RichTextParagraph {
   runs: RichTextRun[];
   listType?: 'bullet' | 'ordered';
+  // Nesting depth for list items only (0 = top level, meaningless when
+  // `listType` is unset) — stored flat rather than as a tree so paragraphs
+  // stay a plain array; the nested <ul>/<ol> DOM (real sub-lists, so an
+  // indented ordered item restarts its own numbering) is only ever built/
+  // parsed at the edges: RichTextEditor's edit-mode seed, the commit
+  // parser, and the read-only display renderer.
+  indentLevel?: number;
 }
 
 export interface ShapeNodeData extends Record<string, unknown> {
@@ -140,6 +147,13 @@ export interface ShapeNodeData extends Record<string, unknown> {
   tags?: string[];
   link?: ShapeLink;
   imageUrl?: string;
+  // Image-kind only — the uploaded file's byte size (from the Storage
+  // upload's own metadata) and whether it's already been through
+  // downsampleImageFile, so ShapePropertiesPanel's Settings tab can show
+  // current size and only offer "Downsample now" when there's still
+  // savings to be had.
+  fileSizeBytes?: number;
+  downsampled?: boolean;
   locked?: boolean;
   hidden?: boolean;
   pathAnchors?: PathAnchor[];

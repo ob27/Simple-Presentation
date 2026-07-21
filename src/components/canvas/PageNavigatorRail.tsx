@@ -1,6 +1,6 @@
 import { useState, Fragment } from 'react';
-import { Tooltip, Popover, Input, Button, Popconfirm } from 'antd';
-import { IconSettingsGear, IconAdd, IconInfo, IconDelete } from '../icons';
+import { Tooltip, Popover, Input, Button, Popconfirm, Dropdown } from 'antd';
+import { IconSettingsGear, IconAdd, IconInfo, IconDelete, IconDuplicate } from '../icons';
 import {
   DndContext, PointerSensor, KeyboardSensor, useSensor, useSensors, closestCenter,
   type DragEndEvent,
@@ -22,14 +22,20 @@ interface Props {
   pageOrigins: Map<string, number>;
   pageDimensions: Map<string, { width: number; height: number }>;
   shapeNodes: Node[];
+  // Client-side-only raster snapshots of pages that have been visited this
+  // session (see Canvas.tsx) — never uploaded anywhere, so this costs no
+  // bandwidth/storage. Pages not yet in this map fall back to the rough
+  // ThumbnailShape SVG approximation below.
+  pageSnapshots: Map<string, string>;
   onSelectPage: (pageId: string) => void;
   onInsertPageAt: (afterOrder: number) => void;
   onReorderPages: (pages: DiagramPage[]) => void;
   onOpenPageSettings: (pageId: string) => void;
+  onDuplicatePage: (pageId: string) => void;
 }
 
-const THUMB_MAX_WIDTH = 132;
-const THUMB_MAX_HEIGHT = 132;
+export const THUMB_MAX_WIDTH = 132;
+export const THUMB_MAX_HEIGHT = 132;
 
 // Docked to the left, full page height, top-aligned — a traditional
 // slide-panel layout (à la PowerPoint) rather than the floating
@@ -38,7 +44,7 @@ const THUMB_MAX_HEIGHT = 132;
 // real paper dimensions, so both the aspect ratio/orientation AND the
 // rough visual content stay live and accurate — not just a placeholder
 // block standing in for the page.
-export function PageNavigatorRail({ diagramId, pages, masterPages, pageOrigins, pageDimensions, shapeNodes, onSelectPage, onInsertPageAt, onReorderPages, onOpenPageSettings }: Props) {
+export function PageNavigatorRail({ diagramId, pages, masterPages, pageOrigins, pageDimensions, shapeNodes, pageSnapshots, onSelectPage, onInsertPageAt, onReorderPages, onOpenPageSettings, onDuplicatePage }: Props) {
   const activePageId = useActivePageId(pages, pageOrigins, pageDimensions);
   const [masterSettingsOpenFor, setMasterSettingsOpenFor] = useState<string | null>(null);
 
@@ -91,8 +97,10 @@ export function PageNavigatorRail({ diagramId, pages, masterPages, pageOrigins, 
                 <SortablePageThumb
                   page={page} index={i} activePageId={activePageId}
                   thumbW={thumbW} thumbH={thumbH} dims={dims} origin={origin} pageShapes={pageShapes}
+                  snapshot={pageSnapshots.get(page.id)}
                   onSelectPage={onSelectPage}
                   onOpenPageSettings={onOpenPageSettings}
+                  onDuplicatePage={onDuplicatePage}
                 />
                 <PageGap afterOrder={page.order} onInsert={onInsertPageAt} />
               </Fragment>
@@ -259,7 +267,7 @@ function PageGap({ afterOrder, onInsert }: { afterOrder: number; onInsert: (afte
 }
 
 function SortablePageThumb({
-  page, index, activePageId, thumbW, thumbH, dims, origin, pageShapes, onSelectPage, onOpenPageSettings,
+  page, index, activePageId, thumbW, thumbH, dims, origin, pageShapes, snapshot, onSelectPage, onOpenPageSettings, onDuplicatePage,
 }: {
   page: DiagramPage;
   index: number;
@@ -269,10 +277,13 @@ function SortablePageThumb({
   dims: { width: number; height: number };
   origin: number;
   pageShapes: Node[];
+  snapshot: string | undefined;
   onSelectPage: (pageId: string) => void;
   onOpenPageSettings: (pageId: string) => void;
+  onDuplicatePage: (pageId: string) => void;
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: page.id });
+  const [contextMenuOpen, setContextMenuOpen] = useState(false);
 
   return (
     <div
@@ -286,26 +297,42 @@ function SortablePageThumb({
         touchAction: 'none', cursor: isDragging ? 'grabbing' : 'grab',
       }}
     >
-      <Tooltip title={`${page.name} — opens page settings in the sidebar`} placement="right">
-        <div
-          onClick={() => { onSelectPage(page.id); onOpenPageSettings(page.id); }}
-          onMouseDown={e => e.preventDefault()}
-          style={{ position: 'relative', cursor: 'pointer' }}
-        >
-          <svg
-            width={thumbW} height={thumbH} viewBox={`0 0 ${dims.width} ${dims.height}`}
-            style={{
-              display: 'block', background: '#fff',
-              border: page.id === activePageId ? '2px solid #1677ff' : '1px solid #d4d7e0',
-              borderRadius: 3, boxShadow: page.id === activePageId ? '0 0 0 2px rgba(22,119,255,0.15)' : undefined,
-            }}
+      <Dropdown
+        trigger={['contextMenu']}
+        onOpenChange={setContextMenuOpen}
+        menu={{
+          items: [{ key: 'duplicate', icon: <IconDuplicate />, label: 'Duplicate page' }],
+          onClick: ({ key }) => { if (key === 'duplicate') onDuplicatePage(page.id); },
+        }}
+      >
+        {/* `open={false}` while the context menu is up — otherwise the
+            hover tooltip stays visible (the pointer never actually left
+            this element) and its higher stacking order sits on top of the
+            dropdown menu, intercepting clicks on "Duplicate page". */}
+        <Tooltip title={`${page.name} — opens page settings in the sidebar`} placement="right" open={contextMenuOpen ? false : undefined}>
+          <div
+            data-page-thumb={page.id}
+            onClick={() => { onSelectPage(page.id); onOpenPageSettings(page.id); }}
+            onMouseDown={e => e.preventDefault()}
+            style={{ position: 'relative', cursor: 'pointer' }}
           >
-            {pageShapes.map(n => (
-              <ThumbnailShape key={n.id} node={n} pageX={PAGE_X} pageOrigin={origin} />
-            ))}
-          </svg>
-        </div>
-      </Tooltip>
+            <svg
+              width={thumbW} height={thumbH} viewBox={`0 0 ${dims.width} ${dims.height}`}
+              style={{
+                display: 'block', background: '#fff',
+                border: page.id === activePageId ? '2px solid #1677ff' : '1px solid #d4d7e0',
+                borderRadius: 3, boxShadow: page.id === activePageId ? '0 0 0 2px rgba(22,119,255,0.15)' : undefined,
+              }}
+            >
+              {snapshot
+                ? <image href={snapshot} x={0} y={0} width={dims.width} height={dims.height} preserveAspectRatio="xMidYMid slice" />
+                : pageShapes.map(n => (
+                    <ThumbnailShape key={n.id} node={n} pageX={PAGE_X} pageOrigin={origin} />
+                  ))}
+            </svg>
+          </div>
+        </Tooltip>
+      </Dropdown>
       <div style={{
         fontSize: 11, color: page.id === activePageId ? '#1677ff' : '#888', fontWeight: page.id === activePageId ? 600 : 400,
         maxWidth: THUMB_MAX_WIDTH, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'center',

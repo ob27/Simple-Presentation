@@ -15,6 +15,8 @@ import { DEFAULT_PIE_SEGMENTS } from '../../utils/pieDefaults';
 import { DEFAULT_CHART_DATA } from '../../utils/chartDefaults';
 import { ColorPickerField } from './ColorPickerField';
 import { defaultGradient } from '../../utils/gradient';
+import { downsampleImageFile, formatBytes } from '../../utils/imageDownsample';
+import { uploadDiagramImage } from '../../utils/imageUpload';
 
 const OP_OPTIONS: { value: StyleRuleOp; label: string }[] = [
   { value: '<', label: '<' }, { value: '<=', label: '≤' },
@@ -30,6 +32,7 @@ const PX_PER_MM = 96 / 25.4;
 
 interface Props {
   node: Node;
+  diagramId: string;
   pages: DiagramPage[];
   allShapes: Node[];
   variables: DiagramVariable[];
@@ -47,8 +50,22 @@ interface Props {
   onClose: () => void;
 }
 
-export function ShapePropertiesPanel({ node, pages, allShapes, variables, connectorEdges, onChange, onResize, onMove, pageOrigin, onDeleteEdge, onClose }: Props) {
+export function ShapePropertiesPanel({ node, diagramId, pages, allShapes, variables, connectorEdges, onChange, onResize, onMove, pageOrigin, onDeleteEdge, onClose }: Props) {
   const data = node.data as ShapeNodeData;
+  const [downsampling, setDownsampling] = useState(false);
+
+  async function handleDownsampleNow() {
+    if (!data.imageUrl) return;
+    setDownsampling(true);
+    try {
+      const sourceBlob = await fetch(data.imageUrl).then(r => r.blob());
+      const downsampledBlob = await downsampleImageFile(sourceBlob);
+      const upload = await uploadDiagramImage(diagramId, downsampledBlob);
+      onChange({ imageUrl: upload.url, fileSizeBytes: upload.sizeBytes, downsampled: true });
+    } finally {
+      setDownsampling(false);
+    }
+  }
   const widthMm = Math.round(((node.width ?? 100) / PX_PER_MM) * 10) / 10;
   const heightMm = Math.round(((node.height ?? 70) / PX_PER_MM) * 10) / 10;
   const xMm = Math.round((node.position.x / PX_PER_MM) * 10) / 10;
@@ -634,6 +651,25 @@ export function ShapePropertiesPanel({ node, pages, allShapes, variables, connec
                   <span style={{ fontSize: 12, color: '#888' }}>Show controls (in presentation)</span>
                   <Switch size="small" checked={data.videoControls ?? true} onChange={v => onChange({ videoControls: v })} />
                 </div>
+              </div>
+            ),
+          }] : []),
+          ...(data.kind === 'image' ? [{
+            key: 'settings',
+            label: <span>Settings</span>,
+            children: (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 14, paddingTop: 8 }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <span style={{ fontSize: 12, color: '#888' }}>File size</span>
+                  <span style={{ fontSize: 12, color: '#333' }}>{data.fileSizeBytes ? formatBytes(data.fileSizeBytes) : 'Unknown'}</span>
+                </div>
+                {data.downsampled ? (
+                  <div style={{ fontSize: 12, color: '#888' }}>Already downsampled.</div>
+                ) : (
+                  <Button size="small" loading={downsampling} onClick={handleDownsampleNow}>
+                    Downsample now
+                  </Button>
+                )}
               </div>
             ),
           }] : []),

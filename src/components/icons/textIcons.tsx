@@ -12,6 +12,17 @@ export function IconBold({ style, className }: IconProps) {
   );
 }
 
+// Toolbar entry point for placing a Text-kind shape — distinct from IconBold/
+// IconItalic/etc. above (those style existing text), this is the "add text"
+// tool button itself.
+export function IconTextTool({ style, className }: IconProps) {
+  return (
+    <svg data-icon="text-tool" viewBox={ICON_VIEWBOX} width="1em" height="1em" style={style} className={className} fill="none" stroke="currentColor" strokeWidth={ICON_STROKE} strokeLinecap="round" strokeLinejoin="round">
+      <path d="M5 6h14M12 6v13" />
+    </svg>
+  );
+}
+
 export function IconItalic({ style, className }: IconProps) {
   return (
     <svg data-icon="italic" viewBox={ICON_VIEWBOX} width="1em" height="1em" style={style} className={className} fill="none" stroke="currentColor" strokeWidth={ICON_STROKE} strokeLinecap="round" strokeLinejoin="round">

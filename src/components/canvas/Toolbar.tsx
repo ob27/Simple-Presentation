@@ -4,7 +4,7 @@ import {
   IconShapes, IconPenTool, IconDirectSelect, IconConnector, IconHotspot, IconImage,
   IconLayers, IconBranchHighlight, IconAnimationPanel, IconVariables, IconExport, IconContainer,
   IconSelect, IconComment, IconBrush, IconStylePaint, IconUndo, IconRedo, IconHelp,
-  IconRulerGrid, IconTags, IconValidation, IconSettingsGear,
+  IconRulerGrid, IconTags, IconValidation, IconSettingsGear, IconTextTool,
 } from '../icons';
 import type { ToolId } from '../../types/tools';
 
@@ -23,6 +23,7 @@ interface Props {
   // icon kind), so they stay their own callbacks rather than going through
   // onSelectTool.
   onStartPlacingHotspot: () => void;
+  onStartPlacingText: () => void;
   onUploadMedia: (file: File) => void;
   onInsertContainer: () => void;
 
@@ -65,7 +66,7 @@ function Divider() {
 export function Toolbar({
   onUndo, onRedo,
   activeTool, onSelectTool, directSelectDisabled,
-  onStartPlacingHotspot, onUploadMedia, onInsertContainer,
+  onStartPlacingHotspot, onStartPlacingText, onUploadMedia, onInsertContainer,
   onOpenExport, onOpenShortcuts,
 }: Props) {
   const fileRef = useRef<HTMLInputElement>(null);
@@ -95,6 +96,9 @@ export function Toolbar({
 
       <ToolButton title="Shapes — browse the shape library" active={activeTool === 'shapeGallery' || activeTool === 'shapes'} onClick={() => onSelectTool('shapeGallery')}>
         <IconShapes />
+      </ToolButton>
+      <ToolButton title="Text — click the canvas to place a text box" active={activeTool === 'text'} onClick={onStartPlacingText}>
+        <IconTextTool />
       </ToolButton>
       <ToolButton title={activeTool === 'pen' ? 'Exit pen tool (Esc)' : 'Pen tool — click to place points, drag to curve, click near start to close'} active={activeTool === 'pen'} onClick={() => onSelectTool('pen')}>
         <IconPenTool />

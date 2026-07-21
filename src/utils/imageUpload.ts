@@ -1,16 +1,39 @@
-import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
 import { storage } from '../firebase';
 
-export async function uploadDiagramMedia(diagramId: string, file: File, folder: string): Promise<string> {
-  const fileId = crypto.randomUUID();
-  const ext = file.name.split('.').pop() ?? 'bin';
-  const storageRef = ref(storage, `${folder}/${diagramId}/${fileId}.${ext}`);
-  await uploadBytes(storageRef, file);
-  return getDownloadURL(storageRef);
+export interface UploadResult {
+  url: string;
+  sizeBytes: number;
 }
 
-export function uploadDiagramImage(diagramId: string, file: File): Promise<string> {
-  return uploadDiagramMedia(diagramId, file, 'diagramImages');
+// Resumable (not the plain one-shot uploadBytes) specifically so callers can
+// show a real progress bar — 'state_changed' fires with byte-level progress
+// throughout the upload, which uploadBytes has no equivalent event for.
+export function uploadDiagramMedia(
+  diagramId: string, file: File | Blob, folder: string, onProgress?: (percent: number) => void,
+): Promise<UploadResult> {
+  return new Promise((resolve, reject) => {
+    const fileId = crypto.randomUUID();
+    const ext = file instanceof File ? file.name.split('.').pop() ?? 'bin' : (file.type.split('/')[1] ?? 'bin');
+    const storageRef = ref(storage, `${folder}/${diagramId}/${fileId}.${ext}`);
+    const task = uploadBytesResumable(storageRef, file);
+    task.on('state_changed',
+      snapshot => onProgress?.(snapshot.totalBytes > 0 ? (snapshot.bytesTransferred / snapshot.totalBytes) * 100 : 0),
+      reject,
+      async () => {
+        try {
+          const url = await getDownloadURL(task.snapshot.ref);
+          resolve({ url, sizeBytes: task.snapshot.totalBytes });
+        } catch (err) {
+          reject(err);
+        }
+      },
+    );
+  });
+}
+
+export function uploadDiagramImage(diagramId: string, file: File | Blob, onProgress?: (percent: number) => void): Promise<UploadResult> {
+  return uploadDiagramMedia(diagramId, file, 'diagramImages', onProgress);
 }
 
 // Reads the file locally to get intrinsic pixel dimensions before it's placed

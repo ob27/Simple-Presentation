@@ -190,6 +190,59 @@ export async function updatePage(diagramId: string, pageId: string, patch: Parti
   await updateDoc(doc(db, 'diagrams', diagramId, 'pages', pageId), patch);
 }
 
+// Duplicates one page WITHIN the same diagram — its own `shapes`/`connectors`
+// subcollections included, with fresh ids and remapped cross-references.
+// Scoped-down sibling of cloneDiagramContent (whole-diagram duplication,
+// above): same fresh-id-then-remap approach, but for a single page's content
+// rather than every page/variable in the diagram, and inserted right after
+// the source page using the exact same order-bump invariant addPage relies
+// on (order stays a gapless 0..n-1 sequence).
+export async function duplicatePage(diagramId: string, sourcePage: DiagramPage, pages: DiagramPage[]): Promise<DiagramPage> {
+  const [shapesSnap, connectorsSnap] = await Promise.all([
+    getDocs(collection(db, 'diagrams', diagramId, 'pages', sourcePage.id, 'shapes')),
+    getDocs(collection(db, 'diagrams', diagramId, 'pages', sourcePage.id, 'connectors')),
+  ]);
+  const shapes = shapesSnap.docs.map(d => ({ id: d.id, ...d.data() } as unknown as DiagramNode));
+  const connectors = connectorsSnap.docs.map(d => ({ id: d.id, ...d.data() } as unknown as DiagramEdge));
+  const shapeIdMap = new Map<string, string>();
+  for (const s of shapes) shapeIdMap.set(s.id, crypto.randomUUID());
+
+  const newOrder = sourcePage.order + 1;
+  const newPageId = crypto.randomUUID();
+  const newPage: DiagramPage = { ...sourcePage, id: newPageId, name: `${sourcePage.name} copy`, order: newOrder };
+
+  const batch = writeBatch(db);
+  for (const p of pages) {
+    if (p.order >= newOrder) batch.update(doc(db, 'diagrams', diagramId, 'pages', p.id), { order: p.order + 1 });
+  }
+  batch.set(doc(db, 'diagrams', diagramId, 'pages', newPageId), newPage);
+  batch.update(doc(db, 'diagrams', diagramId), { updatedAt: Date.now() });
+
+  for (const s of shapes) {
+    const newShapeId = shapeIdMap.get(s.id)!;
+    const newParentId = s.parentId ? shapeIdMap.get(s.parentId) : undefined;
+    const data = { ...(s.data as ShapeNodeData), pageId: newPageId };
+    // Cross-page references (link targets into other pages, data-binding
+    // variables) still resolve fine as-is — only same-page shape ids
+    // (parentId, and a link/dataBinding target that happens to point at a
+    // shape being duplicated here) need remapping.
+    if (data.link?.targetNodeId && shapeIdMap.has(data.link.targetNodeId)) {
+      data.link = { ...data.link, targetNodeId: shapeIdMap.get(data.link.targetNodeId) };
+    }
+    batch.set(doc(db, 'diagrams', diagramId, 'pages', newPageId, 'shapes', newShapeId), { ...s, id: newShapeId, parentId: newParentId, data });
+  }
+  for (const e of connectors) {
+    const newSource = shapeIdMap.get(e.source);
+    const newTarget = shapeIdMap.get(e.target);
+    if (!newSource || !newTarget) continue;
+    const newEdgeId = crypto.randomUUID();
+    batch.set(doc(db, 'diagrams', diagramId, 'pages', newPageId, 'connectors', newEdgeId), { ...e, id: newEdgeId, source: newSource, target: newTarget });
+  }
+  await batch.commit();
+
+  return newPage;
+}
+
 // A master page lives in the same `pages` subcollection as everything else
 // (reusing subscribePages/updatePage/deletePage unchanged) but is flagged
 // isMaster so it's filtered out of the regular, navigable/orderable page

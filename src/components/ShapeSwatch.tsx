@@ -18,7 +18,6 @@ const BASE_CATALOG: ShapeCatalogEntry[] = [
   { kind: 'ellipse', label: 'Ellipse', category: 'Basic', preview: { borderRadius: '50%' } },
   { kind: 'diamond', label: 'Diamond', category: 'Basic', preview: { clipPath: 'polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%)' } },
   { kind: 'stickyNote', label: 'Sticky note', category: 'Basic', preview: { borderRadius: 2, background: '#FFF3B0', border: '1px solid #E8D77A' } },
-  { kind: 'text', label: 'Text', category: 'Basic', preview: {} },
   { kind: 'triangle', label: 'Triangle', category: 'Flowchart', preview: { clipPath: 'polygon(50% 0%, 100% 100%, 0% 100%)' } },
   { kind: 'parallelogram', label: 'Parallelogram', category: 'Flowchart', preview: { clipPath: 'polygon(20% 0%, 100% 0%, 80% 100%, 0% 100%)' } },
   { kind: 'hexagon', label: 'Hexagon', category: 'Flowchart', preview: { clipPath: 'polygon(25% 0%, 75% 0%, 100% 50%, 75% 100%, 25% 100%, 0% 50%)' } },

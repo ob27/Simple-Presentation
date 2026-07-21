@@ -37,7 +37,7 @@ export function ExportModal({ open, onClose, docName, pages, pageOrigins, pageDi
     try {
       await waitForFullRender();
       if (scope === 'all') {
-        await exportDocumentAsPdf(pages, pageOrigins, pageDimensions, docName, pdfQuality);
+        await exportDocumentAsPdf(pages, pageOrigins, pageDimensions, docName, pdfQuality, shapeNodes);
       } else if (scope === 'pptx') {
         await exportDocumentAsPptx(pages, pageOrigins, pageDimensions, docName);
       } else if (scope === 'json') {
