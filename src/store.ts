@@ -244,23 +244,85 @@ export async function duplicatePage(diagramId: string, sourcePage: DiagramPage, 
 }
 
 // A master page lives in the same `pages` subcollection as everything else
-// (reusing subscribePages/updatePage/deletePage unchanged) but is flagged
-// isMaster so it's filtered out of the regular, navigable/orderable page
-// list — its own `order` value is therefore never read for display and
-// paperSize/orientation are only set because DiagramPage requires them, not
-// because a master is ever actually rendered as a real page.
-export async function addMasterPage(diagramId: string, name: string): Promise<DiagramPage> {
+// (reusing subscribePages/updatePage/deletePage/addPage's shape+connector
+// infrastructure unchanged) but is flagged isMaster so it's filtered into
+// its own navigable/orderable "Master Pages" list instead of the regular
+// page stack. Its `order` is a real, gapless sequence scoped to just the
+// master pages (same invariant addPage keeps for regular pages, reindexed
+// independently) so multiple masters sort stably and can be drag-reordered;
+// paperSize/orientation are real, user-chosen values now too, since a
+// master's format determines which regular pages can even be assigned it
+// (see PageSettingsPanel's format-filtered master dropdown).
+export async function addMasterPage(
+  diagramId: string, masterPages: DiagramPage[], afterOrder: number, options: NewPageOptions = {},
+): Promise<DiagramPage> {
+  const newOrder = afterOrder + 1;
   const pageId = crypto.randomUUID();
   const page: DiagramPage = {
     id: pageId,
-    name,
-    order: -1,
-    paperSize: DEFAULT_PAPER_SIZE,
-    orientation: DEFAULT_ORIENTATION,
+    name: options.name ?? `Master ${newOrder + 1}`,
+    order: newOrder,
+    paperSize: options.paperSize ?? DEFAULT_PAPER_SIZE,
+    orientation: options.orientation ?? DEFAULT_ORIENTATION,
+    customWidth: options.customWidth,
+    customHeight: options.customHeight,
     isMaster: true,
   };
-  await setDoc(doc(db, 'diagrams', diagramId, 'pages', pageId), page);
+  const batch = writeBatch(db);
+  for (const m of masterPages) {
+    if (m.order >= newOrder) batch.update(doc(db, 'diagrams', diagramId, 'pages', m.id), { order: m.order + 1 });
+  }
+  batch.set(doc(db, 'diagrams', diagramId, 'pages', pageId), page);
+  batch.update(doc(db, 'diagrams', diagramId), { updatedAt: Date.now() });
+  await batch.commit();
   return page;
+}
+
+// Clones one live-inherited master shape (and, if it's a group, its full
+// descendant subtree) into `childPageId`'s own `shapes` subcollection with
+// fresh ids, translated by the same delta Canvas.tsx used to render it
+// there, then records the ORIGINAL master shape's id in that one child
+// page's overriddenMasterShapeIds so it stops being inherited-rendered on
+// THIS page specifically — every other page still using the same master is
+// unaffected. Mirrors duplicatePage's fresh-id-then-remap approach, scoped
+// to one shape (plus descendants) instead of a whole page.
+export async function detachMasterShape(
+  diagramId: string, childPageId: string, masterPageId: string, rootMasterShapeId: string,
+  translateDelta: { dx: number; dy: number },
+): Promise<string> {
+  const shapesSnap = await getDocs(collection(db, 'diagrams', diagramId, 'pages', masterPageId, 'shapes'));
+  const allMasterShapes = shapesSnap.docs.map(d => ({ id: d.id, ...d.data() } as unknown as DiagramNode));
+
+  const subtreeIds = new Set([rootMasterShapeId]);
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const s of allMasterShapes) {
+      if (s.parentId && subtreeIds.has(s.parentId) && !subtreeIds.has(s.id)) { subtreeIds.add(s.id); grew = true; }
+    }
+  }
+  const subtree = allMasterShapes.filter(s => subtreeIds.has(s.id));
+  const idMap = new Map(subtree.map(s => [s.id, crypto.randomUUID()]));
+
+  const batch = writeBatch(db);
+  for (const s of subtree) {
+    const newId = idMap.get(s.id)!;
+    const newParentId = s.parentId ? idMap.get(s.parentId) : undefined;
+    const data = { ...(s.data as ShapeNodeData), pageId: childPageId, detachedFromMasterShapeId: s.id };
+    // Only the root (parentless) shape carries an absolute, page-relative
+    // position that needs translating — a descendant's position is already
+    // local to its parent and must be copied through unchanged, same
+    // "only top-level shapes move" rule duplicatePage/handleReorderPages... use.
+    const position = s.parentId ? s.position : { x: s.position.x + translateDelta.dx, y: s.position.y + translateDelta.dy };
+    batch.set(doc(db, 'diagrams', diagramId, 'pages', childPageId, 'shapes', newId), {
+      ...s, id: newId, parentId: newParentId, position, data,
+    });
+  }
+  batch.update(doc(db, 'diagrams', diagramId, 'pages', childPageId), {
+    overriddenMasterShapeIds: arrayUnion(rootMasterShapeId),
+  });
+  await batch.commit();
+  return idMap.get(rootMasterShapeId)!;
 }
 
 export async function reorderPages(diagramId: string, orderedPageIds: string[]): Promise<void> {

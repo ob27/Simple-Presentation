@@ -1,6 +1,6 @@
 import { useState, Fragment } from 'react';
-import { Tooltip, Popover, Input, Button, Popconfirm, Dropdown } from 'antd';
-import { IconSettingsGear, IconAdd, IconInfo, IconDelete, IconDuplicate } from '../icons';
+import { Tooltip, Button, Dropdown } from 'antd';
+import { IconAdd, IconDuplicate } from '../icons';
 import {
   DndContext, PointerSensor, KeyboardSensor, useSensor, useSensors, closestCenter,
   type DragEndEvent,
@@ -11,14 +11,10 @@ import type { Node } from '@xyflow/react';
 import type { DiagramPage } from '../../types/document';
 import type { ShapeNodeData } from '../../types/shapes';
 import { useActivePageId } from './useActivePageId';
-import { updatePage, addMasterPage, deletePage } from '../../store';
-import { ColorPickerField } from '../panels/ColorPickerField';
 import { PAGE_X } from '../../constants';
 
 interface Props {
-  diagramId: string;
   pages: DiagramPage[];
-  masterPages: DiagramPage[];
   pageOrigins: Map<string, number>;
   pageDimensions: Map<string, { width: number; height: number }>;
   shapeNodes: Node[];
@@ -44,9 +40,14 @@ export const THUMB_MAX_HEIGHT = 132;
 // real paper dimensions, so both the aspect ratio/orientation AND the
 // rough visual content stay live and accurate — not just a placeholder
 // block standing in for the page.
-export function PageNavigatorRail({ diagramId, pages, masterPages, pageOrigins, pageDimensions, shapeNodes, pageSnapshots, onSelectPage, onInsertPageAt, onReorderPages, onOpenPageSettings, onDuplicatePage }: Props) {
+//
+// This same rail now renders EITHER the regular page stack OR the master
+// page stack, unchanged — Canvas.tsx decides which set to pass in `pages`
+// based on its own viewMode, so master pages get full thumbnails, drag-
+// reorder, insert-at-position, and open into the same PageSettingsPanel as
+// any other page, with zero separate code path.
+export function PageNavigatorRail({ pages, pageOrigins, pageDimensions, shapeNodes, pageSnapshots, onSelectPage, onInsertPageAt, onReorderPages, onOpenPageSettings, onDuplicatePage }: Props) {
   const activePageId = useActivePageId(pages, pageOrigins, pageDimensions);
-  const [masterSettingsOpenFor, setMasterSettingsOpenFor] = useState<string | null>(null);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
@@ -60,18 +61,6 @@ export function PageNavigatorRail({ diagramId, pages, masterPages, pageOrigins, 
     const newIndex = pages.findIndex(p => p.id === over.id);
     if (oldIndex === -1 || newIndex === -1) return;
     onReorderPages(arrayMove(pages, oldIndex, newIndex));
-  }
-
-  // Deleting a master doesn't cascade to the pages pointing at it — they'd
-  // otherwise keep a dangling masterPageId forever (harmless at render time,
-  // since Canvas.tsx's lookup just falls through to "no master found," but
-  // it'd silently resurrect if a master with the same id ever existed
-  // again). Clearing it here means "Master page" cleanly shows "No master
-  // page" for every page that referenced this one.
-  function handleDeleteMaster(masterId: string) {
-    const referencing = pages.filter(p => p.masterPageId === masterId);
-    for (const p of referencing) updatePage(diagramId, p.id, { masterPageId: undefined });
-    deletePage(diagramId, masterId);
   }
 
   return (
@@ -108,128 +97,6 @@ export function PageNavigatorRail({ diagramId, pages, masterPages, pageOrigins, 
           })}
         </SortableContext>
       </DndContext>
-
-      <MastersSection
-        diagramId={diagramId} masterPages={masterPages} pages={pages}
-        settingsOpenFor={masterSettingsOpenFor} setSettingsOpenFor={setMasterSettingsOpenFor}
-        onDeleteMaster={handleDeleteMaster}
-      />
-    </div>
-  );
-}
-
-// Master pages are never navigated to, reordered alongside regular pages,
-// presented, or exported — they're only ever a target for a regular page's
-// "Master page" dropdown (see PageSettingsForm below) — so this is a plain
-// list, not a draggable/thumbnail strip like the section above.
-function MastersSection({ diagramId, masterPages, pages, settingsOpenFor, setSettingsOpenFor, onDeleteMaster }: {
-  diagramId: string;
-  masterPages: DiagramPage[];
-  pages: DiagramPage[];
-  settingsOpenFor: string | null;
-  setSettingsOpenFor: (id: string | null) => void;
-  onDeleteMaster: (masterId: string) => void;
-}) {
-  return (
-    <div style={{ marginTop: 12, paddingTop: 8, borderTop: '1px solid #e6e8ef', display: 'flex', flexDirection: 'column', gap: 6 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-        <span style={{ fontSize: 10, fontWeight: 700, color: '#999', letterSpacing: '0.06em', textTransform: 'uppercase' }}>
-          Masters
-        </span>
-        <Tooltip
-          title="A master isn't a real page in your deck — it's a reusable background, header & footer preset that other pages can pick up in their own page settings, so you can update all of them at once from here."
-          placement="right"
-        >
-          <IconInfo style={{ fontSize: 12, color: '#aaa', cursor: 'help' }} />
-        </Tooltip>
-      </div>
-      {masterPages.map(master => (
-        <Popover
-          key={master.id}
-          open={settingsOpenFor === master.id}
-          onOpenChange={open => setSettingsOpenFor(open ? master.id : null)}
-          trigger="click"
-          placement="right"
-          content={settingsOpenFor === master.id
-            ? (
-              <MasterPageSettingsForm
-                diagramId={diagramId} page={master}
-                usedByCount={pages.filter(p => p.masterPageId === master.id).length}
-                onClose={() => setSettingsOpenFor(null)}
-                onDelete={() => { onDeleteMaster(master.id); setSettingsOpenFor(null); }}
-              />
-            )
-            : null}
-        >
-          <div
-            onClick={() => setSettingsOpenFor(master.id)}
-            style={{
-              display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 4,
-              fontSize: 12, color: '#555', cursor: 'pointer', padding: '4px 2px', borderRadius: 4,
-            }}
-          >
-            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{master.name}</span>
-            <IconSettingsGear style={{ fontSize: 11, color: '#aaa', flexShrink: 0 }} />
-          </div>
-        </Popover>
-      ))}
-      <Button
-        size="small" type="dashed" icon={<IconAdd />}
-        onClick={() => addMasterPage(diagramId, `Master ${masterPages.length + 1}`)}
-      >
-        New master
-      </Button>
-    </div>
-  );
-}
-
-function MasterPageSettingsForm({ diagramId, page, usedByCount, onClose, onDelete }: {
-  diagramId: string;
-  page: DiagramPage;
-  usedByCount: number;
-  onClose: () => void;
-  onDelete: () => void;
-}) {
-  const [name, setName] = useState(page.name);
-  const [backgroundColor, setBackgroundColor] = useState(page.backgroundColor ?? '#ffffff');
-  const [headerText, setHeaderText] = useState(page.headerText ?? '');
-  const [footerText, setFooterText] = useState(page.footerText ?? '');
-
-  function commit() {
-    updatePage(diagramId, page.id, {
-      name, backgroundColor,
-      headerText: headerText || undefined, footerText: footerText || undefined,
-    });
-    onClose();
-  }
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 10, width: 220 }}>
-      <Input size="small" value={name} onChange={e => setName(e.target.value)} onPressEnter={commit} placeholder="Master name" />
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <span style={{ fontSize: 12, color: '#666' }}>Background</span>
-        <ColorPickerField value={backgroundColor} onChangeComplete={setBackgroundColor} />
-      </div>
-      <Input
-        size="small" placeholder="Header text (use {page}/{pages})" value={headerText}
-        onChange={e => setHeaderText(e.target.value)}
-      />
-      <Input
-        size="small" placeholder="Footer text (use {page}/{pages})" value={footerText}
-        onChange={e => setFooterText(e.target.value)}
-      />
-      <div style={{ display: 'flex', gap: 6 }}>
-        <Button size="small" type="primary" onClick={commit} style={{ flex: 1 }}>Save</Button>
-        <Popconfirm
-          title="Delete this master?"
-          description={usedByCount > 0
-            ? `${usedByCount} page${usedByCount === 1 ? '' : 's'} using it will fall back to their own background/header/footer.`
-            : undefined}
-          onConfirm={onDelete}
-        >
-          <Button size="small" danger icon={<IconDelete />} />
-        </Popconfirm>
-      </div>
     </div>
   );
 }

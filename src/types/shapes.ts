@@ -156,6 +156,10 @@ export interface ShapeNodeData extends Record<string, unknown> {
   downsampled?: boolean;
   locked?: boolean;
   hidden?: boolean;
+  // Set only on a shape created via "Detach from master" — the master
+  // shape id it was cloned from. Purely informational (nothing reads it
+  // yet); kept for a possible future "re-sync with master" affordance.
+  detachedFromMasterShapeId?: string;
   pathAnchors?: PathAnchor[];
   pathClosed?: boolean;
   pathHoles?: PathContourData[];

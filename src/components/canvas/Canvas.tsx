@@ -71,7 +71,7 @@ import { THUMB_MAX_WIDTH, THUMB_MAX_HEIGHT } from './PageNavigatorRail';
 import type { DiagramVariable } from '../../types/variables';
 import {
   subscribeShapes, subscribeConnectors, saveShape, deleteShape, saveConnector, deleteConnector,
-  subscribeVariables, upsertVariable, deleteVariable, updatePage, duplicatePage,
+  subscribeVariables, upsertVariable, deleteVariable, updatePage, duplicatePage, detachMasterShape,
   subscribeComments, saveComment, deleteComment,
 } from '../../store';
 import type { DiagramComment } from '../../types/comments';
@@ -117,9 +117,40 @@ interface Props {
   onPresentStateChange?: (state: PresentState) => void;
   toolbarSlot?: HTMLElement | null;
   onInsertPageAt?: (afterOrder: number) => void;
+  onInsertMasterAt?: (afterOrder: number) => void;
+  onCreateMasterForFormat?: (paperSize: string, orientation: 'portrait' | 'landscape', customWidth?: number, customHeight?: number) => void;
   onReorderPages?: (pages: DiagramPage[]) => void;
   // Diagram members, for @mention autocomplete in comment threads.
   members?: { uid: string; email: string }[];
+  // 'masters' swaps the entire canvas/rail to show ONLY master pages (full
+  // editing tools, same as any regular page) instead of the regular page
+  // stack — Affinity Publisher's Pages/Master Pages toggle. Kept as a
+  // single prop rather than a separate component so every existing piece of
+  // page machinery (thumbnails, drag-reorder, PageSettingsPanel, fit-to-
+  // page, shape/connector subscriptions) stays master-aware for free.
+  viewMode?: 'pages' | 'masters';
+}
+
+// React Flow requires a parent node to appear before its children in the
+// array. Same topological-depth approach rebuildShapes uses for the main
+// shape subscription (Firestore's onSnapshot delivery order isn't
+// guaranteed to respect parent/child order), extracted here so the master-
+// shape inheritance layer can apply the identical rule without depending on
+// rebuildShapes' own closures.
+function sortByParentDepth<T extends { id: string; parentId?: string }>(nodes: T[]): T[] {
+  const byId = new Map(nodes.map(n => [n.id, n]));
+  const depthCache = new Map<string, number>();
+  function computeDepth(id: string, guard: Set<string>): number {
+    if (depthCache.has(id)) return depthCache.get(id)!;
+    if (guard.has(id)) return 0;
+    guard.add(id);
+    const node = byId.get(id);
+    const parentId = node?.parentId;
+    const depth = parentId && byId.has(parentId) ? computeDepth(parentId, guard) + 1 : 0;
+    depthCache.set(id, depth);
+    return depth;
+  }
+  return [...nodes].sort((a, b) => computeDepth(a.id, new Set()) - computeDepth(b.id, new Set()));
 }
 
 // A connector's arrowhead is chosen per-end (start/end independently) after
@@ -148,18 +179,24 @@ const STYLE_PAINT_FIELDS = [
 export function Canvas({
   diagramId, pages: pagesProp, diagramName = 'diagram', mode = 'edit', onExitPresent,
   presentationSettings, onUpdatePresentationSettings, presentState, onPresentStateChange,
-  toolbarSlot, onInsertPageAt, onReorderPages, members = [],
+  toolbarSlot, onInsertPageAt, onInsertMasterAt, onCreateMasterForFormat, onReorderPages, members = [], viewMode = 'pages',
 }: Props) {
   // Master pages (isMaster: true) live in the same pages subcollection as
   // everything else — reusing all of addPage/updatePage/subscribePages
-  // unchanged — but they're never themselves navigated to, presented,
-  // exported, or counted in {page}/{pages}: they exist only to be pointed
-  // at by other pages' masterPageId. Every existing `pages` usage below
-  // this line continues to mean "the regular, navigable pages" unchanged;
-  // `masterPages` is the small separate list for the settings-form
-  // dropdown and for resolving a page's inherited background/header/footer.
+  // unchanged. `masterPages` is always every isMaster page, regardless of
+  // viewMode (needed for the master-inheritance lookups below and for
+  // PageSettingsPanel's master-select dropdown). `regularPages` is always
+  // every non-master page, also viewMode-independent (needed anywhere that
+  // must keep meaning "the real content pages" even while editing masters,
+  // e.g. PageSettingsPanel's delete/usedByCount logic). `pages` is the
+  // ACTIVE, viewMode-dependent set — every other piece of page machinery
+  // below (thumbnails, shape/connector subscriptions, pageOrigins,
+  // drag-reorder, fit-to-page, useActivePageId) reads from this one, so
+  // swapping it here is the single thing that makes "Master Pages mode"
+  // fall out of the entire rest of this file for free.
   const masterPages = useMemo(() => pagesProp.filter(p => p.isMaster), [pagesProp]);
-  const pages = useMemo(() => pagesProp.filter(p => !p.isMaster), [pagesProp]);
+  const regularPages = useMemo(() => pagesProp.filter(p => !p.isMaster), [pagesProp]);
+  const pages = viewMode === 'masters' ? masterPages : regularPages;
 
   const { user } = useAuth();
   const { screenToFlowPosition, setCenter, getZoom, getInternalNode, fitBounds, getViewport, setViewport, updateNodeData } = useReactFlow();
@@ -259,6 +296,23 @@ export function Canvas({
   const pageGeomRef = useRef({ pageOrigins, pageDimensions, pages });
   pageGeomRef.current = { pageOrigins, pageDimensions, pages };
 
+  // Every master's own origin in the SAME PAGE_GAP-stacked coordinate scheme
+  // regular pages use, computed unconditionally from masterPages (never
+  // gated on viewMode) — a master's shapes carry absolute positions relative
+  // to wherever it sits in the master stack while it's being edited in
+  // Master Pages mode, and translating them onto a child page (below) needs
+  // to know that offset regardless of which mode is currently active.
+  const masterOrigins = useMemo(() => {
+    const origins = new Map<string, number>();
+    let cursorY = 0;
+    for (const master of masterPages) {
+      const { height } = getPageDimensions(master.paperSize, master.orientation, master.customWidth, master.customHeight);
+      origins.set(master.id, cursorY);
+      cursorY += height + PAGE_GAP;
+    }
+    return origins;
+  }, [masterPages]);
+
   // Fit-to-page zoom — used both for the initial view and for page-switching,
   // replacing the old "whole document" fitView and "keep whatever zoom was
   // already active" goToPage. fitBounds already contains RF's own
@@ -357,6 +411,22 @@ export function Canvas({
 
   // ── Subscriptions: merge shapes/connectors across every page of this document ──
   useEffect(() => {
+    // Prune slice entries for pages no longer in the current set BEFORE
+    // resubscribing — critical now that `pages` can swap wholesale between
+    // regular content pages and master pages (viewMode toggle). Without
+    // this, a page's slice (e.g. a master's shapes, loaded while editing it
+    // in Master Pages mode) would linger in shapesSlices.current forever
+    // after switching away, since unsubscribing only stops FUTURE updates —
+    // it doesn't remove the already-cached Map entry rebuildShapes/
+    // rebuildConnectors/rebuildComments keep iterating every render.
+    const currentIds = new Set(pages.map(p => p.id));
+    for (const key of shapesSlices.current.keys()) if (!currentIds.has(key)) shapesSlices.current.delete(key);
+    for (const key of connectorsSlices.current.keys()) if (!currentIds.has(key)) connectorsSlices.current.delete(key);
+    for (const key of commentsSlices.current.keys()) if (!currentIds.has(key)) commentsSlices.current.delete(key);
+    rebuildShapes();
+    rebuildConnectors();
+    rebuildComments();
+
     const shapeUnsubs = pages.map(page => subscribeShapes(diagramId, page.id, nodes => {
       shapesSlices.current.set(page.id, new Map(nodes.map(n => [n.id, n])));
       rebuildShapes();
@@ -376,6 +446,91 @@ export function Canvas({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [diagramId, pages.map(p => p.id).join(',')]);
+
+  // inheritedMasterNodes (below) is freshly re-derived every render from
+  // master shape data, with no memory of its own — React Flow's own
+  // internal click handling can't persist a `selected` flag onto it the
+  // way applyNodeChanges does for real shapes in shapeNodes state (there's
+  // no matching entry there for a synthetic `inherited-*` id to attach to).
+  // This tracks it explicitly so the memo can set `selected` itself.
+  const [selectedInheritedId, setSelectedInheritedId] = useState<string | null>(null);
+
+  // ── Live master-shape inheritance: subscribe once per unique referenced
+  // master, not once per referencing page — many pages can share one master.
+  // Only active in 'pages' mode; a master never inherits from another master.
+  const referencedMasterIds = useMemo(
+    () => (viewMode === 'masters' ? [] : Array.from(new Set(pages.map(p => p.masterPageId).filter((id): id is string => !!id)))),
+    [pages, viewMode],
+  );
+  const masterShapesSlices = useRef<Map<string, Map<string, DiagramNode>>>(new Map());
+  const [masterShapeNodesByMaster, setMasterShapeNodesByMaster] = useState<Map<string, DiagramNode[]>>(new Map());
+  useEffect(() => {
+    const unsubs = referencedMasterIds.map(masterId => subscribeShapes(diagramId, masterId, nodes => {
+      masterShapesSlices.current.set(masterId, new Map(nodes.map(n => [n.id, n])));
+      setMasterShapeNodesByMaster(new Map(
+        referencedMasterIds.map(mid => [mid, Array.from(masterShapesSlices.current.get(mid)?.values() ?? [])]),
+      ));
+    }));
+    return () => {
+      unsubs.forEach(u => u());
+      // Drop cached slices for masters no longer referenced by anything
+      // currently rendered, so a stale snapshot can't resurface if the same
+      // master id becomes referenced again later with different content.
+      for (const id of masterShapesSlices.current.keys()) {
+        if (!referencedMasterIds.includes(id)) masterShapesSlices.current.delete(id);
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [diagramId, referencedMasterIds.join(',')]);
+
+  // Translates each referencing page's master's CURRENT shapes onto that
+  // page's own origin and renders them as a locked, non-interactive layer
+  // behind the page's own content — see PAGE_GAP-based translation
+  // precedent in handleReorderPagesWithShapes above. Ephemeral only: none of
+  // this is ever written back to Firestore, so editing the real master
+  // (elsewhere) is what actually changes what every referencing page shows.
+  const inheritedMasterNodes = useMemo<Node[]>(() => {
+    if (viewMode === 'masters') return [];
+    const out: Node[] = [];
+    for (const page of pages) {
+      if (!page.masterPageId) continue;
+      const masterShapes = masterShapeNodesByMaster.get(page.masterPageId);
+      if (!masterShapes) continue;
+      const overridden = new Set(page.overriddenMasterShapeIds ?? []);
+      const dy = (pageOrigins.get(page.id) ?? 0) - (masterOrigins.get(page.masterPageId) ?? 0);
+      for (const m of sortByParentDepth(masterShapes)) {
+        if (overridden.has(m.id)) continue;
+        const inheritedId = `inherited-${page.id}-${m.id}`;
+        out.push({
+          ...m,
+          id: inheritedId,
+          parentId: m.parentId ? `inherited-${page.id}-${m.parentId}` : undefined,
+          // Only a top-level (parentless) master shape needs translating —
+          // a grouped child's position is already local to its parent, same
+          // "only top-level shapes carry an absolute position" rule
+          // handleReorderPagesWithShapes/handleResizePageContent rely on.
+          position: m.parentId ? m.position : { x: m.position.x, y: m.position.y + dy },
+          // Behind every real shape (which default to zIndex 0 — see
+          // nextZIndexForPage) but ABOVE the page frame's own opaque
+          // background (zIndex -1) — matches this file's own existing
+          // -0.5 "just behind normal content" convention used elsewhere
+          // (e.g. the dimmed/ghost layers around line 2828). -1000 here
+          // would paint UNDER the frame's background, making inherited
+          // shapes invisible despite genuinely being in the node tree.
+          zIndex: -0.5,
+          draggable: false,
+          selectable: true,
+          connectable: false,
+          selected: inheritedId === selectedInheritedId,
+          data: {
+            ...m.data, pageId: page.id, locked: true,
+            __inheritedFromMaster: true, __masterPageId: page.masterPageId, __masterShapeId: m.id,
+          },
+        });
+      }
+    }
+    return out;
+  }, [pages, masterShapeNodesByMaster, masterOrigins, pageOrigins, viewMode, selectedInheritedId]);
 
   function navigateToLink(shapeId: string) {
     const shape = shapeNodesRef.current.find(n => n.id === shapeId);
@@ -536,6 +691,18 @@ export function Canvas({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [diagramId]);
+
+  // Tracks whether the currently-selected shape is mid text-edit (typing
+  // inside it), reported by ShapeNode via data.onEditingChange — used to
+  // hide the floating shape quick-actions toolbar (container/z-order/
+  // duplicate/delete) below, since those act on the shape as an object and
+  // have no meaning while the user is just typing text into it, and the
+  // toolbar's fixed top-of-canvas position otherwise overlaps whatever
+  // shape happens to be selected near the top of the viewport.
+  const [editingShapeId, setEditingShapeId] = useState<string | null>(null);
+  const handleShapeEditingChange = useCallback((id: string, editing: boolean) => {
+    setEditingShapeId(prev => (editing ? id : (prev === id ? null : prev)));
+  }, []);
 
   function applySize(id: string, size: { width: number; height: number }) {
     for (const slice of shapesSlices.current.values()) {
@@ -1070,7 +1237,7 @@ export function Canvas({
       // picks up live tool state and can report a connect-drag start.
       // directSelectMode is injected the same way so PathNode can hide its
       // NodeResizer while anchor points are the interactive thing instead.
-      const extra: Record<string, unknown> = { connectMode, onStartConnect: handleStartConnect, directSelectMode };
+      const extra: Record<string, unknown> = { connectMode, onStartConnect: handleStartConnect, directSelectMode, onEditingChange: handleShapeEditingChange };
       if (shapeData.dataBinding) {
         const resolved = resolveStyle(shapeData.dataBinding, variables);
         if (resolved) extra.__resolvedStyle = resolved;
@@ -1131,8 +1298,8 @@ export function Canvas({
         data: { resolved: false, replyCount: 0, active: true, onOpen: () => {} },
       });
     }
-    return [...frameNodes, ...styled, ...commentNodes];
-  }, [frameNodes, shapeNodes, variables, highlighted, animationPanelOpen, revealStep, isPresent, presentPage, presentThresholdOrder, connectMode, toolActive, directSelectMode, comments, activeCommentId, draftComment, hiddenTags]);
+    return [...frameNodes, ...inheritedMasterNodes, ...styled, ...commentNodes];
+  }, [frameNodes, inheritedMasterNodes, shapeNodes, variables, highlighted, animationPanelOpen, revealStep, isPresent, presentPage, presentThresholdOrder, connectMode, toolActive, directSelectMode, handleShapeEditingChange, comments, activeCommentId, draftComment, hiddenTags]);
 
   const edges = useMemo(() => connectorEdges.map(e => {
     const edgeData = e.data as SmartEdgeData | undefined;
@@ -1635,6 +1802,15 @@ export function Canvas({
     const changes = clampDragChanges(rawChanges);
     setShapeNodes(prev => applyNodeChanges(changes, [...frameNodes, ...prev]).filter(n => n.type !== 'pageFrame'));
 
+    for (const change of changes) {
+      if (change.type === 'select') {
+        if (change.id.startsWith('inherited-')) {
+          setSelectedInheritedId(change.selected ? change.id : null);
+        } else if (change.selected) {
+          setSelectedInheritedId(null);
+        }
+      }
+    }
     for (const change of changes) {
       if (change.type === 'position' && change.dragging === false && change.position) {
         const node = shapeNodes.find(n => n.id === change.id);
@@ -2618,7 +2794,13 @@ export function Canvas({
   // reach, like "Edit points").
   const selectedShapeIds = nodes.filter(n => n.selected && (n.type === 'shape' || n.type === 'path')).map(n => n.id);
   const selectedGroup = nodes.find(n => n.selected && n.type === 'group');
-  const singleSelectedShape = selectedShapeIds.length === 1 ? shapeNodes.find(n => n.id === selectedShapeIds[0]) : undefined;
+  // Falls back to the ephemeral inherited-master layer — those synthetic
+  // `inherited-*` ids are never in shapeNodes (the real committed state),
+  // so without this an inherited shape would visually select but the
+  // properties panel would silently never open.
+  const singleSelectedShape = selectedShapeIds.length === 1
+    ? (shapeNodes.find(n => n.id === selectedShapeIds[0]) ?? inheritedMasterNodes.find(n => n.id === selectedShapeIds[0]))
+    : undefined;
   const selectedEdges = connectorEdges.filter(e => e.selected);
   const singleSelectedEdge = selectedEdges.length === 1 ? selectedEdges[0] : undefined;
   const BOOLEAN_ELIGIBLE_KINDS = new Set(['path', 'ellipse', 'rectangle', 'stickyNote', 'container']);
@@ -3276,6 +3458,18 @@ export function Canvas({
     onNodesChange(changes);
   }
 
+  async function handleDetachMasterShape() {
+    if (!singleSelectedShape) return;
+    const d = singleSelectedShape.data as ShapeNodeData & { __masterPageId?: string; __masterShapeId?: string };
+    const childPageId = d.pageId;
+    if (!d.__masterPageId || !d.__masterShapeId || !childPageId) return;
+    const dy = (pageOrigins.get(childPageId) ?? 0) - (masterOrigins.get(d.__masterPageId) ?? 0);
+    const newShapeId = await detachMasterShape(diagramId, childPageId, d.__masterPageId, d.__masterShapeId, { dx: 0, dy });
+    // Best-effort continuity — a no-op if this fires before the detached
+    // shape's own Firestore snapshot has round-tripped back into `nodes`.
+    handleLayerSelect(newShapeId, false);
+  }
+
   function handleReorderLayer(id: string, direction: -1 | 1) {
     const node = shapeNodes.find(n => n.id === id);
     if (!node || isLocked(id)) return;
@@ -3698,14 +3892,23 @@ export function Canvas({
           onClose={() => setLayersPanelOpen(false)}
         />
       )}
+      {!isPresent && viewMode === 'masters' && (
+        <div style={{
+          position: 'absolute', top: 0, left: 168, right: 0, height: 32, zIndex: 15,
+          background: '#fff7e6', borderBottom: '1px solid #ffd591',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: 12, fontWeight: 600, color: '#874d00', pointerEvents: 'none',
+        }}>
+          Editing Master Pages
+        </div>
+      )}
       {!isPresent && (
         <PageNavigatorRail
-          diagramId={diagramId}
-          pages={pages} masterPages={masterPages} pageOrigins={pageOrigins} pageDimensions={pageDimensions}
+          pages={pages} pageOrigins={pageOrigins} pageDimensions={pageDimensions}
           shapeNodes={shapeNodes}
           pageSnapshots={pageSnapshots}
           onSelectPage={pageId => fitToPage(pageId, { duration: 300 })}
-          onInsertPageAt={afterOrder => onInsertPageAt?.(afterOrder)}
+          onInsertPageAt={afterOrder => (viewMode === 'masters' ? onInsertMasterAt : onInsertPageAt)?.(afterOrder)}
           onReorderPages={handleReorderPagesWithShapes}
           onOpenPageSettings={() => selectTool('pageSettings')}
           onDuplicatePage={handleDuplicatePage}
@@ -3718,12 +3921,13 @@ export function Canvas({
           <PageSettingsPanel
             diagramId={diagramId}
             page={activePage}
-            pages={pages}
+            pages={regularPages}
             masterPages={masterPages}
             pageOrigin={pageOrigins.get(activePageId) ?? 0}
             pageShapes={shapeNodes.filter(n => (n.data as ShapeNodeData).pageId === activePageId)}
             onResizePageContent={handleResizePageContent}
             onClose={() => setPageSettingsPanelOpen(false)}
+            onCreateMasterForFormat={onCreateMasterForFormat}
           />
         );
       })()}
@@ -3775,6 +3979,7 @@ export function Canvas({
           pageOrigin={pageOrigins.get(findPageIdFor(singleSelectedShape) ?? '') ?? 0}
           onDeleteEdge={id => onEdgesChange([{ type: 'remove', id }])}
           onClose={deselectAll}
+          onDetachFromMaster={handleDetachMasterShape}
         />
       )}
 
@@ -3826,7 +4031,7 @@ export function Canvas({
         />
       )}
 
-      {selectedShapeIds.length > 0 && (
+      {selectedShapeIds.length > 0 && !editingShapeId && !(singleSelectedShape?.data as { __inheritedFromMaster?: boolean } | undefined)?.__inheritedFromMaster && (
         <div style={{
           position: 'absolute', top: 64, left: '50%', transform: 'translateX(-50%)', zIndex: 20,
           background: '#fff', borderRadius: 8, padding: 6, display: 'flex', alignItems: 'center', gap: 4,

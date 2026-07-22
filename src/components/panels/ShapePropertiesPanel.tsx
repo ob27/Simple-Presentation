@@ -48,9 +48,15 @@ interface Props {
   pageOrigin: number;
   onDeleteEdge: (id: string) => void;
   onClose: () => void;
+  // Only relevant when node.data.__inheritedFromMaster is set (Canvas.tsx's
+  // ephemeral master-inheritance layer) — clones this one shape into the
+  // current page's own shapes so it becomes independently editable there,
+  // while every other page still using the same unmodified master keeps
+  // showing it live/locked.
+  onDetachFromMaster?: () => void;
 }
 
-export function ShapePropertiesPanel({ node, diagramId, pages, allShapes, variables, connectorEdges, onChange, onResize, onMove, pageOrigin, onDeleteEdge, onClose }: Props) {
+export function ShapePropertiesPanel({ node, diagramId, pages, allShapes, variables, connectorEdges, onChange, onResize, onMove, pageOrigin, onDeleteEdge, onClose, onDetachFromMaster }: Props) {
   const data = node.data as ShapeNodeData;
   const [downsampling, setDownsampling] = useState(false);
 
@@ -89,6 +95,37 @@ export function ShapePropertiesPanel({ node, diagramId, pages, allShapes, variab
   const [linkType, setLinkType] = useState<'page' | 'shape' | 'none'>(
     data.link?.type === 'shape' ? 'shape' : data.link?.type === 'page' ? 'page' : 'none',
   );
+
+  // A shape inherited live from a master page — locked, non-editable here
+  // by design (see Canvas.tsx's inheritedMasterNodes). Render a minimal
+  // read-only card instead of the full editable form below: none of that
+  // form's fields would be meaningful to show as editable when every write
+  // would be silently discarded (this node is never persisted as-is).
+  // Placed AFTER every hook call in this component (not right at the top)
+  // — an early return before a hook call here would violate the Rules of
+  // Hooks the moment the SAME selected node transitions between inherited
+  // and detached (e.g. right after "Detach from master to edit"), since
+  // that's a prop change on the same component instance, not a remount.
+  if ((data as ShapeNodeData & { __inheritedFromMaster?: boolean }).__inheritedFromMaster) {
+    return (
+      <div style={{
+        position: 'absolute', top: 0, right: 0, bottom: 0, width: 260, zIndex: 15,
+        background: '#fff', borderLeft: '1px solid #e6e8ef', boxShadow: '-2px 0 8px rgba(0,0,0,0.05)',
+        display: 'flex', flexDirection: 'column',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', borderBottom: '1px solid #f0f0f0' }}>
+          <span style={{ fontWeight: 600, fontSize: 13, color: '#1a1a2e' }}>From master page</span>
+          <Button size="small" type="text" icon={<IconClose />} onClick={onClose} />
+        </div>
+        <div style={{ padding: '14px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <div style={{ fontSize: 12, color: '#666' }}>
+            <strong>{data.label || data.kind}</strong> is inherited live from this page's master page. It's locked here — editing the master updates every page using it.
+          </div>
+          <Button size="small" onClick={onDetachFromMaster}>Detach from master to edit</Button>
+        </div>
+      </div>
+    );
+  }
 
   function updateLink(patch: Partial<ShapeLink> | null) {
     if (patch === null) {

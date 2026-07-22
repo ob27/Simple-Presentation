@@ -7,13 +7,26 @@ interface Props {
   open: boolean;
   onClose: () => void;
   onCreate: (options: NewPageOptions) => void;
+  // Lets this same modal double as "New Master" (title/button copy) and
+  // pre-seed a specific format — used by PageSettingsPanel's "no matching
+  // master yet — create one" affordance, which needs the modal to open
+  // already set to the exact format the user was configuring.
+  title?: string;
+  createLabel?: string;
+  initialPaperSize?: string;
+  initialOrientation?: 'portrait' | 'landscape';
+  initialCustomWidth?: number;
+  initialCustomHeight?: number;
 }
 
-export function NewPageModal({ open, onClose, onCreate }: Props) {
-  const [selectedId, setSelectedId] = useState('A4');
-  const [orientation, setOrientation] = useState<'portrait' | 'landscape'>('portrait');
-  const [customWidth, setCustomWidth] = useState(794);
-  const [customHeight, setCustomHeight] = useState(1123);
+export function NewPageModal({
+  open, onClose, onCreate, title = 'New Page', createLabel = 'Create page',
+  initialPaperSize = 'A4', initialOrientation = 'portrait', initialCustomWidth = 794, initialCustomHeight = 1123,
+}: Props) {
+  const [selectedId, setSelectedId] = useState(initialPaperSize);
+  const [orientation, setOrientation] = useState<'portrait' | 'landscape'>(initialOrientation);
+  const [customWidth, setCustomWidth] = useState(initialCustomWidth);
+  const [customHeight, setCustomHeight] = useState(initialCustomHeight);
 
   function handleCreate() {
     const preset = FRAME_PRESETS.find(p => p.id === selectedId);
@@ -32,7 +45,7 @@ export function NewPageModal({ open, onClose, onCreate }: Props) {
     // Watch/Web/Presentation/Social/Custom) overflow into an easy-to-miss
     // "..." dropdown at the old width, on top of Presentation/Social being
     // long labels.
-    <Modal title="New Page" open={open} onCancel={onClose} footer={null} destroyOnClose width={680}>
+    <Modal title={title} open={open} onCancel={onClose} footer={null} destroyOnClose width={680}>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 14, marginTop: 8 }}>
         <Tabs
           size="small"
@@ -62,7 +75,7 @@ export function NewPageModal({ open, onClose, onCreate }: Props) {
           <Radio.Button value="landscape">Landscape</Radio.Button>
         </Radio.Group>
 
-        <Button type="primary" onClick={handleCreate} block>Create page</Button>
+        <Button type="primary" onClick={handleCreate} block>{createLabel}</Button>
       </div>
     </Modal>
   );

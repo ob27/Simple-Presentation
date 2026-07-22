@@ -1,4 +1,4 @@
-import { memo, useState } from 'react';
+import { memo, useState, useEffect } from 'react';
 import { NodeResizer, useReactFlow, type NodeProps } from '@xyflow/react';
 import { IconLink } from '../../icons';
 import type { ShapeNodeData, PieSegment, ChartDataPoint } from '../../../types/shapes';
@@ -163,6 +163,7 @@ export interface ShapeNodeRuntimeData {
   onCommit?: (id: string, patch: Partial<ShapeNodeData>) => void;
   onNavigateLink?: (id: string) => void;
   onStartConnect?: (id: string, e: React.MouseEvent) => void;
+  onEditingChange?: (id: string, editing: boolean) => void;
   connectMode?: boolean;
   readOnly?: boolean;
   directSelectMode?: boolean;
@@ -317,6 +318,18 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
   const { updateNodeData } = useReactFlow();
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(shapeData.label ?? '');
+
+  // Reports text-edit state up to Canvas so it can hide the floating
+  // shape quick-actions toolbar (container/z-order/duplicate/delete) while
+  // this shape is being typed into — those actions have no meaning
+  // mid-edit and the toolbar's fixed screen position otherwise overlaps
+  // whatever's being typed. Cleanup covers the shape being deleted/
+  // unmounted while still mid-edit (e.g. via keyboard delete).
+  useEffect(() => {
+    shapeData.onEditingChange?.(id, editing);
+    return () => { if (editing) shapeData.onEditingChange?.(id, false); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editing, id]);
 
   const isArchimateElement = shapeData.kind === 'archimateElement';
   const resolved = shapeData.__resolvedStyle;

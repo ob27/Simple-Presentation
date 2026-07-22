@@ -1,9 +1,9 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { Spin, Button, Tooltip, Input } from 'antd';
+import { Spin, Button, Tooltip, Input, Segmented } from 'antd';
 import { IconArrowLeft, IconPlayCircle, IconPresenterNotes, IconHistory } from '../components/icons';
 import { ReactFlowProvider } from '@xyflow/react';
-import { subscribePages, subscribeDiagram, addPage, reorderPages, renameDiagram, type NewPageOptions } from '../store';
+import { subscribePages, subscribeDiagram, addPage, addMasterPage, reorderPages, renameDiagram, type NewPageOptions } from '../store';
 import type { DiagramPage } from '../types/document';
 import { Canvas } from '../components/canvas/Canvas';
 import { NewPageModal } from '../components/NewPageModal';
@@ -24,6 +24,12 @@ export function DocumentEditor() {
   const [loading, setLoading] = useState(true);
   const [newPageOpen, setNewPageOpen] = useState(false);
   const [newPageAfterOrder, setNewPageAfterOrder] = useState<number | null>(null);
+  const [newMasterOpen, setNewMasterOpen] = useState(false);
+  const [newMasterAfterOrder, setNewMasterAfterOrder] = useState<number | null>(null);
+  const [newMasterInitialFormat, setNewMasterInitialFormat] = useState<
+    { paperSize: string; orientation: 'portrait' | 'landscape'; customWidth?: number; customHeight?: number } | null
+  >(null);
+  const [viewMode, setViewMode] = useState<'pages' | 'masters'>('pages');
   const [toolbarSlotEl, setToolbarSlotEl] = useState<HTMLDivElement | null>(null);
   const isEditingTitleRef = useRef(false);
   // Last name known to be saved (from Firestore, or our own successful
@@ -66,15 +72,44 @@ export function DocumentEditor() {
     }
   }
 
+  // `pages` here is every page in the diagram, regular AND master mixed —
+  // addPage/addMasterPage's insert-at-position bump logic must only ever
+  // touch its own subset's `order` values (each subset is its own gapless
+  // 0..n-1 sequence sharing the same underlying field), so both handlers
+  // below scope to regularPages/masterPages, never the raw mixed `pages`.
+  const regularPages = useMemo(() => pages.filter(p => !p.isMaster), [pages]);
+  const masterPages = useMemo(() => pages.filter(p => p.isMaster), [pages]);
+
   async function handleAddPage(options: NewPageOptions) {
     if (!id) return;
-    const afterOrder = newPageAfterOrder ?? (pages.length > 0 ? pages[pages.length - 1].order : -1);
-    await addPage(id, pages, afterOrder, options);
+    const afterOrder = newPageAfterOrder ?? (regularPages.length > 0 ? regularPages[regularPages.length - 1].order : -1);
+    await addPage(id, regularPages, afterOrder, options);
   }
 
   function handleInsertPageAt(afterOrder: number) {
     setNewPageAfterOrder(afterOrder);
     setNewPageOpen(true);
+  }
+
+  async function handleAddMaster(options: NewPageOptions) {
+    if (!id) return;
+    const afterOrder = newMasterAfterOrder ?? (masterPages.length > 0 ? masterPages[masterPages.length - 1].order : -1);
+    await addMasterPage(id, masterPages, afterOrder, options);
+  }
+
+  function handleInsertMasterAt(afterOrder: number) {
+    setNewMasterAfterOrder(afterOrder);
+    setNewMasterInitialFormat(null);
+    setNewMasterOpen(true);
+  }
+
+  // "No matching master yet — Create one" (PageSettingsPanel) — appends a
+  // new master rather than inserting at a specific position, pre-seeded to
+  // the exact format the user was configuring on their page.
+  function handleCreateMasterForFormat(paperSize: string, orientation: 'portrait' | 'landscape', customWidth?: number, customHeight?: number) {
+    setNewMasterAfterOrder(null);
+    setNewMasterInitialFormat({ paperSize, orientation, customWidth, customHeight });
+    setNewMasterOpen(true);
   }
 
   function handleReorderPages(reordered: DiagramPage[]) {
@@ -117,15 +152,25 @@ export function DocumentEditor() {
           }}
         />
         <div style={{ flex: 1 }} />
+        <Segmented
+          size="small"
+          value={viewMode}
+          onChange={v => setViewMode(v as 'pages' | 'masters')}
+          options={[{ label: 'Pages', value: 'pages' }, { label: 'Master Pages', value: 'masters' }]}
+        />
         <Tooltip title="Version history">
           <Button icon={<IconHistory />} onClick={() => setVersionHistoryOpen(true)} />
         </Tooltip>
-        <Tooltip title="Presenter view (notes + next slide — open on your own screen, then Present on the shared one)">
-          <Button icon={<IconPresenterNotes />} onClick={() => window.open(`/simple-presentation/d/${id}/present?mode=presenter`, '_blank')} />
-        </Tooltip>
-        <Tooltip title="Present">
-          <Button icon={<IconPlayCircle />} onClick={() => window.open(`/simple-presentation/d/${id}/present`, '_blank')} />
-        </Tooltip>
+        {viewMode === 'pages' && (
+          <>
+            <Tooltip title="Presenter view (notes + next slide — open on your own screen, then Present on the shared one)">
+              <Button icon={<IconPresenterNotes />} onClick={() => window.open(`/simple-presentation/d/${id}/present?mode=presenter`, '_blank')} />
+            </Tooltip>
+            <Tooltip title="Present">
+              <Button icon={<IconPlayCircle />} onClick={() => window.open(`/simple-presentation/d/${id}/present`, '_blank')} />
+            </Tooltip>
+          </>
+        )}
       </div>
       <div style={{ flex: 1, minHeight: 0 }}>
         <ReactFlowProvider>
@@ -133,7 +178,10 @@ export function DocumentEditor() {
             diagramId={id!} pages={pages} diagramName={diagramName}
             members={members}
             toolbarSlot={toolbarSlotEl}
-            onInsertPageAt={handleInsertPageAt} onReorderPages={handleReorderPages}
+            viewMode={viewMode}
+            onInsertPageAt={handleInsertPageAt} onInsertMasterAt={handleInsertMasterAt}
+            onCreateMasterForFormat={handleCreateMasterForFormat}
+            onReorderPages={handleReorderPages}
           />
         </ReactFlowProvider>
       </div>
@@ -141,6 +189,17 @@ export function DocumentEditor() {
         open={newPageOpen}
         onClose={() => { setNewPageOpen(false); setNewPageAfterOrder(null); }}
         onCreate={handleAddPage}
+      />
+      <NewPageModal
+        open={newMasterOpen}
+        onClose={() => { setNewMasterOpen(false); setNewMasterAfterOrder(null); setNewMasterInitialFormat(null); }}
+        onCreate={handleAddMaster}
+        title="New Master"
+        createLabel="Create master"
+        initialPaperSize={newMasterInitialFormat?.paperSize}
+        initialOrientation={newMasterInitialFormat?.orientation}
+        initialCustomWidth={newMasterInitialFormat?.customWidth}
+        initialCustomHeight={newMasterInitialFormat?.customHeight}
       />
       {id && (
         <VersionHistoryModal

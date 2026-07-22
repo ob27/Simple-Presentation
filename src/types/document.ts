@@ -52,8 +52,19 @@ export interface DiagramPage {
   // When set, this page inherits backgroundColor/headerText/footerText from
   // the referenced master page for whichever of those it leaves unset
   // itself — same "undefined means fall through" convention already used
-  // for this page's own optional fields.
+  // for this page's own optional fields. It ALSO live-inherits the master's
+  // real shape content (Canvas.tsx renders the master's current shapes,
+  // translated onto this page, as a locked background layer) — see
+  // overriddenMasterShapeIds below for the per-shape opt-out.
   masterPageId?: string;
+  // Master-derived shapes render live/locked on this page by default.
+  // "Detach from master" clones one specific inherited shape into this
+  // page's own `shapes` subcollection and records the ORIGINAL master
+  // shape's id here, so that one shape stops being inherited-rendered on
+  // THIS page specifically — every other page still using the same master
+  // is unaffected, matching Affinity Publisher's per-page master-item
+  // override behavior.
+  overriddenMasterShapeIds?: string[];
 }
 
 export interface PresentationSettings {

@@ -43,21 +43,30 @@ function PositionPicker({ value, onChange }: { value: PageNumberPosition; onChan
 interface Props {
   diagramId: string;
   page: DiagramPage;
+  // Always the real, non-master content pages regardless of which mode is
+  // currently being edited (Canvas.tsx passes its viewMode-independent
+  // regularPages here) — needed so "used by N pages" and "can't delete the
+  // last page" mean the same thing whether you're deleting a regular page
+  // or a master.
   pages: DiagramPage[];
   masterPages: DiagramPage[];
   pageOrigin: number;
   pageShapes: Node[];
   onResizePageContent: (pageId: string, scaleX: number, scaleY: number, pageOrigin: number) => void;
   onClose: () => void;
+  // Opens "New Master" pre-seeded to a specific format — used by the "no
+  // matching master yet" affordance below.
+  onCreateMasterForFormat?: (paperSize: string, orientation: 'portrait' | 'landscape', customWidth?: number, customHeight?: number) => void;
 }
 
 // Ported from PageNavigatorRail's old floating-Popover `PageSettingsForm` and
 // consolidated here as a proper right-hand panel — the Popover version got
 // cramped fast once page numbers (style + a 2D location picker) were added
-// on top of everything margins/header/footer/master already needed. Masters
-// themselves are still managed from the left rail (a separate, unrelated
-// list), only a regular page's own settings moved.
-export function PageSettingsPanel({ diagramId, page, pages, masterPages, pageOrigin, pageShapes, onResizePageContent, onClose }: Props) {
+// on top of everything margins/header/footer/master already needed. This
+// same panel now also opens for master pages themselves (Master Pages mode
+// reuses the entire regular page-editing UI) — see the `page.isMaster`
+// branches below for what differs in that case.
+export function PageSettingsPanel({ diagramId, page, pages, masterPages, pageOrigin, pageShapes, onResizePageContent, onClose, onCreateMasterForFormat }: Props) {
   const [name, setName] = useState(page.name);
   const [paperSize, setPaperSize] = useState(page.paperSize);
   const [orientation, setOrientation] = useState(page.orientation);
@@ -117,21 +126,41 @@ export function PageSettingsPanel({ diagramId, page, pages, masterPages, pageOri
           </Radio.Group>
         </div>
 
-        {masterPages.length > 0 && (
-          <div>
-            <Tooltip title="Inherit this master's background, header & footer text for whichever of those this page itself leaves unset">
-              <div style={{ fontSize: 11, color: '#888', marginBottom: 3 }}>Master page</div>
-            </Tooltip>
-            <Select
-              size="small" style={{ width: '100%' }}
-              allowClear
-              placeholder="No master page"
-              value={masterPageId}
-              options={masterPages.map(m => ({ value: m.id, label: m.name }))}
-              onChange={v => setMasterPageId(v ?? undefined)}
-            />
-          </div>
-        )}
+        {/* A master can't itself have a master — no nested masters. */}
+        {!page.isMaster && (() => {
+          const pageDims = getPageDimensions(paperSize, orientation, page.customWidth, page.customHeight);
+          const matchingMasters = masterPages.filter(m => {
+            const d = getPageDimensions(m.paperSize, m.orientation, m.customWidth, m.customHeight);
+            return d.width === pageDims.width && d.height === pageDims.height;
+          });
+          return (
+            <div>
+              <Tooltip title="Inherit this master's background, header, footer & shape content — shapes on the master render live and locked here, unless individually detached">
+                <div style={{ fontSize: 11, color: '#888', marginBottom: 3 }}>Master page</div>
+              </Tooltip>
+              {matchingMasters.length > 0 ? (
+                <Select
+                  size="small" style={{ width: '100%' }}
+                  allowClear
+                  placeholder="No master page"
+                  value={masterPageId}
+                  options={matchingMasters.map(m => ({ value: m.id, label: m.name }))}
+                  onChange={v => setMasterPageId(v ?? undefined)}
+                />
+              ) : (
+                <div style={{ fontSize: 12, color: '#999' }}>
+                  No {pageDims.width}×{pageDims.height} master pages yet.{' '}
+                  <Button
+                    size="small" type="link" style={{ padding: 0, height: 'auto' }}
+                    onClick={() => onCreateMasterForFormat?.(paperSize, orientation, page.customWidth, page.customHeight)}
+                  >
+                    Create one
+                  </Button>
+                </div>
+              )}
+            </div>
+          );
+        })()}
 
         {pageShapes.length > 0 && (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -210,13 +239,35 @@ export function PageSettingsPanel({ diagramId, page, pages, masterPages, pageOri
 
       <div style={{ display: 'flex', gap: 6, padding: '10px 14px', borderTop: '1px solid #f0f0f0' }}>
         <Button size="small" type="primary" onClick={commit} style={{ flex: 1 }}>Save</Button>
-        <Popconfirm
-          title="Delete this page?"
-          disabled={pages.length <= 1}
-          onConfirm={() => { deletePage(diagramId, page.id); onClose(); }}
-        >
-          <Button size="small" danger icon={<IconDelete />} disabled={pages.length <= 1} />
-        </Popconfirm>
+        {(() => {
+          // "Can't delete the last page" only makes sense for a regular
+          // content page — a document can have zero master pages just fine.
+          const disabled = !page.isMaster && pages.length <= 1;
+          const referencing = page.isMaster ? pages.filter(p => p.masterPageId === page.id) : [];
+          function handleDelete() {
+            // A deleted master leaves referencing pages with a dangling
+            // masterPageId otherwise — harmless at render time (Canvas's
+            // lookup just falls through to "no master found"), but it'd
+            // silently resurrect if a master with that id ever existed
+            // again, and would keep offering a "Detach from master" action
+            // for shapes that no longer have a live source.
+            for (const p of referencing) updatePage(diagramId, p.id, { masterPageId: undefined });
+            deletePage(diagramId, page.id);
+            onClose();
+          }
+          return (
+            <Popconfirm
+              title={page.isMaster ? 'Delete this master?' : 'Delete this page?'}
+              description={page.isMaster && referencing.length > 0
+                ? `${referencing.length} page${referencing.length === 1 ? '' : 's'} using this master will lose its shape content, background, header & footer — not just fall back to a default.`
+                : undefined}
+              disabled={disabled}
+              onConfirm={handleDelete}
+            >
+              <Button size="small" danger icon={<IconDelete />} disabled={disabled} />
+            </Popconfirm>
+          );
+        })()}
       </div>
     </PeekableDrawer>
   );
