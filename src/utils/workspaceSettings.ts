@@ -1,4 +1,4 @@
-import { ref, uploadBytes, getDownloadURL, deleteObject } from 'firebase/storage';
+import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { storage, db } from '../firebase';
 
@@ -32,18 +32,29 @@ export async function saveNavBgColor(uid: string, color: string): Promise<void> 
 // uses (its rule already permits write by the owning uid) — a distinctly
 // named file slot (presentation-nav.*) so it never collides with Kanban's
 // own nav.*/board.* logo files in the same uid folder.
+//
+// The filename now carries a timestamp rather than being fixed
+// (`presentation-nav.{ext}`) — that's what lets this upload get a real
+// long-lived Cache-Control below: a fixed path re-used across re-uploads
+// would mean a legitimate icon change stays stuck behind other users'
+// year-long browser cache until it expires, whereas a genuinely new path
+// per upload needs no cache invalidation at all. The old blob is simply
+// left behind (cheap, low-volume) rather than tracked for cleanup.
 export async function uploadNavLogo(uid: string, file: File): Promise<string> {
   const ext = file.name.split('.').pop() ?? 'png';
-  const storageRef = ref(storage, `logos/${uid}/presentation-nav.${ext}`);
-  await uploadBytes(storageRef, file);
+  const storageRef = ref(storage, `logos/${uid}/presentation-nav.${Date.now()}.${ext}`);
+  await uploadBytes(storageRef, file, { cacheControl: 'public, max-age=31536000, immutable' });
   const url = await getDownloadURL(storageRef);
   await setDoc(doc(db, 'users', uid), { presentationNavLogoUrl: url }, { merge: true });
   return url;
 }
 
 export async function deleteNavLogo(uid: string): Promise<void> {
-  for (const ext of ['png', 'jpg', 'jpeg', 'svg', 'webp']) {
-    try { await deleteObject(ref(storage, `logos/${uid}/presentation-nav.${ext}`)); } catch { /* not found, skip */ }
-  }
+  // Only ever clears the Firestore field the app actually reads to decide
+  // whether a logo displays — the versioned-path scheme above means the
+  // current blob's exact name isn't guessable from a fixed extension list
+  // the way it was before, so removal no longer also deletes the
+  // underlying Storage object (an orphaned-blob storage cost, not a visible
+  // bug: the logo genuinely disappears the moment this field clears).
   await setDoc(doc(db, 'users', uid), { presentationNavLogoUrl: null }, { merge: true });
 }

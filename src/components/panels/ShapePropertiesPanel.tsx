@@ -18,6 +18,32 @@ import { defaultGradient } from '../../utils/gradient';
 import { downsampleImageFile, formatBytes } from '../../utils/imageDownsample';
 import { uploadDiagramImage } from '../../utils/imageUpload';
 
+// Kinds with no plain, single-line label span to style — either they render
+// their own dedicated text surface (table cells, chart/pie labels) or no
+// text at all (image, video, brush strokes, hotspots). Every other kind
+// (including all the polygon/curved/UML shapes, which just show a centered
+// label) gets the Character font tab now, not just Text.
+const TEXT_TAB_EXCLUDED_KINDS = new Set<ShapeNodeData['kind']>([
+  'image', 'video', 'table', 'pieChart', 'chart', 'brushStroke', 'hotspot',
+]);
+
+// A curated, small, fixed set — loaded once in index.html, not lazy-loaded
+// per selection. `fontFamily` already accepts any free-form CSS value, so
+// this is only a UI-picker limitation being lifted, not a data model change.
+const NAMED_FONT_OPTIONS = [
+  { value: 'inherit', label: 'Default' },
+  { value: "'Inter', sans-serif", label: 'Inter' },
+  { value: "'Roboto', sans-serif", label: 'Roboto' },
+  { value: "'Open Sans', sans-serif", label: 'Open Sans' },
+  { value: "'Lato', sans-serif", label: 'Lato' },
+  { value: "'Montserrat', sans-serif", label: 'Montserrat' },
+  { value: "'Playfair Display', serif", label: 'Playfair Display' },
+  { value: "'Merriweather', serif", label: 'Merriweather' },
+  { value: "'Times New Roman', serif", label: 'Times New Roman' },
+  { value: "'Courier New', monospace", label: 'Courier New' },
+  { value: "'Caveat', cursive", label: 'Caveat (handwriting)' },
+];
+
 const OP_OPTIONS: { value: StyleRuleOp; label: string }[] = [
   { value: '<', label: '<' }, { value: '<=', label: '≤' },
   { value: '>', label: '>' }, { value: '>=', label: '≥' },
@@ -188,6 +214,15 @@ export function ShapePropertiesPanel({ node, diagramId, pages, allShapes, variab
         <Button size="small" type="text" icon={<IconClose />} onClick={onClose} />
       </div>
 
+      {/* Informational only, same as when this field was first added — no
+          "re-sync with master" action exists yet, just a badge so a
+          detached shape's history isn't silently invisible in the UI. */}
+      {data.detachedFromMasterShapeId && (
+        <div style={{ padding: '8px 14px', borderBottom: '1px solid #f0f0f0', fontSize: 11, color: '#999' }}>
+          Detached from master page
+        </div>
+      )}
+
       {connections.length > 0 && (
         <div style={{ padding: '10px 14px', borderBottom: '1px solid #f0f0f0' }}>
           <div style={{ fontSize: 11, fontWeight: 600, color: '#999', textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 6 }}>
@@ -267,13 +302,20 @@ export function ShapePropertiesPanel({ node, diagramId, pages, allShapes, variab
                   <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Fill</div>
                   <Radio.Group
                     size="small" style={{ marginBottom: 6 }}
-                    value={data.fillGradient ? 'gradient' : 'solid'}
-                    onChange={e => onChange({
-                      fillGradient: e.target.value === 'gradient' ? (data.fillGradient ?? defaultGradient(data.fillColor ?? '#E3EAFD')) : undefined,
-                    })}
+                    value={data.fillGradient ? 'gradient' : data.fillColor === 'transparent' ? 'transparent' : 'solid'}
+                    onChange={e => {
+                      if (e.target.value === 'gradient') {
+                        onChange({ fillGradient: data.fillGradient ?? defaultGradient(data.fillColor === 'transparent' ? '#E3EAFD' : (data.fillColor ?? '#E3EAFD')) });
+                      } else if (e.target.value === 'transparent') {
+                        onChange({ fillGradient: undefined, fillColor: 'transparent' });
+                      } else {
+                        onChange({ fillGradient: undefined, fillColor: data.fillColor === 'transparent' ? '#E3EAFD' : data.fillColor });
+                      }
+                    }}
                   >
                     <Radio.Button value="solid">Solid</Radio.Button>
                     <Radio.Button value="gradient">Gradient</Radio.Button>
+                    <Radio.Button value="transparent">None</Radio.Button>
                   </Radio.Group>
                   {data.fillGradient ? (
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -295,6 +337,10 @@ export function ShapePropertiesPanel({ node, diagramId, pages, allShapes, variab
                       <div style={{ display: 'flex', gap: 8 }}>
                         <ColorPickerField
                           value={data.fillGradient.stops[0]?.color ?? '#E3EAFD'}
+                          // Left-anchored — the panel is a narrow, right-
+                          // docked strip with no room for the popup to open
+                          // rightward without spilling off the viewport.
+                          placement="left"
                           onChangeComplete={hex => {
                             const stops = [...data.fillGradient!.stops];
                             stops[0] = { color: hex, offset: stops[0]?.offset ?? 0 };
@@ -303,6 +349,7 @@ export function ShapePropertiesPanel({ node, diagramId, pages, allShapes, variab
                         />
                         <ColorPickerField
                           value={data.fillGradient.stops[1]?.color ?? '#ffffff'}
+                          placement="left"
                           onChangeComplete={hex => {
                             const stops = [...data.fillGradient!.stops];
                             stops[1] = { color: hex, offset: stops[1]?.offset ?? 100 };
@@ -311,7 +358,7 @@ export function ShapePropertiesPanel({ node, diagramId, pages, allShapes, variab
                         />
                       </div>
                     </div>
-                  ) : (
+                  ) : data.fillColor === 'transparent' ? null : (
                     <ColorPickerField
                       value={data.fillColor ?? '#E3EAFD'}
                       onChangeComplete={hex => onChange({ fillColor: hex })}
@@ -570,9 +617,9 @@ export function ShapePropertiesPanel({ node, diagramId, pages, allShapes, variab
               </div>
             ),
           },
-          ...(data.kind === 'text' ? [{
+          ...(!TEXT_TAB_EXCLUDED_KINDS.has(data.kind) ? [{
             key: 'text',
-            label: <span><IconFontSize /> Text</span>,
+            label: <span><IconFontSize /> {data.kind === 'text' ? 'Text' : 'Font'}</span>,
             children: (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 16, paddingTop: 8 }}>
                 <div>
@@ -583,13 +630,7 @@ export function ShapePropertiesPanel({ node, diagramId, pages, allShapes, variab
                     <Select
                       style={{ width: '100%' }}
                       value={data.fontFamily ?? 'inherit'}
-                      options={[
-                        { value: 'inherit', label: 'Default' },
-                        { value: "'Arial', sans-serif", label: 'Sans-serif' },
-                        { value: "'Georgia', serif", label: 'Serif' },
-                        { value: "'Courier New', monospace", label: 'Monospace' },
-                        { value: "'Segoe Print', 'Bradley Hand', cursive", label: 'Handwriting' },
-                      ]}
+                      options={NAMED_FONT_OPTIONS}
                       onChange={v => onChange({ fontFamily: v })}
                     />
                     <div style={{ display: 'flex', gap: 8 }}>
@@ -640,30 +681,35 @@ export function ShapePropertiesPanel({ node, diagramId, pages, allShapes, variab
                   </div>
                 </div>
 
-                <div>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: '#999', letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 8 }}>
-                    Paragraph
-                  </div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                    <div>
-                      <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Alignment</div>
-                      <Radio.Group size="small" value={data.textAlign ?? 'center'} onChange={e => onChange({ textAlign: e.target.value })}>
-                        <Radio.Button value="left"><IconAlignLeft /></Radio.Button>
-                        <Radio.Button value="center"><IconAlignCenter /></Radio.Button>
-                        <Radio.Button value="right"><IconAlignRight /></Radio.Button>
-                        <Radio.Button value="justify"><IconJustify /></Radio.Button>
-                      </Radio.Group>
+                {/* Alignment/list semantics only make sense for a floating,
+                    multi-line Text box — a regular shape's label is always
+                    a single centered span, so this stays text-only. */}
+                {data.kind === 'text' && (
+                  <div>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: '#999', letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 8 }}>
+                      Paragraph
                     </div>
-                    <div>
-                      <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Vertical alignment</div>
-                      <Radio.Group size="small" value={data.verticalAlign ?? 'middle'} onChange={e => onChange({ verticalAlign: e.target.value })}>
-                        <Radio.Button value="top"><IconAlignTop /></Radio.Button>
-                        <Radio.Button value="middle"><IconAlignMiddle /></Radio.Button>
-                        <Radio.Button value="bottom"><IconAlignBottom /></Radio.Button>
-                      </Radio.Group>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                      <div>
+                        <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Alignment</div>
+                        <Radio.Group size="small" value={data.textAlign ?? 'center'} onChange={e => onChange({ textAlign: e.target.value })}>
+                          <Radio.Button value="left"><IconAlignLeft /></Radio.Button>
+                          <Radio.Button value="center"><IconAlignCenter /></Radio.Button>
+                          <Radio.Button value="right"><IconAlignRight /></Radio.Button>
+                          <Radio.Button value="justify"><IconJustify /></Radio.Button>
+                        </Radio.Group>
+                      </div>
+                      <div>
+                        <div style={{ fontSize: 12, color: '#888', marginBottom: 4 }}>Vertical alignment</div>
+                        <Radio.Group size="small" value={data.verticalAlign ?? 'middle'} onChange={e => onChange({ verticalAlign: e.target.value })}>
+                          <Radio.Button value="top"><IconAlignTop /></Radio.Button>
+                          <Radio.Button value="middle"><IconAlignMiddle /></Radio.Button>
+                          <Radio.Button value="bottom"><IconAlignBottom /></Radio.Button>
+                        </Radio.Group>
+                      </div>
                     </div>
                   </div>
-                </div>
+                )}
               </div>
             ),
           }] : []),

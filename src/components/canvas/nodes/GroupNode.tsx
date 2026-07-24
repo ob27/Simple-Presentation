@@ -1,4 +1,4 @@
-import { memo } from 'react';
+import { memo, useCallback, useState } from 'react';
 import { NodeResizer, type NodeProps } from '@xyflow/react';
 import { EdgeResizeHandles } from './EdgeResizeHandles';
 import { useShiftHeld } from './useShiftHeld';
@@ -11,7 +11,12 @@ export interface GroupNodeData extends Record<string, unknown> {
 
 function GroupNodeImpl({ id, data, selected }: NodeProps) {
   const { label, locked, onResizeGroup } = data as unknown as GroupNodeData;
-  const shiftHeld = useShiftHeld(!!selected && !locked);
+  const { shiftHeldRef } = useShiftHeld(!!selected && !locked);
+  // See useShiftHeld's own comment — snapshotted once at resize-start rather
+  // than bound to the live value, so Shift toggling mid-drag can't flip
+  // keepAspectRatio partway through a gesture.
+  const [resizeShiftLock, setResizeShiftLock] = useState(false);
+  const handleResizeStart = useCallback(() => setResizeShiftLock(shiftHeldRef.current), [shiftHeldRef]);
   // Wired to BOTH controls below, not just NodeResizer — EdgeResizeHandles'
   // dots are independent resize controls (see its own comment), so a drag
   // that starts there would otherwise never rescale this group's children.
@@ -22,20 +27,27 @@ function GroupNodeImpl({ id, data, selected }: NodeProps) {
     <div
       style={{
         width: '100%', height: '100%',
-        border: `1.5px dashed ${selected ? '#1677ff' : '#b7bed1'}`,
+        // Invisible unless selected — an unconditional dashed frame + tint
+        // made every group read visually as a "container" even when nobody
+        // had selected it, which is exactly what containerTheme (a real,
+        // intentionally-styled container variant) is supposed to look like
+        // instead of a plain grouping construct.
+        border: selected ? '1.5px dashed #1677ff' : 'none',
         borderRadius: 8,
-        background: 'rgba(140, 163, 232, 0.04)',
+        background: selected ? 'rgba(140, 163, 232, 0.04)' : 'transparent',
         position: 'relative',
       }}
     >
       <NodeResizer
-        isVisible={!!selected && !locked} minWidth={24} minHeight={24} keepAspectRatio={shiftHeld}
+        isVisible={!!selected && !locked} minWidth={24} minHeight={24} keepAspectRatio={resizeShiftLock}
         lineStyle={{ borderColor: '#1677ff' }} handleStyle={{ width: 8, height: 8, borderRadius: 2 }}
+        onResizeStart={handleResizeStart}
         onResizeEnd={handleResizeEnd}
       />
       {!!selected && !locked && (
         <EdgeResizeHandles
-          minWidth={24} minHeight={24} keepAspectRatio={shiftHeld} onResizeEnd={handleResizeEnd}
+          minWidth={24} minHeight={24} keepAspectRatio={resizeShiftLock}
+          onResizeStart={handleResizeStart} onResizeEnd={handleResizeEnd}
         />
       )}
       {label && (

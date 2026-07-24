@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import {
   ReactFlow, Background, Controls, addEdge, applyNodeChanges, applyEdgeChanges,
   MarkerType, ConnectionMode, useReactFlow, type Node, type Edge, type NodeTypes, type EdgeTypes,
-  type OnConnect, type NodeChange, type EdgeChange,
+  type OnConnect, type NodeChange, type EdgeChange, type OnReconnect,
 } from '@xyflow/react';
 import { Button, Tooltip, Select, Popover, Switch, ColorPicker, Modal, Progress } from 'antd';
 import {
@@ -15,6 +15,7 @@ import {
   IconExit, IconChevronLeft, IconChevronRight,
   IconFullscreenEnter, IconFullscreenExit, IconSettingsGear, IconFillScreen,
   IconAddRow, IconRemoveRow, IconAddColumn, IconRemoveColumn,
+  IconComment,
 } from '../icons';
 import type { DiagramPage, PresentationSettings, PresentState } from '../../types/document';
 import type { ToolId } from '../../types/tools';
@@ -27,6 +28,7 @@ import { ShapeNode } from './nodes/ShapeNode';
 import { GroupNode } from './nodes/GroupNode';
 import { PathNode } from './nodes/PathNode';
 import { CommentPinNode } from './nodes/CommentPinNode';
+import { MultiSelectOverlayNode } from './nodes/MultiSelectOverlayNode';
 import { CommentThreadPanel } from '../panels/CommentThreadPanel';
 import { SmartEdge } from './edges/SmartEdge';
 import { PageNavigatorRail } from './PageNavigatorRail';
@@ -64,7 +66,7 @@ import { usePresence } from '../../hooks/usePresence';
 import { resolveStyle } from '../../utils/shapeStyleResolver';
 import { computeDownstream } from '../../utils/graphTraversal';
 import { computePresentationLayout, DEFAULT_PRESENTATION_SETTINGS } from '../../utils/presentationFrame';
-import { uploadDiagramImage, uploadDiagramMedia, getImageDimensions, getVideoDimensions } from '../../utils/imageUpload';
+import { uploadDiagramImage, uploadDiagramMedia, getImageDimensions, getVideoDimensions, uploadThumbnail } from '../../utils/imageUpload';
 import { downsampleImageFile, formatBytes } from '../../utils/imageDownsample';
 import { exportPageAsImage } from '../../utils/exportImage';
 import { THUMB_MAX_WIDTH, THUMB_MAX_HEIGHT } from './PageNavigatorRail';
@@ -72,7 +74,7 @@ import type { DiagramVariable } from '../../types/variables';
 import {
   subscribeShapes, subscribeConnectors, saveShape, deleteShape, saveConnector, deleteConnector,
   subscribeVariables, upsertVariable, deleteVariable, updatePage, duplicatePage, detachMasterShape,
-  subscribeComments, saveComment, deleteComment,
+  subscribeComments, saveComment, deleteComment, setCoverPage,
 } from '../../store';
 import type { DiagramComment } from '../../types/comments';
 import { useAuth } from '../../AuthContext';
@@ -83,6 +85,7 @@ const nodeTypes: NodeTypes = {
   group: GroupNode,
   path: PathNode,
   comment: CommentPinNode,
+  multiSelectOverlay: MultiSelectOverlayNode,
 };
 const edgeTypes: EdgeTypes = {
   smart: SmartEdge,
@@ -104,7 +107,11 @@ interface Props {
   diagramId: string;
   pages: DiagramPage[];
   diagramName?: string;
-  mode?: 'edit' | 'present';
+  // 'comment' is a third, narrower tier between the two: editing stays
+  // blocked exactly like 'present' (every existing `isPresent`-gated check
+  // below applies to it too), but comment pins stay placeable/visible,
+  // unlike a pure 'present' viewer — see `commentsEnabled` below.
+  mode?: 'edit' | 'present' | 'comment';
   onExitPresent?: () => void;
   presentationSettings?: PresentationSettings;
   onUpdatePresentationSettings?: (patch: Partial<PresentationSettings>) => void;
@@ -159,10 +166,72 @@ function sortByParentDepth<T extends { id: string; parentId?: string }>(nodes: T
 // falls back to each end's pre-existing default (no start arrow, filled
 // arrow at the end) so every connector created before this field existed
 // keeps looking exactly the same.
+// React Flow's own MarkerType enum only covers a plain open/filled arrow —
+// UML (aggregation/composition/generalization) and DFD/ER (circle) end
+// styles need custom SVG <marker> defs instead, referenced by url() the same
+// way `markerStart`/`markerEnd` already accept a raw string. See
+// ARROW_MARKER_DEFS below for where these ids are actually defined.
+const CUSTOM_ARROW_MARKER_IDS: Partial<Record<ArrowStyle, string>> = {
+  diamond: 'arrow-diamond',
+  diamondFilled: 'arrow-diamondFilled',
+  triangleOpen: 'arrow-triangleOpen',
+  circle: 'arrow-circle',
+  circleFilled: 'arrow-circleFilled',
+};
+
+const ARROW_MARKER_OPTIONS: { value: ArrowStyle; label: string }[] = [
+  { value: 'none', label: 'None' },
+  { value: 'arrow', label: 'Arrow' },
+  { value: 'arrowClosed', label: 'Filled arrow' },
+  { value: 'triangleOpen', label: 'Open triangle (UML generalization)' },
+  { value: 'diamond', label: 'Diamond (UML aggregation)' },
+  { value: 'diamondFilled', label: 'Filled diamond (UML composition)' },
+  { value: 'circle', label: 'Circle (DFD/ER)' },
+  { value: 'circleFilled', label: 'Filled circle (DFD/ER)' },
+];
+
+// A connector's arrowhead is chosen per-end (start/end independently) after
+// it's drawn, stored in `data.startArrow`/`endArrow` and materialized into
+// React Flow's own `markerStart`/`markerEnd` edge fields here — `undefined`
+// falls back to each end's pre-existing default (no start arrow, filled
+// arrow at the end) so every connector created before this field existed
+// keeps looking exactly the same.
 function arrowMarker(style: ArrowStyle | undefined, fallback: ArrowStyle) {
   const resolved = style ?? fallback;
   if (resolved === 'none') return undefined;
+  const customId = CUSTOM_ARROW_MARKER_IDS[resolved];
+  if (customId) return `url(#${customId})`;
   return { type: resolved === 'arrow' ? MarkerType.Arrow : MarkerType.ArrowClosed, color: '#8a93a6' };
+}
+
+// Mounted once at the ReactFlow SVG root (see the <svg><defs> render below,
+// alongside ReactFlow's own children) — always rendered regardless of
+// onlyRenderVisibleElements culling, since these are definitions, not
+// visible marks, and a culled-out edge referencing one by id would just
+// silently fail to resolve it if the defs themselves were culled too.
+function ArrowMarkerDefs() {
+  const color = '#8a93a6';
+  return (
+    <svg width="0" height="0" style={{ position: 'absolute' }}>
+      <defs>
+        <marker id="arrow-diamond" viewBox="0 0 20 20" refX="18" refY="10" markerWidth="14" markerHeight="14" orient="auto-start-reverse">
+          <polygon points="0,10 10,3 20,10 10,17" fill="#fff" stroke={color} strokeWidth="1.5" />
+        </marker>
+        <marker id="arrow-diamondFilled" viewBox="0 0 20 20" refX="18" refY="10" markerWidth="14" markerHeight="14" orient="auto-start-reverse">
+          <polygon points="0,10 10,3 20,10 10,17" fill={color} stroke={color} strokeWidth="1.5" />
+        </marker>
+        <marker id="arrow-triangleOpen" viewBox="0 0 20 20" refX="18" refY="10" markerWidth="12" markerHeight="12" orient="auto-start-reverse">
+          <polygon points="1,2 19,10 1,18" fill="#fff" stroke={color} strokeWidth="1.5" />
+        </marker>
+        <marker id="arrow-circle" viewBox="0 0 20 20" refX="17" refY="10" markerWidth="10" markerHeight="10" orient="auto-start-reverse">
+          <circle cx="10" cy="10" r="7" fill="#fff" stroke={color} strokeWidth="1.5" />
+        </marker>
+        <marker id="arrow-circleFilled" viewBox="0 0 20 20" refX="17" refY="10" markerWidth="10" markerHeight="10" orient="auto-start-reverse">
+          <circle cx="10" cy="10" r="7" fill={color} stroke={color} strokeWidth="1.5" />
+        </marker>
+      </defs>
+    </svg>
+  );
 }
 
 // Fields the Style Paint tool copies from a source shape onto a target —
@@ -200,8 +269,11 @@ export function Canvas({
 
   const { user } = useAuth();
   const { screenToFlowPosition, setCenter, getZoom, getInternalNode, fitBounds, getViewport, setViewport, updateNodeData } = useReactFlow();
-  const isPresent = mode === 'present';
-  const { peers, updateCursor, updateDragPreview } = usePresence(diagramId, user, mode);
+  const isPresent = mode !== 'edit';
+  // Only comment pins carve an exception out of the blanket isPresent gate
+  // above — see the 'comment' mode doc comment on the Props type.
+  const commentsEnabled = mode !== 'present';
+  const { peers, updateCursor, updateDragPreview } = usePresence(diagramId, user, mode === 'edit' ? 'edit' : 'present');
   // Measures the actual on-screen container size so fitToPage can reserve
   // space for the properties drawer (an absolutely-positioned overlay that
   // doesn't shrink this element's own measured size) — fitBounds's own
@@ -396,6 +468,8 @@ export function Canvas({
         backgroundColor: page.backgroundColor ?? master?.backgroundColor,
         headerText: page.headerText ?? master?.headerText,
         footerText: page.footerText ?? master?.footerText,
+        headerConfig: page.headerConfig ?? master?.headerConfig,
+        footerConfig: page.footerConfig ?? master?.footerConfig,
         pageNumberEnabled: page.pageNumberEnabled, pageNumberStyle: page.pageNumberStyle, pageNumberPosition: page.pageNumberPosition,
         pageIndex: i + 1, pageCount: pages.length,
         ...(pageDimensions.get(page.id) ?? { width: 794, height: 1123 }),
@@ -464,6 +538,13 @@ export function Canvas({
   );
   const masterShapesSlices = useRef<Map<string, Map<string, DiagramNode>>>(new Map());
   const [masterShapeNodesByMaster, setMasterShapeNodesByMaster] = useState<Map<string, DiagramNode[]>>(new Map());
+  // Same dedup-by-unique-master subscription as the shapes above, but for
+  // connectors BETWEEN master shapes — previously only master shapes
+  // themselves were inherited onto a referencing page, never the connectors
+  // linking them (a real gap in the original master-pages design, not just
+  // an unreported bug).
+  const masterConnectorsSlices = useRef<Map<string, Map<string, DiagramEdge>>>(new Map());
+  const [masterConnectorsByMaster, setMasterConnectorsByMaster] = useState<Map<string, DiagramEdge[]>>(new Map());
   useEffect(() => {
     const unsubs = referencedMasterIds.map(masterId => subscribeShapes(diagramId, masterId, nodes => {
       masterShapesSlices.current.set(masterId, new Map(nodes.map(n => [n.id, n])));
@@ -471,13 +552,23 @@ export function Canvas({
         referencedMasterIds.map(mid => [mid, Array.from(masterShapesSlices.current.get(mid)?.values() ?? [])]),
       ));
     }));
+    const connectorUnsubs = referencedMasterIds.map(masterId => subscribeConnectors(diagramId, masterId, edges => {
+      masterConnectorsSlices.current.set(masterId, new Map(edges.map(e => [e.id, e])));
+      setMasterConnectorsByMaster(new Map(
+        referencedMasterIds.map(mid => [mid, Array.from(masterConnectorsSlices.current.get(mid)?.values() ?? [])]),
+      ));
+    }));
     return () => {
       unsubs.forEach(u => u());
+      connectorUnsubs.forEach(u => u());
       // Drop cached slices for masters no longer referenced by anything
       // currently rendered, so a stale snapshot can't resurface if the same
       // master id becomes referenced again later with different content.
       for (const id of masterShapesSlices.current.keys()) {
         if (!referencedMasterIds.includes(id)) masterShapesSlices.current.delete(id);
+      }
+      for (const id of masterConnectorsSlices.current.keys()) {
+        if (!referencedMasterIds.includes(id)) masterConnectorsSlices.current.delete(id);
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -489,6 +580,28 @@ export function Canvas({
   // precedent in handleReorderPagesWithShapes above. Ephemeral only: none of
   // this is ever written back to Firestore, so editing the real master
   // (elsewhere) is what actually changes what every referencing page shows.
+  // A "detach from master" clone only ever records the detached shape's OWN
+  // id into overriddenMasterShapeIds (see detachMasterShape in store.ts) —
+  // not its descendants', since detaching clones the whole subtree at once.
+  // A flat `overridden.has(m.id)` check therefore let an un-recorded child
+  // of a detached GROUP still pass through here, referencing a `parentId`
+  // that got excluded from `out` in the same pass — React Flow silently
+  // fails to render a node whose parent isn't in the array. Walking each
+  // shape's own ancestor chain (not just changing what detachMasterShape
+  // records) fixes this for shapes already detached in production data too,
+  // with no migration needed.
+  function isOverriddenOrAncestor(shapeId: string, byId: Map<string, DiagramNode>, overridden: Set<string>): boolean {
+    let current: string | undefined = shapeId;
+    const guard = new Set<string>();
+    while (current) {
+      if (overridden.has(current)) return true;
+      if (guard.has(current)) return false;
+      guard.add(current);
+      current = byId.get(current)?.parentId;
+    }
+    return false;
+  }
+
   const inheritedMasterNodes = useMemo<Node[]>(() => {
     if (viewMode === 'masters') return [];
     const out: Node[] = [];
@@ -496,10 +609,11 @@ export function Canvas({
       if (!page.masterPageId) continue;
       const masterShapes = masterShapeNodesByMaster.get(page.masterPageId);
       if (!masterShapes) continue;
+      const masterById = new Map(masterShapes.map(s => [s.id, s]));
       const overridden = new Set(page.overriddenMasterShapeIds ?? []);
       const dy = (pageOrigins.get(page.id) ?? 0) - (masterOrigins.get(page.masterPageId) ?? 0);
       for (const m of sortByParentDepth(masterShapes)) {
-        if (overridden.has(m.id)) continue;
+        if (isOverriddenOrAncestor(m.id, masterById, overridden)) continue;
         const inheritedId = `inherited-${page.id}-${m.id}`;
         out.push({
           ...m,
@@ -531,6 +645,41 @@ export function Canvas({
     }
     return out;
   }, [pages, masterShapeNodesByMaster, masterOrigins, pageOrigins, viewMode, selectedInheritedId]);
+
+  // Parallel to inheritedMasterNodes above, but for connectors BETWEEN
+  // master shapes — a page inheriting a master's shapes previously never
+  // inherited the arrows linking them. Endpoint ids are rewritten to match
+  // inheritedMasterNodes' `inherited-{page.id}-{shapeId}` convention; an
+  // edge is skipped entirely (not rendered dangling) if either endpoint is
+  // itself overridden (or a descendant of an overridden ancestor) on this
+  // page, since a detached endpoint no longer has a corresponding inherited
+  // node for the edge to attach to.
+  const inheritedMasterEdges = useMemo<DiagramEdge[]>(() => {
+    if (viewMode === 'masters') return [];
+    const out: DiagramEdge[] = [];
+    for (const page of pages) {
+      if (!page.masterPageId) continue;
+      const masterShapes = masterShapeNodesByMaster.get(page.masterPageId);
+      const masterEdges = masterConnectorsByMaster.get(page.masterPageId);
+      if (!masterShapes || !masterEdges) continue;
+      const masterById = new Map(masterShapes.map(s => [s.id, s]));
+      const overridden = new Set(page.overriddenMasterShapeIds ?? []);
+      for (const e of masterEdges) {
+        if (isOverriddenOrAncestor(e.source, masterById, overridden)) continue;
+        if (isOverriddenOrAncestor(e.target, masterById, overridden)) continue;
+        out.push({
+          ...e,
+          id: `inherited-edge-${page.id}-${e.id}`,
+          source: `inherited-${page.id}-${e.source}`,
+          target: `inherited-${page.id}-${e.target}`,
+          selectable: false,
+          deletable: false,
+          data: { ...e.data, locked: true },
+        } as DiagramEdge);
+      }
+    }
+    return out;
+  }, [pages, masterShapeNodesByMaster, masterConnectorsByMaster, viewMode]);
 
   function navigateToLink(shapeId: string) {
     const shape = shapeNodesRef.current.find(n => n.id === shapeId);
@@ -629,6 +778,27 @@ export function Canvas({
       const prevSelected = new Set(prev.filter(n => n.selected).map(n => n.id));
       return merged.map(n => prevSelected.has(n.id) ? { ...n, selected: true } : n);
     });
+  }
+
+  // Shared by any bulk shape-geometry mutation (page reorder, group/page
+  // resize) that computes new positions/sizes from a `shapesSlices`
+  // snapshot for potentially many shapes at once. Writing the result back
+  // into `shapesSlices.current` here — not just `setShapeNodes` — matters:
+  // the per-page Firestore listener calls `rebuildShapes()` on every echo,
+  // including the echo of the `saveShape` calls below, and if the slice
+  // still held the stale pre-mutation snapshot when that echo lands, the
+  // rebuild would revert (or, mid-drag, duplicate) the shapes this just
+  // moved. Every single-shape mutation path (applyDataPatch/applySize/
+  // applyPosition) already follows this write-slice-then-rebuild order;
+  // this is the same pattern generalized to many shapes at once.
+  function commitShapeUpdates(updates: { id: string; pageId: string; node: DiagramNode }[]) {
+    for (const { id, pageId, node } of updates) {
+      let slice = shapesSlices.current.get(pageId);
+      if (!slice) { slice = new Map(); shapesSlices.current.set(pageId, slice); }
+      slice.set(id, node);
+      saveShape(diagramId, pageId, toPersistableShape(node));
+    }
+    rebuildShapes();
   }
 
   function rebuildConnectors() {
@@ -808,12 +978,10 @@ export function Canvas({
     }
 
     function applySnapshots(snaps: GeomSnapshot[]) {
-      setShapeNodes(prev => prev.map(n => {
-        const s = snaps.find(x => x.id === n.id);
-        if (!s) return n;
-        const updated = { ...n, position: s.position, ...(s.width !== undefined ? { width: s.width } : {}), ...(s.height !== undefined ? { height: s.height } : {}) };
-        saveShape(diagramId, s.pageId, toPersistableShape(updated));
-        return updated;
+      commitShapeUpdates(snaps.map(s => {
+        const existing = byId.get(s.id)!;
+        const updated = { ...existing, position: s.position, ...(s.width !== undefined ? { width: s.width } : {}), ...(s.height !== undefined ? { height: s.height } : {}) };
+        return { id: s.id, pageId: s.pageId, node: updated };
       }));
     }
 
@@ -836,6 +1004,7 @@ export function Canvas({
     for (const slice of shapesSlices.current.values()) for (const n of slice.values()) allCommitted.push(n);
     const pageShapes = allCommitted.filter(n => n.data.pageId === pageId);
     if (pageShapes.length === 0) return;
+    const byId = new Map(pageShapes.map(n => [n.id, n]));
 
     type GeomSnapshot = { id: string; position: { x: number; y: number }; width?: number; height?: number };
     const before: GeomSnapshot[] = [];
@@ -854,12 +1023,10 @@ export function Canvas({
     }
 
     function applySnapshots(snaps: GeomSnapshot[]) {
-      setShapeNodes(prev => prev.map(n => {
-        const s = snaps.find(x => x.id === n.id);
-        if (!s) return n;
-        const updated = { ...n, position: s.position, ...(s.width !== undefined ? { width: s.width } : {}), ...(s.height !== undefined ? { height: s.height } : {}) };
-        saveShape(diagramId, pageId, toPersistableShape(updated));
-        return updated;
+      commitShapeUpdates(snaps.map(s => {
+        const existing = byId.get(s.id)!;
+        const updated = { ...existing, position: s.position, ...(s.width !== undefined ? { width: s.width } : {}), ...(s.height !== undefined ? { height: s.height } : {}) };
+        return { id: s.id, pageId, node: updated };
       }));
     }
 
@@ -885,6 +1052,7 @@ export function Canvas({
 
     const allCommitted: DiagramNode[] = [];
     for (const slice of shapesSlices.current.values()) for (const n of slice.values()) allCommitted.push(n);
+    const byId = new Map(allCommitted.map(n => [n.id, n]));
 
     const updates = new Map<string, { pageId: string; position: { x: number; y: number } }>();
     for (const page of reordered) {
@@ -899,13 +1067,13 @@ export function Canvas({
     }
 
     if (updates.size > 0) {
-      setShapeNodes(prev => prev.map(n => {
-        const u = updates.get(n.id);
-        if (!u) return n;
-        const updated = { ...n, position: u.position };
-        saveShape(diagramId, u.pageId, toPersistableShape(updated));
-        return updated;
-      }));
+      commitShapeUpdates(
+        Array.from(updates.entries()).map(([id, u]) => ({
+          id,
+          pageId: u.pageId,
+          node: { ...byId.get(id)!, position: u.position },
+        }))
+      );
     }
 
     onReorderPages?.(reordered);
@@ -1228,6 +1396,51 @@ export function Canvas({
     return node.parentId ? isTagHidden(node.parentId, byId, guard) : false;
   }
 
+  // Combined-bounding-box resize handles for a multi-selection — previously
+  // each shape in a multi-select only exposed its OWN resize handles, so
+  // dragging any one of them resized just that shape rather than "the
+  // selection" as a whole (unlike a real group, whose GroupNode frame
+  // already does this). Computed straight from shapeNodes' own `.selected`
+  // flag rather than the derived `selectedShapeIds` below (which itself
+  // derives from `nodes` — using it here would be a circular dependency).
+  // Only top-level, unlocked shapes participate: a selected group's child
+  // has a parent-relative position, not the absolute one this math assumes.
+  const multiSelectTargets = useMemo(
+    () => shapeNodes.filter(n => n.selected && !n.parentId && !(n.data as ShapeNodeData).locked),
+    [shapeNodes],
+  );
+  const multiSelectOverlayNode = useMemo<Node[]>(() => {
+    if (multiSelectTargets.length < 2) return [];
+    const boxes = multiSelectTargets.map(getBBox);
+    const minX = Math.min(...boxes.map(b => b.x));
+    const minY = Math.min(...boxes.map(b => b.y));
+    const maxX = Math.max(...boxes.map(b => b.x + b.w));
+    const maxY = Math.max(...boxes.map(b => b.y + b.h));
+    // React Flow itself boosts every SELECTED node's effective z-index by
+    // +1000 by default (SELECTED_NODE_Z, elevateNodesOnSelect) — since every
+    // shape in a multi-selection is, definitionally, selected, a fixed
+    // zIndex of 1000 here loses the corner-handle hit-test to whichever
+    // selected shape's own corner happens to coincide with the overlay's
+    // (virtually always true — a bbox corner IS one of the selected shapes'
+    // own corners), so dragging a corner only ever resized that one shape.
+    // Computed relative to the highest already-elevated selected shape
+    // instead of a bare constant so this can't regress if any shape's own
+    // zIndex is ever pushed above 1000 by repeated "bring to front" use.
+    const maxSelectedZ = Math.max(0, ...multiSelectTargets.map(n => (n.zIndex ?? 0) + 1000));
+    return [{
+      id: '__multiselect__',
+      type: 'multiSelectOverlay',
+      position: { x: minX, y: minY },
+      width: maxX - minX,
+      height: maxY - minY,
+      selectable: false,
+      draggable: false,
+      zIndex: maxSelectedZ + 1,
+      data: { onResizeStart: handleMultiSelectResizeStart, onResizeEnd: handleMultiSelectResizeEnd },
+    }];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [multiSelectTargets]);
+
   const nodes = useMemo(() => {
     const byId = new Map(shapeNodes.map(n => [n.id, n]));
     const styled = shapeNodes.map(n => {
@@ -1262,12 +1475,21 @@ export function Canvas({
         // a shape, instead of moving that shape.
         draggable: !locked && !toolActive && !isPresent && !isSpaceDown,
         connectable: !locked && !isPresent,
+        // Explicit per-node override of the (now edge-inclusive) global
+        // elementsSelectable prop below — a shape shouldn't be selectable
+        // while a tool (e.g. the connector/pen tool) is active, since
+        // clicking one is meant to draw/connect, not select it. Edges have
+        // no such per-node override, so they stay selectable even during
+        // connect-mode — see the toolActive comment on elementsSelectable.
+        selectable: !isPresent && !toolActive,
       };
     });
     // Comment pins are an authoring/collaboration affordance, not part of
     // the diagram's actual content — hidden while presenting, same as the
-    // page navigator rail and other editor-only chrome.
-    const commentNodes: Node[] = isPresent ? [] : comments.map(c => ({
+    // page navigator rail and other editor-only chrome. Stay visible in
+    // 'comment' mode specifically, unlike every other isPresent-gated bit
+    // of editor chrome.
+    const commentNodes: Node[] = !commentsEnabled ? [] : comments.map(c => ({
       id: c.id,
       type: 'comment',
       position: { x: c.x - 13, y: c.y - 13 },
@@ -1285,7 +1507,7 @@ export function Canvas({
     // A not-yet-saved draft still gets a visible marker at its drop point —
     // otherwise clicking with the comment tool would open the compose panel
     // with no on-canvas indication of where the pin is actually landing.
-    if (!isPresent && draftComment) {
+    if (commentsEnabled && draftComment) {
       commentNodes.push({
         id: '__draft-comment__',
         type: 'comment',
@@ -1298,10 +1520,10 @@ export function Canvas({
         data: { resolved: false, replyCount: 0, active: true, onOpen: () => {} },
       });
     }
-    return [...frameNodes, ...inheritedMasterNodes, ...styled, ...commentNodes];
-  }, [frameNodes, inheritedMasterNodes, shapeNodes, variables, highlighted, animationPanelOpen, revealStep, isPresent, presentPage, presentThresholdOrder, connectMode, toolActive, directSelectMode, handleShapeEditingChange, comments, activeCommentId, draftComment, hiddenTags]);
+    return [...frameNodes, ...inheritedMasterNodes, ...styled, ...commentNodes, ...multiSelectOverlayNode];
+  }, [frameNodes, inheritedMasterNodes, shapeNodes, variables, highlighted, animationPanelOpen, revealStep, isPresent, commentsEnabled, presentPage, presentThresholdOrder, connectMode, toolActive, directSelectMode, handleShapeEditingChange, comments, activeCommentId, draftComment, hiddenTags, multiSelectOverlayNode]);
 
-  const edges = useMemo(() => connectorEdges.map(e => {
+  const edges = useMemo(() => [...connectorEdges, ...inheritedMasterEdges].map(e => {
     const edgeData = e.data as SmartEdgeData | undefined;
     const edgePageId = findPageIdFor(shapeNodes.find(n => n.id === e.source));
     let hidden = false;
@@ -1316,7 +1538,7 @@ export function Canvas({
       markerEnd: arrowMarker(edgeData?.endArrow, 'arrowClosed'),
       data: { ...e.data, __dimmed: highlighted ? !highlighted.edgeIds.has(e.id) : false, __hidden: hidden },
     };
-  }), [connectorEdges, shapeNodes, highlighted, animationPanelOpen, revealStep, isPresent, presentPage, presentThresholdOrder]);
+  }), [connectorEdges, inheritedMasterEdges, shapeNodes, highlighted, animationPanelOpen, revealStep, isPresent, presentPage, presentThresholdOrder]);
 
   function renumberSequence(items: SequenceItem[]) {
     const sequenced = items.filter(i => i.revealOrder !== undefined).sort((a, b) => (a.revealOrder ?? 0) - (b.revealOrder ?? 0));
@@ -1693,6 +1915,48 @@ export function Canvas({
     } as DiagramNode;
   }
 
+  // A pasted shape's `data` starts as a shallow spread of the copied
+  // shape's `data` (see handlePaste) — every nested array/object field
+  // below would otherwise still be the exact same reference as the source
+  // shape's. Every current editor happens to clone-before-mutate today, so
+  // this stays invisible until some future edit path mutates one of these
+  // in place — at which point it'd silently corrupt both the original and
+  // every paste descended from it. Clone here, once, at the one place data
+  // actually fans out (copy → N pastes), rather than in toPersistableShape
+  // (called on every self-save with no aliasing risk, so cloning there
+  // would be pure overhead).
+  function cloneShapeData(data: ShapeNodeData): ShapeNodeData {
+    return {
+      ...data,
+      richText: data.richText?.map(p => ({ ...p, runs: p.runs.map(r => ({ ...r })) })),
+      tableCells: data.tableCells?.map(row => ({ cells: [...row.cells] })),
+      dataBinding: data.dataBinding ? {
+        ...data.dataBinding,
+        rules: data.dataBinding.rules.map(r => ({ ...r, style: { ...r.style } })),
+        fallbackStyle: data.dataBinding.fallbackStyle ? { ...data.dataBinding.fallbackStyle } : undefined,
+      } : undefined,
+      pieSegments: data.pieSegments?.map(s => ({ ...s })),
+      chartData: data.chartData?.map(s => ({ ...s })),
+      customFields: data.customFields?.map(f => ({ ...f })),
+      pathAnchors: data.pathAnchors?.map(a => ({
+        ...a,
+        handleIn: a.handleIn ? { ...a.handleIn } : undefined,
+        handleOut: a.handleOut ? { ...a.handleOut } : undefined,
+      })),
+      pathHoles: data.pathHoles?.map(hole => ({
+        closed: hole.closed,
+        anchors: hole.anchors.map(a => ({
+          ...a,
+          handleIn: a.handleIn ? { ...a.handleIn } : undefined,
+          handleOut: a.handleOut ? { ...a.handleOut } : undefined,
+        })),
+      })),
+      tags: data.tags ? [...data.tags] : undefined,
+      laneLabels: data.laneLabels ? [...data.laneLabels] : undefined,
+      brushPoints: data.brushPoints?.map(p => ({ ...p })),
+    };
+  }
+
   // Keeps a dragged shape (or a dragged multi-selection, as one rigid unit)
   // inside the page it was drawn on. Runs on every drag frame, not just
   // drag-stop, since RF calls onNodesChange continuously while dragging and
@@ -1904,6 +2168,28 @@ export function Canvas({
     return sourceNode ? findPageIdFor(sourceNode) : undefined;
   }
 
+  // Lets an EXISTING connector's ends be dragged to a different shape —
+  // previously there was no reconnection affordance at all, so "copy/paste
+  // an arrow then link it up by dragging its ends" had no path even for an
+  // arrow that was never copied in the first place. React Flow's own
+  // reconnect gesture (drag a connected edge's endpoint handle) needs only
+  // `edgesReconnectable` + this handler; the new endpoint's page is assumed
+  // to match the edge's existing page (reconnecting to a shape on a
+  // different page isn't a supported case — connectors are page-scoped).
+  const onReconnect: OnReconnect = useCallback((oldEdge, newConnection) => {
+    const pageId = findEdgePageId(oldEdge as DiagramEdge);
+    if (!pageId || !newConnection.source || !newConnection.target) return;
+    const updated: DiagramEdge = {
+      ...(oldEdge as DiagramEdge),
+      source: newConnection.source,
+      target: newConnection.target,
+      sourceHandle: newConnection.sourceHandle ?? undefined,
+      targetHandle: newConnection.targetHandle ?? undefined,
+    };
+    setConnectorEdges(prev => prev.map(e => e.id === oldEdge.id ? updated : e));
+    saveConnector(diagramId, pageId, updated);
+  }, [diagramId]);
+
   const onConnect: OnConnect = useCallback((params) => {
     const sourceNode = shapeNodes.find(n => n.id === params.source);
     const pageId = sourceNode ? findPageIdFor(sourceNode) : undefined;
@@ -1925,6 +2211,16 @@ export function Canvas({
     };
     setConnectorEdges(prev => addEdge(edge, prev));
     saveConnector(diagramId, pageId, edge);
+    // Connector creation was one of the explicitly-out-of-scope gaps noted
+    // when undo/redo was first built (see the scope comment near
+    // undoStackRef) — a user whose recent actions included drawing an arrow
+    // would find undo did nothing at that point, reading as "undo only
+    // remembers one step" whenever a connector edit was interleaved with
+    // tracked actions like move/resize.
+    pushHistory({
+      undo: () => { setConnectorEdges(prev => prev.filter(e => e.id !== edge.id)); deleteConnector(diagramId, pageId, edge.id); },
+      redo: () => { setConnectorEdges(prev => addEdge(edge, prev)); saveConnector(diagramId, pageId, edge); },
+    });
   }, [shapeNodes, diagramId, toolDefaults.connector]);
 
   function getPageIdForFlowPoint(flowPoint: { x: number; y: number }): string | undefined {
@@ -2140,6 +2436,7 @@ export function Canvas({
     const startScreen = { x: e.clientX, y: e.clientY };
     const additive = e.shiftKey || e.metaKey || e.ctrlKey;
     const preSelectedIds = additive ? new Set(selectedShapeIds) : new Set<string>();
+    const preSelectedEdgeIds = additive ? new Set(selectedEdges.map(edge => edge.id)) : new Set<string>();
     let dragStarted = false;
 
     // Selection is only computed and committed on mouseup, not on every
@@ -2180,6 +2477,29 @@ export function Canvas({
         shapeNodesRef.current
           .filter(n => n.type === 'shape' || n.type === 'path')
           .map(n => ({ type: 'select' as const, id: n.id, selected: finalSet.has(n.id) })),
+      );
+
+      // Marquee-selecting edges too — previously a drag-select only ever
+      // covered shapes/paths, so there was no way to bulk-select connectors
+      // at all. Approximates each edge's bbox as the union of its two
+      // endpoint shapes' rects (no cheap access to the actual rendered SVG
+      // path's bbox from here) — close enough for "does this edge fall
+      // inside the marquee" given connectors are always short relative to
+      // the shapes they join.
+      const intersectingEdges = new Set<string>();
+      for (const edge of connectorEdges) {
+        const srcRect = getAbsoluteRect(edge.source);
+        const tgtRect = getAbsoluteRect(edge.target);
+        if (!srcRect || !tgtRect) continue;
+        const ex = Math.min(srcRect.x, tgtRect.x);
+        const ey = Math.min(srcRect.y, tgtRect.y);
+        const ex2 = Math.max(srcRect.x + srcRect.width, tgtRect.x + tgtRect.width);
+        const ey2 = Math.max(srcRect.y + srcRect.height, tgtRect.y + tgtRect.height);
+        if (ex < maxX && ex2 > minX && ey < maxY && ey2 > minY) intersectingEdges.add(edge.id);
+      }
+      const finalEdgeSet = new Set([...preSelectedEdgeIds, ...intersectingEdges]);
+      onEdgesChange(
+        connectorEdges.map(edge => ({ type: 'select' as const, id: edge.id, selected: finalEdgeSet.has(edge.id) })),
       );
     }
     window.addEventListener('mousemove', onMove);
@@ -2340,6 +2660,10 @@ export function Canvas({
     };
     setConnectorEdges(prev => addEdge(edge, prev));
     saveConnector(diagramId, pageId, edge);
+    pushHistory({
+      undo: () => { setConnectorEdges(prev => prev.filter(e => e.id !== edge.id)); deleteConnector(diagramId, pageId, edge.id); },
+      redo: () => { setConnectorEdges(prev => addEdge(edge, prev)); saveConnector(diagramId, pageId, edge); },
+    });
     // Sticky — stays active for the next connector.
   }
 
@@ -2967,6 +3291,44 @@ export function Canvas({
     return { x: n.position.x, y: n.position.y, w: n.width ?? n.measured?.width ?? 100, h: n.height ?? n.measured?.height ?? 70 };
   }
 
+  // Multi-select resize: captures every currently-selected top-level shape's
+  // geometry the moment the drag starts (start ref), so handleEnd can later
+  // compute one scale factor from the combined bbox's before/after size and
+  // apply it to each shape relative to that SAME starting bbox's origin —
+  // exactly handleResizeGroup's math (see its own comment), just generalized
+  // from a real group's descendant tree to an ad-hoc multi-selection.
+  const multiSelectResizeStartRef = useRef<{ bbox: { x: number; y: number; w: number; h: number }; shapes: Node[] } | null>(null);
+  function handleMultiSelectResizeStart() {
+    const targets = shapeNodesRef.current.filter(n => n.selected && !n.parentId && !(n.data as ShapeNodeData).locked);
+    if (targets.length < 2) { multiSelectResizeStartRef.current = null; return; }
+    const boxes = targets.map(getBBox);
+    const minX = Math.min(...boxes.map(b => b.x));
+    const minY = Math.min(...boxes.map(b => b.y));
+    const maxX = Math.max(...boxes.map(b => b.x + b.w));
+    const maxY = Math.max(...boxes.map(b => b.y + b.h));
+    multiSelectResizeStartRef.current = { bbox: { x: minX, y: minY, w: maxX - minX, h: maxY - minY }, shapes: targets };
+  }
+  function handleMultiSelectResizeEnd(_e: unknown, params: { x: number; y: number; width: number; height: number }) {
+    const start = multiSelectResizeStartRef.current;
+    multiSelectResizeStartRef.current = null;
+    if (!start || start.bbox.w <= 0 || start.bbox.h <= 0) return;
+    const scaleX = params.width / start.bbox.w;
+    const scaleY = params.height / start.bbox.h;
+    const before = start.shapes.map(n => ({ id: n.id, pageId: (n.data as ShapeNodeData).pageId, node: n as DiagramNode }));
+    const after = start.shapes.map(n => {
+      const bbox = getBBox(n);
+      const position = {
+        x: params.x + (bbox.x - start.bbox.x) * scaleX,
+        y: params.y + (bbox.y - start.bbox.y) * scaleY,
+      };
+      const width = (n.width ?? bbox.w) * scaleX;
+      const height = (n.height ?? bbox.h) * scaleY;
+      return { id: n.id, pageId: (n.data as ShapeNodeData).pageId, node: { ...n, position, width, height } as DiagramNode };
+    });
+    commitShapeUpdates(after);
+    pushHistory({ undo: () => commitShapeUpdates(before), redo: () => commitShapeUpdates(after) });
+  }
+
   function applyZIndex(id: string, zIndex: number) {
     for (const slice of shapesSlices.current.values()) {
       const existing = slice.get(id);
@@ -3165,15 +3527,36 @@ export function Canvas({
       return next;
     });
   }
+  // Renumbers every shape on each affected page to consecutive integers
+  // starting at 0 (targets first, in their prior relative order, then
+  // everything else) rather than just decrementing the targets below the
+  // page's current minimum. The old "minZ - 1" approach had no floor at all
+  // relative to the page frame (zIndex -1) or master-inherited layer
+  // (-0.5) — repeated sends-to-back on a page kept decrementing without
+  // bound, and eventually a shape's zIndex dropped low enough to paint
+  // BEHIND the frame's own opaque background, i.e. the shape silently
+  // disappeared under "the white page." Compressing the whole page's range
+  // on every call means it can never run away, at the cost of persisting
+  // every shape on the page, not just the ones actually sent to back.
   function sendToBack() {
     const targets = selectedShapeIds.filter(id => !isLocked(id));
     if (targets.length === 0) return;
     setShapeNodes(prev => {
-      const before = new Map(prev.filter(n => targets.includes(n.id)).map(n => [n.id, n.zIndex ?? 0]));
-      const minZ = Math.min(0, ...prev.map(n => n.zIndex ?? 0));
-      const next = prev.map(n => targets.includes(n.id) ? { ...n, zIndex: minZ - 1 } : n);
-      persistNodes(next, targets);
-      pushZIndexHistory(before, new Map(targets.map(id => [id, minZ - 1])));
+      const pageIds = new Set(
+        targets.map(id => (prev.find(n => n.id === id)?.data as ShapeNodeData | undefined)?.pageId).filter((p): p is string => !!p),
+      );
+      const zUpdates = new Map<string, number>();
+      for (const pageId of pageIds) {
+        const pageShapes = prev.filter(n => !n.parentId && (n.data as ShapeNodeData).pageId === pageId);
+        const targetsOnPage = pageShapes.filter(n => targets.includes(n.id)).sort((a, b) => (a.zIndex ?? 0) - (b.zIndex ?? 0));
+        const restOnPage = pageShapes.filter(n => !targets.includes(n.id)).sort((a, b) => (a.zIndex ?? 0) - (b.zIndex ?? 0));
+        [...targetsOnPage, ...restOnPage].forEach((n, i) => zUpdates.set(n.id, i));
+      }
+      const before = new Map(prev.filter(n => zUpdates.has(n.id)).map(n => [n.id, n.zIndex ?? 0]));
+      const next = prev.map(n => zUpdates.has(n.id) ? { ...n, zIndex: zUpdates.get(n.id)! } : n);
+      const changedIds = Array.from(zUpdates.keys());
+      persistNodes(next, changedIds);
+      pushZIndexHistory(before, new Map(zUpdates));
       return next;
     });
   }
@@ -3192,6 +3575,25 @@ export function Canvas({
   // Pages never visited this session simply keep showing PageNavigatorRail's
   // existing rough SVG approximation.
   const [pageSnapshots, setPageSnapshots] = useState<Map<string, string>>(new Map());
+  // Which page ids are mid-(re)generation right now — purely a small corner
+  // spinner in PageNavigatorRail, so a stale-looking thumbnail doesn't read
+  // as final while a fresher one is on its way.
+  const [generatingSnapshotPageIds, setGeneratingSnapshotPageIds] = useState<Set<string>>(new Set());
+  // Seeds pageSnapshots from each page's own PERSISTED thumbnailUrl (Storage,
+  // survives reload/other sessions) the first time that page is seen, so a
+  // page nobody has visited yet this session still shows a real thumbnail
+  // instead of the rough SVG fallback — the in-memory snapshot above still
+  // takes priority once the active page actually gets (re)rendered.
+  useEffect(() => {
+    setPageSnapshots(prev => {
+      let changed = false;
+      const next = new Map(prev);
+      for (const page of pages) {
+        if (!next.has(page.id) && page.thumbnailUrl) { next.set(page.id, page.thumbnailUrl); changed = true; }
+      }
+      return changed ? next : prev;
+    });
+  }, [pages]);
   useEffect(() => {
     if (isPresent || !activePageId) return;
     const dims = pageDimensions.get(activePageId);
@@ -3199,19 +3601,46 @@ export function Canvas({
     if (!dims || origin === undefined) return;
     const timer = setTimeout(() => {
       const scale = Math.min(THUMB_MAX_WIDTH / dims.width, THUMB_MAX_HEIGHT / dims.height);
+      setGeneratingSnapshotPageIds(prev => new Set(prev).add(activePageId));
       exportPageAsImage({ x: 0, y: origin, width: dims.width, height: dims.height }, 'png', scale)
-        .then(dataUrl => setPageSnapshots(prev => new Map(prev).set(activePageId, dataUrl)))
-        .catch(() => {});
+        .then(async dataUrl => {
+          setPageSnapshots(prev => new Map(prev).set(activePageId, dataUrl));
+          const url = await uploadThumbnail(diagramId, dataUrl, 'pageThumbnails');
+          await updatePage(diagramId, activePageId, { thumbnailUrl: url, thumbnailUpdatedAt: Date.now() });
+        })
+        .catch(() => {})
+        .finally(() => setGeneratingSnapshotPageIds(prev => { const next = new Set(prev); next.delete(activePageId); return next; }));
     }, 1500);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activePageId, shapeNodes, pageDimensions, pageOrigins, isPresent]);
+
+  // A cover thumbnail can only be freshly rendered for the currently ACTIVE
+  // page (onlyRenderVisibleElements keeps only that page's shapes mounted —
+  // see the comment above); for any other page this reuses whatever
+  // snapshot/persisted thumbnail already exists for it rather than forcing
+  // a page switch just to set a cover.
+  async function handleSetCoverPage(pageId: string) {
+    const existing = pageSnapshots.get(pageId) ?? pages.find(p => p.id === pageId)?.thumbnailUrl;
+    const url = existing?.startsWith('data:') ? await uploadThumbnail(diagramId, existing, 'coverThumbnails') : existing;
+    await setCoverPage(diagramId, pageId, url);
+  }
 
   async function handleDuplicatePage(pageId: string) {
     const sourcePage = pages.find(p => p.id === pageId);
     if (!sourcePage) return;
     const newPage = await duplicatePage(diagramId, sourcePage, pages);
     fitToPage(newPage.id, { duration: 300 });
+  }
+
+  // Clones a REGULAR page as a starting point for a new master page —
+  // distinct from handleDuplicatePage, which always stays within the source
+  // page's own kind (a master duplicates into another master, a regular
+  // page into another regular page). Only offered for non-master pages.
+  async function handleCloneIntoMasters(pageId: string) {
+    const sourcePage = regularPages.find(p => p.id === pageId);
+    if (!sourcePage) return;
+    await duplicatePage(diagramId, sourcePage, masterPages, true);
   }
 
   // In-memory clipboard (a ref, not the OS Clipboard API — this is a
@@ -3283,17 +3712,23 @@ export function Canvas({
     const destPageId = activePageId ?? clip.sourcePageId;
     const destOrigin = pageOrigins.get(destPageId) ?? 0;
     const srcOrigin = pageOrigins.get(clip.sourcePageId) ?? 0;
-    // A small fixed offset keeps repeated pastes from stacking exactly on
-    // top of each other; the page-origin delta re-bases Y when pasting onto
-    // a different page than the shapes were copied from.
-    const PASTE_OFFSET = 24;
+    const destDims = pageDimensions.get(destPageId);
+    const srcDims = pageDimensions.get(clip.sourcePageId);
+    // Pasting onto a different page than the one shapes were copied from,
+    // when that destination page is exactly the same format, lands shapes
+    // in the exact same spot they were copied from rather than nudging them
+    // — matches "paste in place" behavior for a same-size target. Any other
+    // case (same page, or a differently-sized page) keeps the small fixed
+    // offset so repeated pastes don't stack exactly on top of each other.
+    const sameFormatDifferentPage = destPageId !== clip.sourcePageId && !!srcDims && !!destDims
+      && srcDims.width === destDims.width && srcDims.height === destDims.height;
+    const PASTE_OFFSET = sameFormatDifferentPage ? 0 : 24;
     const dx = PASTE_OFFSET;
     const dy = (destOrigin - srcOrigin) + PASTE_OFFSET;
 
     const idMap = new Map<string, string>();
     for (const s of clip.shapes) idMap.set(s.id, crypto.randomUUID());
 
-    const destDims = pageDimensions.get(destPageId);
     // Pushes the whole pasted set above everything already on the
     // destination page while preserving their relative stacking order among
     // themselves (same reasoning as nextZIndexForPage — a pasted copy should
@@ -3305,12 +3740,17 @@ export function Canvas({
       let position = isTopLevel ? { x: s.position.x + dx, y: s.position.y + dy } : s.position;
       // Clamp only top-level pasted shapes to the destination page immediately —
       // matches drag clamping, and grouped children stay in their parent's
-      // already-valid local space.
+      // already-valid local space. A shape that's actually larger than the
+      // destination page on an axis has no valid clamped position on that
+      // axis — snapping it to the page origin used to discard the offset
+      // entirely, making a large pasted group land exactly on top of the
+      // still-visible original (read as "pasted twice"). Leave that axis
+      // un-clamped instead of forcing it to the corner.
       if (isTopLevel && destDims) {
         const w = s.width ?? 100, h = s.height ?? 100;
         position = {
-          x: w >= destDims.width ? PAGE_X : Math.min(Math.max(position.x, PAGE_X), PAGE_X + destDims.width - w),
-          y: h >= destDims.height ? destOrigin : Math.min(Math.max(position.y, destOrigin), destOrigin + destDims.height - h),
+          x: w >= destDims.width ? position.x : Math.min(Math.max(position.x, PAGE_X), PAGE_X + destDims.width - w),
+          y: h >= destDims.height ? position.y : Math.min(Math.max(position.y, destOrigin), destOrigin + destDims.height - h),
         };
       }
       return {
@@ -3320,7 +3760,7 @@ export function Canvas({
         extent: newParentId ? ('parent' as const) : undefined,
         position,
         zIndex: (s.zIndex ?? 0) + zIndexBase,
-        data: { ...s.data, pageId: destPageId },
+        data: cloneShapeData({ ...s.data, pageId: destPageId }),
       };
     });
 
@@ -3340,6 +3780,28 @@ export function Canvas({
       ...newShapes.map(s => ({ ...s, selected: true })),
     ]);
     setConnectorEdges(prev => [...prev, ...newEdges]);
+
+    // Paste/duplicate was another explicitly-out-of-scope gap from when
+    // undo/redo was first built — one combined history entry for the whole
+    // batch (all pasted shapes + edges), matching the "batch operation, one
+    // history entry" convention bringToFront/sendToBack already use.
+    pushHistory({
+      undo: () => {
+        for (const s of newShapes) deleteShape(diagramId, destPageId, s.id);
+        for (const e of newEdges) deleteConnector(diagramId, destPageId, e.id);
+        setShapeNodes(prev => prev.filter(n => !newShapes.some(s => s.id === n.id)));
+        setConnectorEdges(prev => prev.filter(e => !newEdges.some(ne => ne.id === e.id)));
+      },
+      redo: () => {
+        for (const s of topoSortByParent(newShapes)) saveShape(diagramId, destPageId, s);
+        for (const e of newEdges) saveConnector(diagramId, destPageId, e);
+        setShapeNodes(prev => [
+          ...prev.map(n => n.selected ? { ...n, selected: false } : n),
+          ...newShapes.map(s => ({ ...s, selected: true })),
+        ]);
+        setConnectorEdges(prev => [...prev, ...newEdges]);
+      },
+    });
   }
 
   useEffect(() => {
@@ -3349,7 +3811,10 @@ export function Canvas({
       if (!(e.metaKey || e.ctrlKey)) return;
       if (e.key === 'c') { e.preventDefault(); handleCopy(); }
       else if (e.key === 'x') { e.preventDefault(); handleCut(); }
-      else if (e.key === 'v') { e.preventDefault(); void handlePaste(); }
+      // Ctrl/Cmd+V itself is handled by the native `paste` listener below,
+      // not here — that's the only place with access to clipboardData, so
+      // an OS-clipboard image can be told apart from the app's own internal
+      // shape clipboard before deciding which paste path to run.
       else if (e.key === 'd') { e.preventDefault(); handleCopy(); void handlePaste(); }
       else if (e.key.toLowerCase() === 'z' && e.shiftKey) { e.preventDefault(); redo(); }
       else if (e.key.toLowerCase() === 'z') { e.preventDefault(); undo(); }
@@ -3358,6 +3823,31 @@ export function Canvas({
     return () => window.removeEventListener('keydown', onKeyDown);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isPresent, selectedShapeIds, selectedGroup, shapeNodes, connectorEdges, activePageId, pageOrigins, pageDimensions, diagramId]);
+
+  // A genuine OS-clipboard paste (e.g. a screenshot copied outside the app)
+  // previously did nothing at all — only the app's own internal shape
+  // clipboard ever responded to Ctrl+V. Checks for an image first and, if
+  // found, reuses the exact same upload pipeline the toolbar's image-upload
+  // button already goes through; falls through to the internal shape
+  // clipboard when the OS clipboard carries no image.
+  useEffect(() => {
+    function onPaste(e: ClipboardEvent) {
+      if (isTypingTarget(e.target) || isPresent) return;
+      const items = e.clipboardData?.items;
+      const imageItem = items && Array.from(items).find(item => item.type.startsWith('image/'));
+      const file = imageItem?.getAsFile();
+      if (file) {
+        e.preventDefault();
+        void handleUploadMedia(file);
+        return;
+      }
+      e.preventDefault();
+      void handlePaste();
+    }
+    document.addEventListener('paste', onPaste);
+    return () => document.removeEventListener('paste', onPaste);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPresent, activePageId, pageOrigins, pageDimensions, diagramId]);
 
   const [guides, setGuides] = useState<GuideLines | null>(null);
   const [dataPanelOpen, setDataPanelOpen] = useState(false);
@@ -3372,6 +3862,16 @@ export function Canvas({
   const [isExporting, setIsExporting] = useState(false);
   const [layersPanelOpen, setLayersPanelOpen] = useState(false);
   const [pageSettingsPanelOpen, setPageSettingsPanelOpen] = useState(false);
+  // Shape selection is driven by React Flow's own node-click handling, not
+  // the shared selectTool() dispatcher every OTHER right-side panel already
+  // mutually excludes itself through — so without this, selecting a page
+  // (opening Page Settings) then clicking a shape left BOTH panels open at
+  // once, overlapping. Closing Page Settings here (paired with the
+  // `!pageSettingsPanelOpen` guard on ShapePropertiesPanel's own render
+  // condition) covers the other direction too.
+  useEffect(() => {
+    if (singleSelectedShape) setPageSettingsPanelOpen(false);
+  }, [singleSelectedShape?.id]);
   const [gridRulersPanelOpen, setGridRulersPanelOpen] = useState(false);
   const [tagsPanelOpen, setTagsPanelOpen] = useState(false);
 
@@ -3615,6 +4115,7 @@ export function Canvas({
         onMouseDown={() => { if (isSpaceDown) setIsSpaceDragging(true); }}
         onMouseUp={() => setIsSpaceDragging(false)}
       >
+        <ArrowMarkerDefs />
         <ReactFlow
           nodes={nodes}
           edges={edges}
@@ -3624,6 +4125,8 @@ export function Canvas({
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
+          edgesReconnectable={!isPresent}
+          onReconnect={onReconnect}
           onNodeClick={handleNodeClick}
           onPaneClick={() => setHighlighted(null)}
           onNodeDrag={isPresent ? undefined : onNodeDrag}
@@ -3666,8 +4169,17 @@ export function Canvas({
           multiSelectionKeyCode={['Shift', 'Meta', 'Control']}
           selectNodesOnDrag={false}
           nodesDraggable={!isPresent && !toolActive && !isSpaceDown}
-          nodesConnectable={!isPresent && !toolActive}
-          elementsSelectable={!isPresent && !toolActive}
+          nodesConnectable={!isPresent && !toolActive && !isSpaceDown}
+          // Dropped `&& !toolActive` here (unlike the two props above) so
+          // EDGES stay globally selectable even while a tool like the
+          // connector/pen tool is active — clicking an existing connector to
+          // select it should still work during connect-mode, only clicking a
+          // SHAPE is meant to draw/connect instead of select (see the
+          // per-node `selectable` override on shape nodes above). Also gated
+          // on isSpaceDown, matching nodesDraggable/nodesConnectable, so
+          // holding Space to grab-pan doesn't leave shapes selectable/
+          // connectable mid-pan.
+          elementsSelectable={!isPresent && !isSpaceDown}
           // Suppressed while Direct Selection is active — Delete/Backspace
           // means "delete the focused anchor point" there (a dedicated
           // keydown effect above), not "delete the whole path"; letting both
@@ -3816,6 +4328,24 @@ export function Canvas({
         </div>
       )}
 
+      {/* A commenter has no full Toolbar (hidden along with every other
+          isPresent-gated bit of editing chrome) — this is their only way to
+          invoke the same click-to-place-a-pin flow the full toolbar's own
+          Comment button already drives via selectTool. */}
+      {mode === 'comment' && (
+        <div style={{ position: 'absolute', top: 12, left: '50%', transform: 'translateX(-50%)', zIndex: 20 }}>
+          <Tooltip title="Add a comment — click the canvas to drop a pin">
+            <Button
+              type={placingComment ? 'primary' : 'default'}
+              icon={<IconComment />}
+              onClick={() => selectTool('comment')}
+            >
+              Comment
+            </Button>
+          </Tooltip>
+        </div>
+      )}
+
       {!isPresent && toolbarSlot && createPortal(
         <Toolbar
           onUndo={undo}
@@ -3907,11 +4437,15 @@ export function Canvas({
           pages={pages} pageOrigins={pageOrigins} pageDimensions={pageDimensions}
           shapeNodes={shapeNodes}
           pageSnapshots={pageSnapshots}
+          generatingSnapshotPageIds={generatingSnapshotPageIds}
           onSelectPage={pageId => fitToPage(pageId, { duration: 300 })}
           onInsertPageAt={afterOrder => (viewMode === 'masters' ? onInsertMasterAt : onInsertPageAt)?.(afterOrder)}
           onReorderPages={handleReorderPagesWithShapes}
           onOpenPageSettings={() => selectTool('pageSettings')}
           onDuplicatePage={handleDuplicatePage}
+          onCloneIntoMasters={viewMode === 'masters' ? undefined : handleCloneIntoMasters}
+          onSetCoverPage={handleSetCoverPage}
+          isMastersMode={viewMode === 'masters'}
         />
       )}
       {!isPresent && pageSettingsPanelOpen && activePageId && (() => {
@@ -3965,7 +4499,7 @@ export function Canvas({
         </div>
       )}
 
-      {!isPresent && singleSelectedShape && !gridRulersPanelOpen && !tagsPanelOpen && (
+      {!isPresent && singleSelectedShape && !gridRulersPanelOpen && !tagsPanelOpen && !pageSettingsPanelOpen && (
         <ShapePropertiesPanel
           node={singleSelectedShape}
           diagramId={diagramId}
@@ -4000,7 +4534,7 @@ export function Canvas({
         />
       )}
 
-      {!isPresent && (draftComment || activeCommentId) && (
+      {commentsEnabled && (draftComment || activeCommentId) && (
         <CommentThreadPanel
           comment={activeCommentId ? findComment(activeCommentId) ?? null : null}
           draft={draftComment}
@@ -4095,40 +4629,53 @@ export function Canvas({
         </div>
       )}
 
-      {singleSelectedEdge && (
-        <div style={{
-          // Sits below the main toolbar (also top-center-docked now that
-          // it's a horizontal bar) rather than sharing its exact position.
-          position: 'absolute', top: 64, left: '50%', transform: 'translateX(-50%)', zIndex: 20,
-          background: '#fff', borderRadius: 8, padding: 6, display: 'flex', alignItems: 'center', gap: 8,
-          boxShadow: '0 2px 8px rgba(0,0,0,0.12)',
-        }}>
-          <Select
-            size="small" style={{ width: 100 }}
-            value={(singleSelectedEdge.data as SmartEdgeData | undefined)?.routing ?? 'orthogonal'}
-            options={[{ value: 'orthogonal', label: 'Elbow' }, { value: 'curved', label: 'Curved' }, { value: 'straight', label: 'Straight' }]}
-            onChange={v => onEdgeCommit(singleSelectedEdge.id, { routing: v })}
-          />
-          <Select
-            size="small" style={{ width: 110 }}
-            value={(singleSelectedEdge.data as SmartEdgeData | undefined)?.flowAnimation ?? 'none'}
-            options={[{ value: 'none', label: 'No animation' }, { value: 'dash', label: 'Flow (dash)' }, { value: 'dot', label: 'Flow (dot)' }]}
-            onChange={v => onEdgeCommit(singleSelectedEdge.id, { flowAnimation: v })}
-          />
-          <Select
-            size="small" style={{ width: 110 }}
-            value={(singleSelectedEdge.data as SmartEdgeData | undefined)?.startArrow ?? 'none'}
-            options={[{ value: 'none', label: 'Start: None' }, { value: 'arrow', label: 'Start: Arrow' }, { value: 'arrowClosed', label: 'Start: Filled' }]}
-            onChange={v => onEdgeCommit(singleSelectedEdge.id, { startArrow: v })}
-          />
-          <Select
-            size="small" style={{ width: 110 }}
-            value={(singleSelectedEdge.data as SmartEdgeData | undefined)?.endArrow ?? 'arrowClosed'}
-            options={[{ value: 'none', label: 'End: None' }, { value: 'arrow', label: 'End: Arrow' }, { value: 'arrowClosed', label: 'End: Filled' }]}
-            onChange={v => onEdgeCommit(singleSelectedEdge.id, { endArrow: v })}
-          />
-        </div>
-      )}
+      {selectedEdges.length > 0 && (() => {
+        // With 2+ edges selected, apply a change to every one of them (same
+        // "loop + per-item Firestore write" convention bringToFront/
+        // sendToBack already use for bulk shape operations) — the displayed
+        // value is just the first selected edge's current value, not a true
+        // mixed-state indicator, matching this file's existing bar-minimum
+        // approach to bulk editing.
+        const displayEdge = singleSelectedEdge ?? selectedEdges[0];
+        const displayData = displayEdge.data as SmartEdgeData | undefined;
+        function commitToAll(patch: Partial<SmartEdgeData>) {
+          for (const edge of selectedEdges) onEdgeCommit(edge.id, patch);
+        }
+        return (
+          <div style={{
+            // Sits below the main toolbar (also top-center-docked now that
+            // it's a horizontal bar) rather than sharing its exact position.
+            position: 'absolute', top: 64, left: '50%', transform: 'translateX(-50%)', zIndex: 20,
+            background: '#fff', borderRadius: 8, padding: 6, display: 'flex', alignItems: 'center', gap: 8,
+            boxShadow: '0 2px 8px rgba(0,0,0,0.12)',
+          }}>
+            <Select
+              size="small" style={{ width: 100 }}
+              value={displayData?.routing ?? 'orthogonal'}
+              options={[{ value: 'orthogonal', label: 'Elbow' }, { value: 'curved', label: 'Curved' }, { value: 'straight', label: 'Straight' }]}
+              onChange={v => commitToAll({ routing: v })}
+            />
+            <Select
+              size="small" style={{ width: 110 }}
+              value={displayData?.flowAnimation ?? 'none'}
+              options={[{ value: 'none', label: 'No animation' }, { value: 'dash', label: 'Flow (dash)' }, { value: 'dot', label: 'Flow (dot)' }]}
+              onChange={v => commitToAll({ flowAnimation: v })}
+            />
+            <Select
+              size="small" style={{ width: 130 }}
+              value={displayData?.startArrow ?? 'none'}
+              options={ARROW_MARKER_OPTIONS.map(o => ({ value: o.value, label: `Start: ${o.label}` }))}
+              onChange={v => commitToAll({ startArrow: v })}
+            />
+            <Select
+              size="small" style={{ width: 130 }}
+              value={displayData?.endArrow ?? 'arrowClosed'}
+              options={ARROW_MARKER_OPTIONS.map(o => ({ value: o.value, label: `End: ${o.label}` }))}
+              onChange={v => commitToAll({ endArrow: v })}
+            />
+          </div>
+        );
+      })()}
     </div>
   );
 }

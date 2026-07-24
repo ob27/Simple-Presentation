@@ -1,4 +1,4 @@
-import { memo, useState, useEffect } from 'react';
+import { memo, useState, useEffect, useCallback } from 'react';
 import { NodeResizer, useReactFlow, type NodeProps } from '@xyflow/react';
 import { IconLink } from '../../icons';
 import type { ShapeNodeData, PieSegment, ChartDataPoint } from '../../../types/shapes';
@@ -23,7 +23,7 @@ import { TableGrid } from './TableGrid';
 // away to invisible slivers at the few points where the polygon touches the
 // original box edge. These render as an SVG <polygon> instead (below), which
 // can carry a real fill AND stroke along its actual visible edge.
-const POLYGON_KINDS = new Set<ShapeNodeData['kind']>(['diamond', 'triangle', 'parallelogram', 'hexagon', 'cross', 'star']);
+const POLYGON_KINDS = new Set<ShapeNodeData['kind']>(['diamond', 'triangle', 'parallelogram', 'hexagon', 'cross', 'star', 'trapezoid', 'arrowShape']);
 
 const POLYGON_POINTS: Record<string, string> = {
   diamond: '50,0 100,50 50,100 0,50',
@@ -32,16 +32,34 @@ const POLYGON_POINTS: Record<string, string> = {
   hexagon: '25,0 75,0 100,50 75,100 25,100 0,50',
   cross: '35,0 65,0 65,35 100,35 100,65 65,65 65,100 35,100 35,65 0,65 0,35 35,35',
   star: '50,0 61,35 98,35 68,57 79,91 50,70 21,91 32,57 2,35 39,35',
+  trapezoid: '20,0 80,0 100,100 0,100',
+  arrowShape: '0,25 60,25 60,0 100,50 60,100 60,75 0,75',
 };
 
 // Kinds whose outline needs a curve, not just straight polygon edges — drawn
 // as a single SVG <path> instead of a <polygon>, same rationale as above.
-const CURVED_KINDS = new Set<ShapeNodeData['kind']>(['cylinder', 'cloud', 'document']);
+const CURVED_KINDS = new Set<ShapeNodeData['kind']>(['cylinder', 'cloud', 'document', 'halfCircle', 'revisionCloud']);
 
 const CURVED_PATHS: Record<string, string> = {
   cylinder: 'M0,10 C0,4 100,4 100,10 L100,90 C100,96 0,96 0,90 Z',
-  cloud: 'M22,82 C6,82 6,54 22,50 C22,20 56,16 68,34 C90,20 108,40 96,58 C114,60 110,82 90,82 Z',
+  // Renormalized to fit exactly within the 0-100 viewBox — the original path
+  // (control points reaching x=108/114) exceeded its own declared bounding
+  // box, so the rightmost "bump" was silently clipped by every renderer that
+  // assumes viewBox 0-100 == the node's full width/height (resize handles,
+  // hit-testing, thumbnails, ...). Same proportions, just rescaled to fit.
+  cloud: 'M14.8,100 C0,100 0,57.6 14.8,51.5 C14.8,6.1 46.3,0 57.4,27.3 C77.8,6.1 94.4,36.4 83.3,57.6 C100,66.7 96.3,100 77.8,100 Z',
   document: 'M0,0 L100,0 L100,82 L50,100 L0,82 Z',
+  // A flat diameter along the bottom, full-height dome — spans the whole
+  // bounding box (not a fixed-height half like a print icon might use) so
+  // it scales the same way every other shape's independent width/height do.
+  halfCircle: 'M0,100 A50,100 0 0 1 100,100 Z',
+  // The scalloped "engineering revision cloud" convention (distinct from
+  // the plain 'cloud' shape's smooth 4-5-lobe silhouette above) — 14
+  // uniform semicircular bumps evenly spaced around an ellipse, each arc's
+  // radius computed to exactly match its own chord length so the path
+  // closes with no gaps or overlaps. Generated once (not authored by hand)
+  // to keep every bump geometrically consistent.
+  revisionCloud: 'M92.0,50.0 A8.5,8.5 0 0 1 87.8,66.5 A8.8,8.8 0 0 1 76.2,79.7 A9.2,9.2 0 0 1 59.3,87.0 A9.3,9.3 0 0 1 40.7,87.0 A9.2,9.2 0 0 1 23.8,79.7 A8.8,8.8 0 0 1 12.2,66.5 A8.5,8.5 0 0 1 8.0,50.0 A8.5,8.5 0 0 1 12.2,33.5 A8.8,8.8 0 0 1 23.8,20.3 A9.2,9.2 0 0 1 40.7,13.0 A9.3,9.3 0 0 1 59.3,13.0 A9.2,9.2 0 0 1 76.2,20.3 A8.8,8.8 0 0 1 87.8,33.5 A8.5,8.5 0 0 1 92.0,50.0 Z',
 };
 
 // A stray ellipse companion path for the cylinder's top rim — drawn as a
@@ -389,7 +407,13 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
   const containerTheme = shapeData.containerTheme ?? 'plain';
   const isPolygon = POLYGON_KINDS.has(shapeData.kind);
   const locked = !!shapeData.locked;
-  const shiftHeld = useShiftHeld(!!selected && !locked);
+  const { shiftHeldRef } = useShiftHeld(!!selected && !locked);
+  // Snapshotted from shiftHeldRef.current at the exact moment a resize
+  // starts, then held fixed for the rest of that drag — see useShiftHeld's
+  // own comment for why binding the LIVE value directly caused long/thin
+  // shapes to visibly jump mid-resize.
+  const [resizeShiftLock, setResizeShiftLock] = useState(false);
+  const handleResizeStart = useCallback(() => setResizeShiftLock(shiftHeldRef.current), [shiftHeldRef]);
   const effect = shapeData.effect ?? (isStickyNote ? 'shadow' : 'none');
   const effectShadow = effectBoxShadow(effect);
   // "float"/"glow" are CSS animations (see index.css), not static values — a
@@ -451,7 +475,8 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
       onMouseDown={handleMouseDown}
     >
       <NodeResizer
-        isVisible={selected && !locked} minWidth={24} minHeight={24} keepAspectRatio={shiftHeld}
+        isVisible={selected && !locked} minWidth={24} minHeight={24} keepAspectRatio={resizeShiftLock}
+        onResizeStart={handleResizeStart}
         // zIndex keeps these above the shape's own content div, which sits
         // later in the DOM and would otherwise win the default DOM-order
         // stacking at any point along the border it fully covers (only the
@@ -460,7 +485,7 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
         lineStyle={{ borderColor: '#1677ff', zIndex: 10 }}
         handleStyle={{ width: 8, height: 8, borderRadius: 2, zIndex: 10 }}
       />
-      {selected && !locked && <EdgeResizeHandles minWidth={24} minHeight={24} keepAspectRatio={shiftHeld} />}
+      {selected && !locked && <EdgeResizeHandles minWidth={24} minHeight={24} keepAspectRatio={resizeShiftLock} onResizeStart={handleResizeStart} />}
 
       {selected && !locked && <RotateHandle onMouseDown={onRotateStart} />}
 
@@ -777,8 +802,11 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
               onKeyDown={e => { if (e.key === 'Enter') commitLabel(); if (e.key === 'Escape') setEditing(false); }}
               style={{
                 width: '100%', textAlign: 'center', border: 'none', outline: 'none',
-                background: 'transparent', fontFamily: 'inherit',
-                fontSize: 13,
+                background: 'transparent',
+                fontFamily: shapeData.fontFamily ?? (isStickyNote ? "'Segoe Print', 'Bradley Hand', cursive" : 'inherit'),
+                fontSize: shapeData.fontSize ?? 13,
+                fontWeight: shapeData.fontWeight ?? 'normal',
+                fontStyle: shapeData.fontStyle ?? 'normal',
               }}
             />
           ) : isText ? (
@@ -791,8 +819,12 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
           ) : (
             <span style={{
               textAlign: 'center', wordBreak: 'break-word', userSelect: 'none',
-              fontFamily: isStickyNote ? "'Segoe Print', 'Bradley Hand', cursive" : 'inherit',
-              fontSize: 13, color: '#1a1a2e',
+              fontFamily: shapeData.fontFamily ?? (isStickyNote ? "'Segoe Print', 'Bradley Hand', cursive" : 'inherit'),
+              fontSize: shapeData.fontSize ?? 13,
+              fontWeight: shapeData.fontWeight ?? 'normal',
+              fontStyle: shapeData.fontStyle ?? 'normal',
+              textDecoration: shapeData.textDecoration ?? 'none',
+              color: shapeData.fontColor ?? '#1a1a2e',
             }}>
               {shapeData.label}
             </span>

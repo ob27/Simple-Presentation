@@ -1,6 +1,7 @@
 import { useState, Fragment } from 'react';
 import { Tooltip, Button, Dropdown } from 'antd';
 import { IconAdd, IconDuplicate } from '../icons';
+import { LoadingOutlined } from '@ant-design/icons';
 import {
   DndContext, PointerSensor, KeyboardSensor, useSensor, useSensors, closestCenter,
   type DragEndEvent,
@@ -23,11 +24,20 @@ interface Props {
   // bandwidth/storage. Pages not yet in this map fall back to the rough
   // ThumbnailShape SVG approximation below.
   pageSnapshots: Map<string, string>;
+  // Page ids whose thumbnail snapshot is currently (re)generating — shows a
+  // small corner spinner instead of implying the visible thumbnail is final.
+  generatingSnapshotPageIds?: Set<string>;
   onSelectPage: (pageId: string) => void;
   onInsertPageAt: (afterOrder: number) => void;
   onReorderPages: (pages: DiagramPage[]) => void;
   onOpenPageSettings: (pageId: string) => void;
   onDuplicatePage: (pageId: string) => void;
+  // Only offered on regular (non-master) pages — clones the page as a new
+  // master, following its own destination-list order-bump rather than the
+  // source page's.
+  onCloneIntoMasters?: (pageId: string) => void;
+  onSetCoverPage?: (pageId: string) => void;
+  isMastersMode?: boolean;
 }
 
 export const THUMB_MAX_WIDTH = 132;
@@ -46,7 +56,11 @@ export const THUMB_MAX_HEIGHT = 132;
 // based on its own viewMode, so master pages get full thumbnails, drag-
 // reorder, insert-at-position, and open into the same PageSettingsPanel as
 // any other page, with zero separate code path.
-export function PageNavigatorRail({ pages, pageOrigins, pageDimensions, shapeNodes, pageSnapshots, onSelectPage, onInsertPageAt, onReorderPages, onOpenPageSettings, onDuplicatePage }: Props) {
+export function PageNavigatorRail({
+  pages, pageOrigins, pageDimensions, shapeNodes, pageSnapshots, generatingSnapshotPageIds,
+  onSelectPage, onInsertPageAt, onReorderPages, onOpenPageSettings, onDuplicatePage,
+  onCloneIntoMasters, onSetCoverPage, isMastersMode,
+}: Props) {
   const activePageId = useActivePageId(pages, pageOrigins, pageDimensions);
 
   const sensors = useSensors(
@@ -70,6 +84,15 @@ export function PageNavigatorRail({ pages, pageOrigins, pageDimensions, shapeNod
       display: 'flex', flexDirection: 'column', padding: '4px 8px',
       overflowY: 'auto',
     }}>
+      {isMastersMode && (
+        <Button
+          size="small" icon={<IconAdd style={{ fontSize: 10 }} />}
+          onClick={() => onInsertPageAt(pages.length > 0 ? Math.max(...pages.map(p => p.order)) : -1)}
+          style={{ marginBottom: 8, flexShrink: 0 }}
+        >
+          New Master Page
+        </Button>
+      )}
       <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
         <SortableContext items={pages.map(p => p.id)} strategy={verticalListSortingStrategy}>
           <PageGap afterOrder={-1} onInsert={onInsertPageAt} />
@@ -87,9 +110,12 @@ export function PageNavigatorRail({ pages, pageOrigins, pageDimensions, shapeNod
                   page={page} index={i} activePageId={activePageId}
                   thumbW={thumbW} thumbH={thumbH} dims={dims} origin={origin} pageShapes={pageShapes}
                   snapshot={pageSnapshots.get(page.id)}
+                  generating={generatingSnapshotPageIds?.has(page.id) ?? false}
                   onSelectPage={onSelectPage}
                   onOpenPageSettings={onOpenPageSettings}
                   onDuplicatePage={onDuplicatePage}
+                  onCloneIntoMasters={!isMastersMode ? onCloneIntoMasters : undefined}
+                  onSetCoverPage={onSetCoverPage}
                 />
                 <PageGap afterOrder={page.order} onInsert={onInsertPageAt} />
               </Fragment>
@@ -134,7 +160,8 @@ function PageGap({ afterOrder, onInsert }: { afterOrder: number; onInsert: (afte
 }
 
 function SortablePageThumb({
-  page, index, activePageId, thumbW, thumbH, dims, origin, pageShapes, snapshot, onSelectPage, onOpenPageSettings, onDuplicatePage,
+  page, index, activePageId, thumbW, thumbH, dims, origin, pageShapes, snapshot, generating,
+  onSelectPage, onOpenPageSettings, onDuplicatePage, onCloneIntoMasters, onSetCoverPage,
 }: {
   page: DiagramPage;
   index: number;
@@ -145,12 +172,21 @@ function SortablePageThumb({
   origin: number;
   pageShapes: Node[];
   snapshot: string | undefined;
+  generating: boolean;
   onSelectPage: (pageId: string) => void;
   onOpenPageSettings: (pageId: string) => void;
   onDuplicatePage: (pageId: string) => void;
+  onCloneIntoMasters?: (pageId: string) => void;
+  onSetCoverPage?: (pageId: string) => void;
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: page.id });
   const [contextMenuOpen, setContextMenuOpen] = useState(false);
+
+  const menuItems = [
+    { key: 'duplicate', icon: <IconDuplicate />, label: 'Duplicate page' },
+    ...(onCloneIntoMasters ? [{ key: 'cloneIntoMasters', icon: <IconAdd />, label: 'Clone into Master Pages' }] : []),
+    ...(onSetCoverPage ? [{ key: 'setCover', icon: <IconAdd />, label: 'Set as cover' }] : []),
+  ];
 
   return (
     <div
@@ -168,8 +204,12 @@ function SortablePageThumb({
         trigger={['contextMenu']}
         onOpenChange={setContextMenuOpen}
         menu={{
-          items: [{ key: 'duplicate', icon: <IconDuplicate />, label: 'Duplicate page' }],
-          onClick: ({ key }) => { if (key === 'duplicate') onDuplicatePage(page.id); },
+          items: menuItems,
+          onClick: ({ key }) => {
+            if (key === 'duplicate') onDuplicatePage(page.id);
+            else if (key === 'cloneIntoMasters') onCloneIntoMasters?.(page.id);
+            else if (key === 'setCover') onSetCoverPage?.(page.id);
+          },
         }}
       >
         {/* `open={false}` while the context menu is up — otherwise the
@@ -197,6 +237,14 @@ function SortablePageThumb({
                     <ThumbnailShape key={n.id} node={n} pageX={PAGE_X} pageOrigin={origin} />
                   ))}
             </svg>
+            {generating && (
+              <LoadingOutlined
+                style={{
+                  position: 'absolute', top: 3, right: 3, fontSize: 11, color: '#1677ff',
+                  background: 'rgba(255,255,255,0.85)', borderRadius: '50%', padding: 2,
+                }}
+              />
+            )}
           </div>
         </Tooltip>
       </Dropdown>

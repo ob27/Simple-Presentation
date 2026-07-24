@@ -3,7 +3,14 @@ import type { ShapeLink } from './links';
 
 export type EdgeRouting = 'orthogonal' | 'curved' | 'straight';
 export type FlowAnimation = 'none' | 'dash' | 'dot';
-export type ArrowStyle = 'none' | 'arrow' | 'arrowClosed';
+// 'arrow'/'arrowClosed' map straight to React Flow's own MarkerType enum
+// (see arrowMarker() in Canvas.tsx); everything after them needs a custom
+// SVG <marker> def (RF's enum only covers those two) — diamond/diamondFilled
+// for UML aggregation/composition, triangleOpen for UML generalization,
+// circle/circleFilled for DFD/ER conventions.
+export type ArrowStyle =
+  | 'none' | 'arrow' | 'arrowClosed'
+  | 'diamond' | 'diamondFilled' | 'triangleOpen' | 'circle' | 'circleFilled';
 
 export interface SmartEdgeData extends Record<string, unknown> {
   routing: EdgeRouting;

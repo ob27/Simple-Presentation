@@ -1,4 +1,4 @@
-import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
+import { ref, uploadBytes, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
 import { storage } from '../firebase';
 
 export interface UploadResult {
@@ -16,7 +16,14 @@ export function uploadDiagramMedia(
     const fileId = crypto.randomUUID();
     const ext = file instanceof File ? file.name.split('.').pop() ?? 'bin' : (file.type.split('/')[1] ?? 'bin');
     const storageRef = ref(storage, `${folder}/${diagramId}/${fileId}.${ext}`);
-    const task = uploadBytesResumable(storageRef, file);
+    // Media assets were re-downloading on every page open instead of being
+    // served from the browser's own disk cache — no Cache-Control metadata
+    // was ever set on upload. Safe to set a full year + immutable here
+    // specifically because the path already carries a random id per upload
+    // (unlike the two fixed-path logo uploaders elsewhere, which needed a
+    // path change first) — a re-upload always gets a brand new URL, so
+    // there's nothing to ever invalidate.
+    const task = uploadBytesResumable(storageRef, file, { cacheControl: 'public, max-age=31536000, immutable' });
     task.on('state_changed',
       snapshot => onProgress?.(snapshot.totalBytes > 0 ? (snapshot.bytesTransferred / snapshot.totalBytes) * 100 : 0),
       reject,
@@ -34,6 +41,18 @@ export function uploadDiagramMedia(
 
 export function uploadDiagramImage(diagramId: string, file: File | Blob, onProgress?: (percent: number) => void): Promise<UploadResult> {
   return uploadDiagramMedia(diagramId, file, 'diagramImages', onProgress);
+}
+
+// Persists a page/cover thumbnail (a data URL from exportPageAsImage) to
+// Storage so it survives reload/other sessions, not just the tab that
+// rendered it. Random per-upload path (matching uploadDiagramMedia above),
+// so the long-lived cacheControl below can never go stale — a regenerated
+// thumbnail just gets a brand new URL rather than overwriting the old one.
+export async function uploadThumbnail(diagramId: string, dataUrl: string, folder: 'pageThumbnails' | 'coverThumbnails'): Promise<string> {
+  const blob = await (await fetch(dataUrl)).blob();
+  const storageRef = ref(storage, `${folder}/${diagramId}/${crypto.randomUUID()}.png`);
+  await uploadBytes(storageRef, blob, { cacheControl: 'public, max-age=31536000, immutable' });
+  return getDownloadURL(storageRef);
 }
 
 // Reads the file locally to get intrinsic pixel dimensions before it's placed

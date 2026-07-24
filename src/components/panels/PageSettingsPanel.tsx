@@ -2,7 +2,7 @@ import { useState } from 'react';
 import type { Node } from '@xyflow/react';
 import { Button, Input, Select, Radio, Switch, InputNumber, Popconfirm, Tooltip } from 'antd';
 import { IconClose, IconDelete } from '../icons';
-import type { DiagramPage, PageNumberPosition, PageNumberStyle } from '../../types/document';
+import type { DiagramPage, HeaderFooterZones, PageNumberPosition, PageNumberStyle } from '../../types/document';
 import { FRAME_PRESETS, getPageDimensions } from '../../utils/paperSizes';
 import { updatePage, deletePage } from '../../store';
 import { ColorPickerField } from './ColorPickerField';
@@ -18,6 +18,34 @@ const POSITION_GRID: PageNumberPosition[] = [
   'top-left', 'top-center', 'top-right',
   'bottom-left', 'bottom-center', 'bottom-right',
 ];
+
+function isEmptyZones(z: HeaderFooterZones): boolean {
+  return !z.left && !z.center && !z.right;
+}
+
+// 3 fixed left/center/right zones (matching the common PPT/Word footer
+// convention) plus a font size stepper and color swatch — deliberately not
+// a rich text editor, just enough beyond a single centered string to cover
+// "put the date on the left, page title in the middle, confidential notice
+// on the right" style layouts.
+function HeaderFooterZoneEditor({ label, value, onChange }: {
+  label: string; value: HeaderFooterZones; onChange: (v: HeaderFooterZones) => void;
+}) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      <div style={{ fontSize: 11, color: '#aaa' }}>{label} (use {'{page}'}/{'{pages}'})</div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 4 }}>
+        <Input size="small" placeholder="Left" value={value.left ?? ''} onChange={e => onChange({ ...value, left: e.target.value || undefined })} />
+        <Input size="small" placeholder="Center" value={value.center ?? ''} onChange={e => onChange({ ...value, center: e.target.value || undefined })} />
+        <Input size="small" placeholder="Right" value={value.right ?? ''} onChange={e => onChange({ ...value, right: e.target.value || undefined })} />
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <InputNumber size="small" addonBefore="Size" min={6} max={48} style={{ width: 96 }} value={value.fontSize ?? 11} onChange={v => onChange({ ...value, fontSize: v ?? undefined })} />
+        <ColorPickerField value={value.color ?? '#8a93a6'} onChangeComplete={color => onChange({ ...value, color })} />
+      </div>
+    </div>
+  );
+}
 
 function PositionPicker({ value, onChange }: { value: PageNumberPosition; onChange: (v: PageNumberPosition) => void }) {
   return (
@@ -76,8 +104,12 @@ export function PageSettingsPanel({ diagramId, page, pages, masterPages, pageOri
   const [marginRight, setMarginRight] = useState(page.marginRight ?? 0);
   const [marginBottom, setMarginBottom] = useState(page.marginBottom ?? 0);
   const [marginLeft, setMarginLeft] = useState(page.marginLeft ?? 0);
-  const [headerText, setHeaderText] = useState(page.headerText ?? '');
-  const [footerText, setFooterText] = useState(page.footerText ?? '');
+  const [headerConfig, setHeaderConfig] = useState<HeaderFooterZones>(
+    page.headerConfig ?? (page.headerText ? { center: page.headerText } : {}),
+  );
+  const [footerConfig, setFooterConfig] = useState<HeaderFooterZones>(
+    page.footerConfig ?? (page.footerText ? { center: page.footerText } : {}),
+  );
   const [masterPageId, setMasterPageId] = useState(page.masterPageId);
   const [backgroundColor, setBackgroundColor] = useState(page.backgroundColor);
   const [notes, setNotes] = useState(page.notes ?? '');
@@ -96,7 +128,12 @@ export function PageSettingsPanel({ diagramId, page, pages, masterPages, pageOri
     updatePage(diagramId, page.id, {
       name, paperSize, orientation,
       marginTop, marginRight, marginBottom, marginLeft,
-      headerText: headerText || undefined, footerText: footerText || undefined,
+      // Saving through this panel always writes the 3-zone config and clears
+      // the legacy single-string fields — headerConfig/footerConfig fully
+      // supersede them from this point on for this page.
+      headerText: undefined, footerText: undefined,
+      headerConfig: isEmptyZones(headerConfig) ? undefined : headerConfig,
+      footerConfig: isEmptyZones(footerConfig) ? undefined : footerConfig,
       masterPageId: masterPageId || undefined, backgroundColor: backgroundColor || undefined,
       notes: notes || undefined,
       pageNumberEnabled, pageNumberStyle, pageNumberPosition,
@@ -138,6 +175,22 @@ export function PageSettingsPanel({ diagramId, page, pages, masterPages, pageOri
               <Tooltip title="Inherit this master's background, header, footer & shape content — shapes on the master render live and locked here, unless individually detached">
                 <div style={{ fontSize: 11, color: '#888', marginBottom: 3 }}>Master page</div>
               </Tooltip>
+              {/* Always shown when a master is assigned, independent of
+                  whether it still shows up below in matchingMasters — the
+                  assignment dropdown disappears entirely once this page's
+                  (or the assigned master's) format no longer matches
+                  anything, which used to make an already-picked master
+                  permanently un-clearable. */}
+              {masterPageId && (
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4, fontSize: 12 }}>
+                  <span style={{ color: '#666' }}>
+                    {masterPages.find(m => m.id === masterPageId)?.name ?? '(format no longer matches)'}
+                  </span>
+                  <Button size="small" type="link" style={{ padding: 0, height: 'auto' }} onClick={() => setMasterPageId(undefined)}>
+                    Clear
+                  </Button>
+                </div>
+              )}
               {matchingMasters.length > 0 ? (
                 <Select
                   size="small" style={{ width: '100%' }}
@@ -207,14 +260,8 @@ export function PageSettingsPanel({ diagramId, page, pages, masterPages, pageOri
               <InputNumber size="small" addonBefore="B" min={0} value={marginBottom} onChange={v => setMarginBottom(v ?? 0)} />
               <InputNumber size="small" addonBefore="L" min={0} value={marginLeft} onChange={v => setMarginLeft(v ?? 0)} />
             </div>
-            <Input
-              size="small" placeholder="Header text (use {page}/{pages})" value={headerText}
-              onChange={e => setHeaderText(e.target.value)}
-            />
-            <Input
-              size="small" placeholder="Footer text (use {page}/{pages})" value={footerText}
-              onChange={e => setFooterText(e.target.value)}
-            />
+            <HeaderFooterZoneEditor label="Header" value={headerConfig} onChange={setHeaderConfig} />
+            <HeaderFooterZoneEditor label="Footer" value={footerConfig} onChange={setFooterConfig} />
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <Tooltip title={masterPageId ? "Leave unset to use the master page's background" : 'Background color'}>
                 <span style={{ fontSize: 12, color: '#666' }}>Background</span>

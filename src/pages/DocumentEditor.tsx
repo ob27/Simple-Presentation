@@ -1,9 +1,13 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { Spin, Button, Tooltip, Input, Segmented } from 'antd';
-import { IconArrowLeft, IconPlayCircle, IconPresenterNotes, IconHistory } from '../components/icons';
+import { IconArrowLeft, IconPlayCircle, IconPresenterNotes, IconHistory, IconShare } from '../components/icons';
 import { ReactFlowProvider } from '@xyflow/react';
-import { subscribePages, subscribeDiagram, addPage, addMasterPage, reorderPages, renameDiagram, type NewPageOptions } from '../store';
+import {
+  subscribePages, subscribeDiagram, addPage, addMasterPage, reorderPages, renameDiagram, getDiagramRole,
+  type NewPageOptions,
+} from '../store';
+import { copyInviteLink } from '../utils/shareLinks';
 import type { DiagramPage } from '../types/document';
 import { Canvas } from '../components/canvas/Canvas';
 import { NewPageModal } from '../components/NewPageModal';
@@ -21,6 +25,11 @@ export function DocumentEditor() {
   // subscribed below for the title; memberIds/memberEmails were previously
   // fetched and discarded, so this is a new state capture, not a new read.
   const [members, setMembers] = useState<{ uid: string; email: string }[]>([]);
+  const [inviteToken, setInviteToken] = useState('');
+  // 'edit' unless/until the diagram subscription resolves a lesser role for
+  // the current user — defaults to full edit so there's no flash of a
+  // restricted UI for the common (editor/owner) case while this is loading.
+  const [role, setRole] = useState<'edit' | 'comment' | 'present'>('edit');
   const [loading, setLoading] = useState(true);
   const [newPageOpen, setNewPageOpen] = useState(false);
   const [newPageAfterOrder, setNewPageAfterOrder] = useState<number | null>(null);
@@ -55,9 +64,14 @@ export function DocumentEditor() {
         setDiagramName(d.name);
         savedNameRef.current = d.name;
       }
-      if (d) setMembers(d.memberIds.map(uid => ({ uid, email: d.memberEmails?.[uid] ?? uid })));
+      if (d) {
+        setMembers(d.memberIds.map(uid => ({ uid, email: d.memberEmails?.[uid] ?? uid })));
+        setInviteToken(d.inviteToken);
+        setRole(user ? getDiagramRole(d, user.uid) : 'edit');
+      }
     });
-  }, [id]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, user?.uid]);
 
   function commitTitle(name: string) {
     isEditingTitleRef.current = false;
@@ -152,12 +166,19 @@ export function DocumentEditor() {
           }}
         />
         <div style={{ flex: 1 }} />
-        <Segmented
-          size="small"
-          value={viewMode}
-          onChange={v => setViewMode(v as 'pages' | 'masters')}
-          options={[{ label: 'Pages', value: 'pages' }, { label: 'Master Pages', value: 'masters' }]}
-        />
+        {role === 'edit' && (
+          <Tooltip title="Copy invite link">
+            <Button icon={<IconShare />} onClick={() => copyInviteLink(inviteToken)}>Share</Button>
+          </Tooltip>
+        )}
+        {role === 'edit' && (
+          <Segmented
+            size="small"
+            value={viewMode}
+            onChange={v => setViewMode(v as 'pages' | 'masters')}
+            options={[{ label: 'Pages', value: 'pages' }, { label: 'Master Pages', value: 'masters' }]}
+          />
+        )}
         <Tooltip title="Version history">
           <Button icon={<IconHistory />} onClick={() => setVersionHistoryOpen(true)} />
         </Tooltip>
@@ -177,6 +198,7 @@ export function DocumentEditor() {
           <Canvas
             diagramId={id!} pages={pages} diagramName={diagramName}
             members={members}
+            mode={role}
             toolbarSlot={toolbarSlotEl}
             viewMode={viewMode}
             onInsertPageAt={handleInsertPageAt} onInsertMasterAt={handleInsertMasterAt}

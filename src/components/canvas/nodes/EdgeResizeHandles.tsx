@@ -1,4 +1,4 @@
-import { NodeResizeControl, ResizeControlVariant, type OnResizeEnd } from '@xyflow/react';
+import { NodeResizeControl, ResizeControlVariant, type OnResizeEnd, type OnResizeStart } from '@xyflow/react';
 
 const EDGE_POSITIONS = ['top', 'right', 'bottom', 'left'] as const;
 
@@ -26,11 +26,12 @@ const EDGE_POSITIONS = ['top', 'right', 'bottom', 'left'] as const;
 // the content div's hit-testable area — an accident of corner-radius, not
 // a real fix, so it's addressed the same way here.)
 export function EdgeResizeHandles({
-  minWidth, minHeight, keepAspectRatio, onResizeEnd,
+  minWidth, minHeight, keepAspectRatio, onResizeStart, onResizeEnd,
 }: {
   minWidth: number;
   minHeight: number;
   keepAspectRatio?: boolean;
+  onResizeStart?: OnResizeStart;
   onResizeEnd?: OnResizeEnd;
 }) {
   return (
@@ -43,8 +44,15 @@ export function EdgeResizeHandles({
           minWidth={minWidth}
           minHeight={minHeight}
           keepAspectRatio={keepAspectRatio}
+          onResizeStart={onResizeStart}
           onResizeEnd={onResizeEnd}
-          style={{ width: 8, height: 8, borderRadius: 2, zIndex: 10 }}
+          // Explicit auto: MultiSelectOverlayNode wraps its content in a
+          // pointer-events:none div (so clicks elsewhere in the combined
+          // bbox pass through to the shape underneath) — these handles are
+          // the one thing inside it that must stay interactive regardless
+          // of what ancestor sets, and every other caller already inherits
+          // 'auto' anyway, so this is a no-op for them.
+          style={{ width: 8, height: 8, borderRadius: 2, zIndex: 10, pointerEvents: 'auto' }}
         />
       ))}
     </>

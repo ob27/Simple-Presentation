@@ -37,7 +37,11 @@ export interface ToolDefaults {
 const DEFAULTS: ToolDefaults = {
   pen: { strokeColor: '#7C93E8', strokeWidth: 1.5, strokeStyle: 'solid' },
   brush: { brushStyle: 'pencil', brushBaseWidth: 6, strokeColor: '#1a1a2e' },
-  connector: { routing: 'orthogonal', flowAnimation: 'none', startArrow: 'none', endArrow: 'arrowClosed' },
+  // 'straight' (not 'orthogonal'/elbow) — a straight connector is the more
+  // common default expectation; existing users' already-persisted
+  // preference is untouched either way since `load()` merges per-field over
+  // this hardcoded default, only a fresh/empty localStorage picks this up.
+  connector: { routing: 'straight', flowAnimation: 'none', startArrow: 'none', endArrow: 'arrowClosed' },
 };
 
 function load(): ToolDefaults {

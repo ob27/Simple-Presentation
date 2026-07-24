@@ -1,6 +1,6 @@
 import { memo, useState, useRef } from 'react';
 import type { NodeProps } from '@xyflow/react';
-import type { PageNumberPosition, PageNumberStyle } from '../../../types/document';
+import type { HeaderFooterZones, PageNumberPosition, PageNumberStyle } from '../../../types/document';
 
 const PX_PER_MM = 96 / 25.4;
 
@@ -43,6 +43,8 @@ export interface PageFrameNodeData extends Record<string, unknown> {
   marginLeft?: number;
   headerText?: string;
   footerText?: string;
+  headerConfig?: HeaderFooterZones;
+  footerConfig?: HeaderFooterZones;
   pageIndex?: number;
   pageCount?: number;
   backgroundColor?: string;
@@ -51,12 +53,42 @@ export interface PageFrameNodeData extends Record<string, unknown> {
   pageNumberPosition?: PageNumberPosition;
 }
 
+// Falls back to the legacy single-string field (mapped into `center`) when
+// no 3-zone config is set at all, so a page saved before headerConfig/
+// footerConfig existed keeps rendering exactly as before.
+function resolveZones(config: HeaderFooterZones | undefined, legacyText: string | undefined): HeaderFooterZones | undefined {
+  if (config) return config;
+  if (legacyText) return { center: legacyText };
+  return undefined;
+}
+
+function HeaderFooterRow({ zones, edge, pageIndex, pageCount }: {
+  zones: HeaderFooterZones; edge: 'top' | 'bottom'; pageIndex: number; pageCount: number;
+}) {
+  const style: React.CSSProperties = {
+    position: 'absolute', left: 8, right: 8, pointerEvents: 'none',
+    fontSize: zones.fontSize ?? 11, color: zones.color ?? '#8a93a6',
+    display: 'flex', justifyContent: 'space-between', gap: 8,
+  };
+  style[edge] = 8;
+  return (
+    <div className="nopan nodrag" style={style}>
+      <span style={{ textAlign: 'left', flex: 1 }}>{zones.left ? substituteTokens(zones.left, pageIndex, pageCount) : ''}</span>
+      <span style={{ textAlign: 'center', flex: 1 }}>{zones.center ? substituteTokens(zones.center, pageIndex, pageCount) : ''}</span>
+      <span style={{ textAlign: 'right', flex: 1 }}>{zones.right ? substituteTokens(zones.right, pageIndex, pageCount) : ''}</span>
+    </div>
+  );
+}
+
 function PageFrameNodeImpl({ data }: NodeProps) {
   const {
     pageName, pageId, width, height, onRename, onDeselectAll,
-    marginTop, marginRight, marginBottom, marginLeft, headerText, footerText, pageIndex, pageCount, backgroundColor,
+    marginTop, marginRight, marginBottom, marginLeft, headerText, footerText, headerConfig, footerConfig,
+    pageIndex, pageCount, backgroundColor,
     pageNumberEnabled, pageNumberStyle, pageNumberPosition,
   } = data as unknown as PageFrameNodeData;
+  const resolvedHeader = resolveZones(headerConfig, headerText);
+  const resolvedFooter = resolveZones(footerConfig, footerText);
   const hasMargins = !!(marginTop || marginRight || marginBottom || marginLeft);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(pageName);
@@ -139,28 +171,8 @@ function PageFrameNodeImpl({ data }: NodeProps) {
           }}
         />
       )}
-      {headerText && (
-        <div
-          className="nopan nodrag"
-          style={{
-            position: 'absolute', top: 8, left: 8, right: 8, pointerEvents: 'none',
-            fontSize: 11, color: '#8a93a6', textAlign: 'center',
-          }}
-        >
-          {substituteTokens(headerText, pageIndex ?? 1, pageCount ?? 1)}
-        </div>
-      )}
-      {footerText && (
-        <div
-          className="nopan nodrag"
-          style={{
-            position: 'absolute', bottom: 8, left: 8, right: 8, pointerEvents: 'none',
-            fontSize: 11, color: '#8a93a6', textAlign: 'center',
-          }}
-        >
-          {substituteTokens(footerText, pageIndex ?? 1, pageCount ?? 1)}
-        </div>
-      )}
+      {resolvedHeader && <HeaderFooterRow zones={resolvedHeader} edge="top" pageIndex={pageIndex ?? 1} pageCount={pageCount ?? 1} />}
+      {resolvedFooter && <HeaderFooterRow zones={resolvedFooter} edge="bottom" pageIndex={pageIndex ?? 1} pageCount={pageCount ?? 1} />}
       {pageNumberEnabled && (
         <div
           className="nopan nodrag"

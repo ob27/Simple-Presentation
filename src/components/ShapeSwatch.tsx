@@ -15,12 +15,18 @@ export interface ShapeCatalogEntry {
 
 const BASE_CATALOG: ShapeCatalogEntry[] = [
   { kind: 'rectangle', label: 'Rectangle', category: 'Basic', preview: { borderRadius: 3 } },
+  // Same 'rectangle' kind, just seeded with a larger corner radius — no new
+  // ShapeKind needed, since cornerRadius already fully drives this visually.
+  { kind: 'rectangle', label: 'Rounded rectangle', category: 'Basic', preview: { borderRadius: 10 }, extraData: { cornerRadius: 10 } },
   { kind: 'ellipse', label: 'Ellipse', category: 'Basic', preview: { borderRadius: '50%' } },
   { kind: 'diamond', label: 'Diamond', category: 'Basic', preview: { clipPath: 'polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%)' } },
   { kind: 'stickyNote', label: 'Sticky note', category: 'Basic', preview: { borderRadius: 2, background: '#FFF3B0', border: '1px solid #E8D77A' } },
+  { kind: 'halfCircle', label: 'Half circle', category: 'Basic', preview: { clipPath: 'ellipse(50% 100% at 50% 100%)' } },
   { kind: 'triangle', label: 'Triangle', category: 'Flowchart', preview: { clipPath: 'polygon(50% 0%, 100% 100%, 0% 100%)' } },
   { kind: 'parallelogram', label: 'Parallelogram', category: 'Flowchart', preview: { clipPath: 'polygon(20% 0%, 100% 0%, 80% 100%, 0% 100%)' } },
+  { kind: 'trapezoid', label: 'Trapezoid', category: 'Flowchart', preview: { clipPath: 'polygon(20% 0%, 80% 0%, 100% 100%, 0% 100%)' } },
   { kind: 'hexagon', label: 'Hexagon', category: 'Flowchart', preview: { clipPath: 'polygon(25% 0%, 75% 0%, 100% 50%, 75% 100%, 25% 100%, 0% 50%)' } },
+  { kind: 'arrowShape', label: 'Arrow', category: 'Flowchart', preview: { clipPath: 'polygon(0% 25%, 60% 25%, 60% 0%, 100% 50%, 60% 100%, 60% 75%, 0% 75%)' } },
   { kind: 'umlActor', label: 'Actor', category: 'UML', preview: {} },
   { kind: 'ellipse', label: 'Use Case', category: 'UML', preview: { borderRadius: '50%' } },
   { kind: 'umlClass', label: 'Class', category: 'UML', preview: {} },
@@ -32,6 +38,7 @@ const BASE_CATALOG: ShapeCatalogEntry[] = [
   { kind: 'cross', label: 'Cross', category: 'Complex', preview: {} },
   { kind: 'star', label: 'Star', category: 'Complex', preview: {} },
   { kind: 'document', label: 'Document', category: 'Complex', preview: {} },
+  { kind: 'revisionCloud', label: 'Revision cloud', category: 'Complex', preview: {} },
   { kind: 'pieChart', label: 'Pie chart', category: 'Complex', preview: {} },
   { kind: 'table', label: 'Table', category: 'Complex', preview: {} },
   { kind: 'chart', label: 'Bar/line chart', category: 'Complex', preview: {} },
@@ -107,6 +114,16 @@ export function ShapeSwatch({ kind, preview, extraData }: { kind: ShapeKind; pre
     return (
       <svg width="26" height="20" viewBox="0 0 26 20">
         <path d="M6 16 C2 16 2 10 6 9.5 C6 5 12 4 14 7 C18 5 22 8 20 11.5 C23 12 22 16 19 16 Z" fill="#8CA3E8" stroke="#5B6B99" strokeWidth="1" />
+      </svg>
+    );
+  }
+  if (kind === 'revisionCloud') {
+    return (
+      <svg width="26" height="20" viewBox="0 0 26 20">
+        <path
+          d="M24.0,10.0 A3.3,3.3 0 0 1 20.8,15.7 A4.1,4.1 0 0 1 13.0,18.0 A4.1,4.1 0 0 1 5.2,15.7 A3.3,3.3 0 0 1 2.0,10.0 A3.3,3.3 0 0 1 5.2,4.3 A4.1,4.1 0 0 1 13.0,2.0 A4.1,4.1 0 0 1 20.8,4.3 A3.3,3.3 0 0 1 24.0,10.0 Z"
+          fill="none" stroke="#5B6B99" strokeWidth="1.5"
+        />
       </svg>
     );
   }

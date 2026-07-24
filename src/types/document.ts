@@ -9,6 +9,18 @@ export type PageNumberPosition =
   | 'top-left' | 'top-center' | 'top-right'
   | 'bottom-left' | 'bottom-center' | 'bottom-right';
 
+// A bounded v1 for header/footer customization — 3 fixed left/center/right
+// text zones (matching the common PPT/Word footer convention) plus basic
+// style. Deliberately NOT rich text, images/logos, or per-zone overrides
+// beyond this whole field's existing master-inheritance fallback rule.
+export interface HeaderFooterZones {
+  left?: string;
+  center?: string;
+  right?: string;
+  fontSize?: number;
+  color?: string;
+}
+
 export interface DiagramPage {
   id: string;
   name: string;
@@ -27,8 +39,13 @@ export interface DiagramPage {
   // Rendered at the top/bottom of the page; `{page}` and `{pages}` are
   // substituted with this page's 1-based index and the document's total
   // page count at render time, so the same text works across every page.
+  // Legacy single-string fields — still read as a fallback (mapped into
+  // `center`) for any page saved before headerConfig/footerConfig existed;
+  // new edits always go through the 3-zone config below.
   headerText?: string;
   footerText?: string;
+  headerConfig?: HeaderFooterZones;
+  footerConfig?: HeaderFooterZones;
   // Independent of header/footer text — those already support a manually
   // typed {page}/{pages} token, but this is the dedicated "just show me a
   // page number" toggle: a formatted, positioned number with no text of its
@@ -65,6 +82,14 @@ export interface DiagramPage {
   // is unaffected, matching Affinity Publisher's per-page master-item
   // override behavior.
   overriddenMasterShapeIds?: string[];
+  // A real raster snapshot of this page, persisted to Storage — survives
+  // reload and other sessions, unlike Canvas.tsx's in-memory `pageSnapshots`
+  // (which still renders first/instantly for the active page; this is what
+  // seeds every OTHER page's thumbnail once it's been generated at least
+  // once). Regenerated opportunistically on the same debounced trigger as
+  // the in-memory snapshot, never proactively for unvisited pages.
+  thumbnailUrl?: string;
+  thumbnailUpdatedAt?: number;
 }
 
 export interface PresentationSettings {
@@ -128,6 +153,12 @@ export interface DiagramDocument {
   // before this field existed — TemplateGalleryModal falls back to a
   // text-only card in that case.
   templateThumbnailUrl?: string;
+  // The page (regular or master) whose thumbnail represents this document
+  // in the gallery — unset means "just show the text-only card as before".
+  // Persisted (not derived from Canvas.tsx's session-only pageSnapshots)
+  // since the gallery never opens the document itself.
+  coverPageId?: string;
+  coverThumbnailUrl?: string;
 }
 
 export type FolderRole = 'owner' | 'editor' | 'viewer';

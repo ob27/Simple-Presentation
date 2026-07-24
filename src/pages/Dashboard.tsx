@@ -10,10 +10,11 @@ import { useAuth } from '../AuthContext';
 import {
   subscribeUserDiagrams, isDiagramOwner, deleteDiagram, renameDiagram,
   subscribeUserFolders, createFolder, deleteFolder, renameFolder, addDiagramToFolder, removeDiagramFromFolder,
-  generateEditorInvite, saveDiagramAsTemplate,
+  generateEditorInvite, saveDiagramAsTemplate, setDiagramPublicShareRole,
 } from '../store';
 import { uploadFolderLogo, deleteFolderLogo } from '../utils/folderLogoUpload';
 import { getWorkspaceSettings, type WorkspaceSettings } from '../utils/workspaceSettings';
+import { copyInviteLink } from '../utils/shareLinks';
 import { useUserProfiles, resolveDisplay } from '../utils/userProfiles';
 import type { DiagramDocument, DiagramFolder } from '../types/document';
 import { FolderMembersModal } from '../components/FolderMembersModal';
@@ -90,9 +91,7 @@ export function Dashboard() {
   }
 
   function handleCopyInvite(diagram: DiagramDocument) {
-    const url = `${window.location.origin}/simple-presentation/invite/${diagram.inviteToken}`;
-    navigator.clipboard.writeText(url);
-    message.success('Invite link copied');
+    copyInviteLink(diagram.inviteToken);
   }
 
   async function handleRenameDiagram() {
@@ -217,9 +216,18 @@ export function Dashboard() {
         onClick={() => navigate(`/d/${d.id}`)}
         style={{
           background: '#fff', borderRadius: 12, overflow: 'hidden', cursor: 'pointer',
-          boxShadow: '0 2px 8px rgba(0,0,0,0.07)', padding: '16px 18px',
+          boxShadow: '0 2px 8px rgba(0,0,0,0.07)',
         }}
       >
+        {/* A designated cover page's persisted thumbnail (see Canvas.tsx's
+            "Set as cover" page-thumbnail menu item) — cards without one keep
+            the plain text-only layout below, unchanged. */}
+        {d.coverThumbnailUrl && (
+          <div style={{ width: '100%', aspectRatio: '4 / 3', background: '#f5f6f9', overflow: 'hidden' }}>
+            <img src={d.coverThumbnailUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+          </div>
+        )}
+        <div style={{ padding: '16px 18px' }}>
         <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8, marginBottom: 10 }}>
           <span style={{ fontWeight: 700, fontSize: 15, color: '#1a1a2e' }}>{d.name}</span>
           {!isOwner && <Tag color="blue">Shared</Tag>}
@@ -238,6 +246,13 @@ export function Dashboard() {
                 items: [
                   { key: 'rename', icon: <IconPencil />, label: 'Rename' },
                   { key: 'template', icon: <IconFileAdd />, label: 'Save as template' },
+                  {
+                    key: 'viewerAccess', icon: <IconShare />, label: 'Viewer access',
+                    children: [
+                      { key: 'viewerAccess:viewer', label: d.publicShareRole !== 'commenter' ? '● View only' : 'View only' },
+                      { key: 'viewerAccess:commenter', label: d.publicShareRole === 'commenter' ? '● View and comment' : 'View and comment' },
+                    ],
+                  },
                   ...(editableFolders.length > 0 ? [{
                     key: 'move', icon: <IconFolder />, label: 'Move to folder',
                     children: [
@@ -252,6 +267,8 @@ export function Dashboard() {
                   if (key === 'rename') { setRenamingDiagram(d); setRenamingDiagramName(d.name); }
                   else if (key === 'template') handleSaveAsTemplate(d);
                   else if (key === 'delete') handleDelete(d);
+                  else if (key === 'viewerAccess:viewer') setDiagramPublicShareRole(d.id, 'viewer');
+                  else if (key === 'viewerAccess:commenter') setDiagramPublicShareRole(d.id, 'commenter');
                   else if (key === 'move:none' && folder) handleRemoveFromFolder(folder, d.id);
                   else if (key.startsWith('move:')) {
                     const targetFolder = editableFolders.find(f => f.id === key.slice('move:'.length));
@@ -264,6 +281,7 @@ export function Dashboard() {
             </Dropdown>
           </div>
         )}
+        </div>
       </div>
     );
   }

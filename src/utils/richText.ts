@@ -93,14 +93,16 @@ function listTypeOf(el: Element): 'bullet' | 'ordered' | undefined {
 
 // One wrinkle Chromium actually produces: converting a non-first line to a
 // list sometimes leaves the new <ul>/<ol> wrapped in the line's original
-// <div> instead of replacing it outright — this looks one level inside a
-// plain <div>/<p> for exactly that case so it's still read as a list, not a
-// single flattened paragraph.
+// <div> instead of replacing it outright — occasionally more than one level
+// deep (a <div> wrapping another <div> wrapping the <ul>, observed after a
+// few edits in a row rather than just the first conversion). Recurses
+// through any number of single-child <div>/<p> wrappers rather than only
+// checking one level in, so it stays correct regardless of how deep this
+// particular quirk goes on a given edit.
 function unwrapList(el: HTMLElement): HTMLElement | undefined {
   if (listTypeOf(el)) return el;
   if ((el.tagName === 'DIV' || el.tagName === 'P') && el.children.length === 1) {
-    const only = el.children[0] as HTMLElement;
-    if (listTypeOf(only)) return only;
+    return unwrapList(el.children[0] as HTMLElement);
   }
   return undefined;
 }

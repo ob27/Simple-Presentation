@@ -8,7 +8,8 @@ export type ShapeKind =
   | 'triangle' | 'parallelogram' | 'hexagon' | 'container' | 'video'
   | 'umlClass' | 'umlPackage' | 'umlComponent' | 'umlNote'
   | 'icon' | 'archimateElement' | 'cylinder' | 'cloud' | 'cross' | 'star' | 'document' | 'pieChart'
-  | 'brushStroke' | 'table' | 'chart';
+  | 'brushStroke' | 'table' | 'chart'
+  | 'halfCircle' | 'trapezoid' | 'arrowShape' | 'revisionCloud';
 
 export interface PieSegment {
   id: string;

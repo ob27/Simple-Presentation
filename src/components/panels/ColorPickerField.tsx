@@ -20,13 +20,18 @@ interface Props {
   // content lands inside a container its blur-detection already treats as
   // "still part of the editor," instead of the default document.body.
   getPopupContainer?: () => HTMLElement;
+  // The properties panel is a narrow (260px), right-docked strip flush
+  // against the viewport's right edge — antd's default popup placement has
+  // no room to expand rightward there and can render partially off-screen.
+  // Pass e.g. "left"/"leftTop" for a field known to sit at that edge.
+  placement?: 'left' | 'leftTop' | 'leftBottom' | 'bottom' | 'bottomLeft' | 'bottomRight';
 }
 
 // Thin wrapper around antd's ColorPicker shared by every fill/stroke/font
 // color field in the properties panel — adds a "Recent" swatch presets
 // list (shared across every instance of this component, not per-field) and,
 // where supported, a screen eyedropper button.
-export function ColorPickerField({ value, onChangeComplete, getPopupContainer }: Props) {
+export function ColorPickerField({ value, onChangeComplete, getPopupContainer, placement }: Props) {
   const [recent, setRecent] = useState(getRecentColors);
   const eyeDropperCtor = getEyeDropper();
 
@@ -50,8 +55,16 @@ export function ColorPickerField({ value, onChangeComplete, getPopupContainer }:
       <ColorPicker
         value={value}
         presets={recent.length > 0 ? [{ label: 'Recent', colors: recent }] : undefined}
-        onChangeComplete={c => commit(c.toHexString())}
+        // toHexString() drops alpha entirely in this antd version — dragging
+        // the picker's own alpha slider to any value was silently discarded
+        // on commit, the only in-picker path to a translucent color.
+        // toCssString() preserves it (rgba(...) once alpha < 1), and every
+        // field this feeds is already a plain CSS-color string that accepts
+        // any valid format, not just hex (fillColor already supports the
+        // literal 'transparent', for instance).
+        onChangeComplete={c => commit(c.toCssString())}
         getPopupContainer={getPopupContainer}
+        placement={placement}
         showText
       />
       {eyeDropperCtor && (

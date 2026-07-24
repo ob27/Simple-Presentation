@@ -1,4 +1,4 @@
-import { memo } from 'react';
+import { memo, useCallback, useState } from 'react';
 import { NodeResizer, type NodeProps } from '@xyflow/react';
 import type { ShapeNodeData } from '../../../types/shapes';
 import type { ResolvedStyle } from '../../../utils/shapeStyleResolver';
@@ -37,7 +37,12 @@ function PathNodeImpl({ id, data, selected }: NodeProps) {
   const locked = !!shapeData.locked;
   const anchors = shapeData.pathAnchors ?? [];
   const closed = !!shapeData.pathClosed;
-  const shiftHeld = useShiftHeld(!!selected && !locked);
+  const { shiftHeldRef } = useShiftHeld(!!selected && !locked);
+  // See useShiftHeld's own comment — snapshotted once at resize-start rather
+  // than bound to the live value, so Shift toggling mid-drag can't flip
+  // keepAspectRatio partway through a gesture.
+  const [resizeShiftLock, setResizeShiftLock] = useState(false);
+  const handleResizeStart = useCallback(() => setResizeShiftLock(shiftHeldRef.current), [shiftHeldRef]);
 
   const holes = shapeData.pathHoles;
   const onRotateStart = useRotateHandle(id, rotation, shapeData.onCommit);
@@ -62,10 +67,13 @@ function PathNodeImpl({ id, data, selected }: NodeProps) {
       onMouseDown={handleMouseDown}
     >
       <NodeResizer
-        isVisible={!!selected && !locked && !isDirectSelecting} minWidth={8} minHeight={8} keepAspectRatio={shiftHeld}
+        isVisible={!!selected && !locked && !isDirectSelecting} minWidth={8} minHeight={8} keepAspectRatio={resizeShiftLock}
+        onResizeStart={handleResizeStart}
         lineStyle={{ borderColor: '#1677ff' }} handleStyle={{ width: 8, height: 8, borderRadius: 2 }}
       />
-      {!!selected && !locked && !isDirectSelecting && <EdgeResizeHandles minWidth={8} minHeight={8} keepAspectRatio={shiftHeld} />}
+      {!!selected && !locked && !isDirectSelecting && (
+        <EdgeResizeHandles minWidth={8} minHeight={8} keepAspectRatio={resizeShiftLock} onResizeStart={handleResizeStart} />
+      )}
       {selected && !locked && !isDirectSelecting && <RotateHandle onMouseDown={onRotateStart} />}
 
       <svg

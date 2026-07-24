@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   IconBold, IconItalic, IconUnderline, IconStrikethrough,
   IconUnorderedList, IconOrderedList,
@@ -37,6 +37,17 @@ export function RichTextEditor({ paragraphs, baseStyle, baseColorHex, textAlign,
   const rootRef = useRef<HTMLDivElement>(null);
   const cancelledRef = useRef(false);
   const savedRangeRef = useRef<Range | null>(null);
+  // Anchored `bottom: 100%` by default; flips to `top: 100%` when there
+  // isn't enough room above the shape (e.g. it sits near the top of the
+  // viewport) so the toolbar doesn't render partially off-screen or flush
+  // against the box it's editing. A one-time measurement at toolbar-show is
+  // enough — the shape doesn't move while text-editing, so no need to keep
+  // re-measuring like a live-tracking tooltip would.
+  const [toolbarPlacement, setToolbarPlacement] = useState<'above' | 'below'>('above');
+  useLayoutEffect(() => {
+    const rect = wrapperRef.current?.getBoundingClientRect();
+    if (rect && rect.top < 40) setToolbarPlacement('below');
+  }, []);
 
   useEffect(() => {
     const root = rootRef.current;
@@ -80,12 +91,13 @@ export function RichTextEditor({ paragraphs, baseStyle, baseColorHex, textAlign,
   }, []);
 
   return (
-    <div ref={wrapperRef} style={{ width: '100%', height: '100%', position: 'relative' }}>
+    <div ref={wrapperRef} className="nodrag nopan" style={{ width: '100%', height: '100%', position: 'relative' }}>
       <div
         className="nodrag nopan"
         onMouseDown={e => e.preventDefault()}
         style={{
-          position: 'absolute', bottom: '100%', left: '50%', transform: 'translateX(-50%)', marginBottom: 4,
+          position: 'absolute', left: '50%', transform: 'translateX(-50%)',
+          ...(toolbarPlacement === 'above' ? { bottom: '100%', marginBottom: 4 } : { top: '100%', marginTop: 4 }),
           display: 'flex', gap: 2, background: '#fff', border: '1px solid #e6e8ef', borderRadius: 6,
           boxShadow: '0 2px 8px rgba(0,0,0,0.15)', padding: 3, zIndex: 20, whiteSpace: 'nowrap',
         }}
@@ -170,9 +182,23 @@ export function RichTextEditor({ paragraphs, baseStyle, baseColorHex, textAlign,
             const sel = window.getSelection();
             const anchor = sel?.anchorNode;
             const anchorEl = anchor instanceof Element ? anchor : anchor?.parentElement;
-            if (anchorEl?.closest('li')) {
+            const li = anchorEl?.closest('li');
+            if (li) {
               e.preventDefault();
+              // execCommand('indent') is a no-op on a list's FIRST <li> —
+              // there's no preceding sibling to nest under, so the browser
+              // simply does nothing (a real execCommand limitation, not a
+              // bug in this handler). Give it one to nest under: insert a
+              // temporary empty leading <li>, indent (now a normal case the
+              // browser handles correctly), then remove the placeholder.
+              const isFirstChild = !e.shiftKey && !li.previousElementSibling;
+              let placeholder: HTMLLIElement | null = null;
+              if (isFirstChild) {
+                placeholder = document.createElement('li');
+                li.parentElement?.insertBefore(placeholder, li);
+              }
               document.execCommand(e.shiftKey ? 'outdent' : 'indent');
+              placeholder?.remove();
             }
           }
           e.stopPropagation();

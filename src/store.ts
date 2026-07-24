@@ -18,6 +18,27 @@ export function isDiagramOwner(diagram: DiagramDocument, uid: string): boolean {
   return diagram.ownerId === uid || (diagram.coOwnerIds ?? []).includes(uid);
 }
 
+export type DiagramAccessRole = 'edit' | 'comment' | 'present';
+
+// A viewer-tier uid (in `viewerIds`, never `memberIds`) gets either
+// present-only or present-plus-comment access depending on this diagram's
+// own `publicShareRole` setting — reusing that field (previously declared
+// but completely unwired anywhere) as the actual "view and comment" access
+// mode toggle, rather than introducing a second uid list. This is a
+// CLIENT-SIDE UX gate only (picks which mode DocumentEditor renders) — it
+// is not a security boundary; a real access-control guarantee needs a
+// Firestore rules backstop, which is outside this repo (no firestore.rules
+// file exists in this checkout to verify/edit).
+export function getDiagramRole(diagram: DiagramDocument, uid: string): DiagramAccessRole {
+  if (isDiagramOwner(diagram, uid) || diagram.memberIds.includes(uid)) return 'edit';
+  if ((diagram.viewerIds ?? []).includes(uid)) {
+    return diagram.publicShareRole === 'commenter' ? 'comment' : 'present';
+  }
+  // Unresolved (e.g. reached without an explicit membership entry) — keep
+  // today's behavior (full edit) rather than introduce a new block here.
+  return 'edit';
+}
+
 // ── Diagram CRUD ─────────────────────────────────────────────────────────────
 
 export function subscribeUserDiagrams(uid: string, onChange: (diagrams: DiagramDocument[]) => void): () => void {
@@ -96,6 +117,25 @@ export async function createDiagram(uid: string, name: string, email?: string): 
 
 export async function renameDiagram(diagramId: string, name: string): Promise<void> {
   await updateDoc(doc(db, 'diagrams', diagramId), { name, updatedAt: Date.now() });
+}
+
+// Determines what every viewer-tier uid (in `viewerIds`) on this diagram
+// gets, per getDiagramRole above — 'viewer' (present-only) or 'commenter'
+// (present + can place comment pins).
+export async function setDiagramPublicShareRole(diagramId: string, role: 'viewer' | 'commenter'): Promise<void> {
+  await updateDoc(doc(db, 'diagrams', diagramId), { publicShareRole: role });
+}
+
+// `coverThumbnailUrl` is optional — pass it once a fresh render has been
+// uploaded (see Canvas.tsx's cover-designation flow); passing just the page
+// id lets the gallery card fall through to its existing text-only display
+// until the thumbnail catches up, rather than blocking designation on it.
+export async function setCoverPage(diagramId: string, pageId: string | undefined, coverThumbnailUrl?: string): Promise<void> {
+  await updateDoc(doc(db, 'diagrams', diagramId), {
+    coverPageId: pageId ?? null,
+    coverThumbnailUrl: coverThumbnailUrl ?? null,
+    updatedAt: Date.now(),
+  });
 }
 
 export async function updatePresentationSettings(diagramId: string, patch: Partial<PresentationSettings>): Promise<void> {
@@ -197,7 +237,18 @@ export async function updatePage(diagramId: string, pageId: string, patch: Parti
 // rather than every page/variable in the diagram, and inserted right after
 // the source page using the exact same order-bump invariant addPage relies
 // on (order stays a gapless 0..n-1 sequence).
-export async function duplicatePage(diagramId: string, sourcePage: DiagramPage, pages: DiagramPage[]): Promise<DiagramPage> {
+//
+// `destinationPages` is the order-bump list for the NEW page's own kind —
+// normally the same list the source page belongs to (a regular page cloned
+// among regular pages), but pass the master-pages list instead when cloning
+// a regular page INTO master-pages (or vice versa); `forceIsMaster` then
+// decides the clone's own `isMaster` flag independently of the source's, so
+// a real page can be cloned as a starting point for a new master page.
+// `overriddenMasterShapeIds` is always stripped on the clone — it only ever
+// means something relative to the ORIGINAL page's own master relationship.
+export async function duplicatePage(
+  diagramId: string, sourcePage: DiagramPage, destinationPages: DiagramPage[], forceIsMaster?: boolean,
+): Promise<DiagramPage> {
   const [shapesSnap, connectorsSnap] = await Promise.all([
     getDocs(collection(db, 'diagrams', diagramId, 'pages', sourcePage.id, 'shapes')),
     getDocs(collection(db, 'diagrams', diagramId, 'pages', sourcePage.id, 'connectors')),
@@ -207,12 +258,17 @@ export async function duplicatePage(diagramId: string, sourcePage: DiagramPage, 
   const shapeIdMap = new Map<string, string>();
   for (const s of shapes) shapeIdMap.set(s.id, crypto.randomUUID());
 
-  const newOrder = sourcePage.order + 1;
+  const isMaster = forceIsMaster ?? sourcePage.isMaster;
+  const newOrder = destinationPages.length > 0 ? Math.max(...destinationPages.map(p => p.order)) + 1 : 0;
   const newPageId = crypto.randomUUID();
-  const newPage: DiagramPage = { ...sourcePage, id: newPageId, name: `${sourcePage.name} copy`, order: newOrder };
+  const newPage: DiagramPage = {
+    ...sourcePage, id: newPageId, name: `${sourcePage.name} copy`, order: newOrder, isMaster,
+    masterPageId: isMaster ? undefined : sourcePage.masterPageId,
+    overriddenMasterShapeIds: undefined,
+  };
 
   const batch = writeBatch(db);
-  for (const p of pages) {
+  for (const p of destinationPages) {
     if (p.order >= newOrder) batch.update(doc(db, 'diagrams', diagramId, 'pages', p.id), { order: p.order + 1 });
   }
   batch.set(doc(db, 'diagrams', diagramId, 'pages', newPageId), newPage);
@@ -333,8 +389,29 @@ export async function reorderPages(diagramId: string, orderedPageIds: string[]):
   await batch.commit();
 }
 
+// Cascades into the page's own shapes/connectors/comments subcollections —
+// a plain deleteDoc on the page alone (the previous behavior) left those
+// orphaned in Firestore forever, since nothing else ever queries/cleans up
+// a subcollection whose parent page doc no longer exists. Same chunked-batch
+// pattern restoreVersion uses for its own bulk deletes.
 export async function deletePage(diagramId: string, pageId: string): Promise<void> {
-  await deleteDoc(doc(db, 'diagrams', diagramId, 'pages', pageId));
+  const [shapesSnap, connectorsSnap, commentsSnap] = await Promise.all([
+    getDocs(collection(db, 'diagrams', diagramId, 'pages', pageId, 'shapes')),
+    getDocs(collection(db, 'diagrams', diagramId, 'pages', pageId, 'connectors')),
+    getDocs(collection(db, 'diagrams', diagramId, 'pages', pageId, 'comments')),
+  ]);
+  const refs = [
+    ...shapesSnap.docs.map(d => d.ref),
+    ...connectorsSnap.docs.map(d => d.ref),
+    ...commentsSnap.docs.map(d => d.ref),
+    doc(db, 'diagrams', diagramId, 'pages', pageId),
+  ];
+  const CHUNK = 400;
+  for (let i = 0; i < refs.length; i += CHUNK) {
+    const batch = writeBatch(db);
+    for (const ref of refs.slice(i, i + CHUNK)) batch.delete(ref);
+    await batch.commit();
+  }
 }
 
 export function getPageOrigin(pageOrderIndex: number, pageHeight: number, pageGap: number): number {
