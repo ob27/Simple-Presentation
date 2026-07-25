@@ -315,6 +315,22 @@ export function Canvas({
   const [connectorEdges, setConnectorEdges] = useState<Edge[]>([]);
   const [comments, setComments] = useState<DiagramComment[]>([]);
 
+  // Selection normally clears itself the instant you click anywhere else on
+  // the canvas (React Flow's own pane-click deselection) — but the Pages/
+  // Master Pages toggle lives in the header, outside the ReactFlow pane
+  // entirely, so clicking it never triggers that. A shape or connector
+  // selected right before toggling stayed marked `selected: true` in this
+  // still-shared shapeNodes/connectorEdges state even though its own page is
+  // no longer the active one, which is what made the connector routing/
+  // arrow-style popover (and, by the same bug, a shape's properties panel)
+  // pop up "for no reason" after switching views — it was never re-selected,
+  // just never actually deselected in the first place.
+  useEffect(() => {
+    setShapeNodes(prev => prev.map(n => n.selected ? { ...n, selected: false } : n));
+    setConnectorEdges(prev => prev.map(e => e.selected ? { ...e, selected: false } : e));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewMode]);
+
   const shapesSlices = useRef<Map<string, Map<string, DiagramNode>>>(new Map());
   const connectorsSlices = useRef<Map<string, Map<string, DiagramEdge>>>(new Map());
   const commentsSlices = useRef<Map<string, Map<string, DiagramComment>>>(new Map());
@@ -506,7 +522,11 @@ export function Canvas({
       },
       draggable: false,
       selectable: false,
-      zIndex: -1,
+      // A large negative sentinel, not -1 — leaves the whole small
+      // negative-integer range (-1 down to -zCount) free for
+      // inheritedMasterNodes' own per-shape ranking below, comfortably far
+      // from any realistic master shape count.
+      zIndex: -1_000_000,
     };
   }), [pages, masterPages, pageOrigins, pageDimensions, diagramId]);
 
@@ -643,16 +663,23 @@ export function Canvas({
       const overridden = new Set(page.overriddenMasterShapeIds ?? []);
       const dy = (pageOrigins.get(page.id) ?? 0) - (masterOrigins.get(page.masterPageId) ?? 0);
       // Every inherited shape used to collapse to the exact same zIndex
-      // (-0.5) regardless of its real stacking order on the master — an
-      // opaque background shape and the logo/title/text meant to sit ON TOP
-      // of it became stacking TIES, and whichever one happened to land
-      // later in this array/DOM order won, silently painting over the
-      // other. A background shape winning that tie makes the text/logo
-      // it's covering look like it simply never inherited at all. Ranking
-      // each master shape by its own zIndex and spreading those ranks
-      // across the (-1, 0) band (still behind every real page shape, still
-      // in front of the page frame at -1) preserves their relative order
-      // instead of flattening it.
+      // (-0.5), then (in a later, still-broken attempt) to a fraction
+      // spreading ranks across the (-1, 0) band — CSS z-index only accepts
+      // INTEGERS; a browser silently discards a fractional value (e.g.
+      // -0.286) instead of applying it, so every inherited shape actually
+      // rendered with NO effective z-index at all. Paint order then fell
+      // back to array order, which mirrors Firestore's default (alphabetical
+      // by doc id) query order — arbitrary, and disconnected from the
+      // master's real stacking order. Confirmed live: two shapes stacked
+      // correctly on the master itself rendered in the WRONG relative order
+      // once inherited on a regular page, purely because their doc ids
+      // happened to sort the "wrong" way alphabetically.
+      // Fix: rank each master shape by its own zIndex and assign INTEGER
+      // ranks counting down from -1 (frontmost among master shapes) to
+      // -zCount (backmost) — still strictly behind every real page shape
+      // (which start at 0+) and strictly in front of the page frame, whose
+      // own zIndex is now a large negative sentinel (see frameNodes below)
+      // specifically to leave this whole negative-integer range free.
       const orderedByZ = [...masterShapes].sort((a, b) => (a.zIndex ?? 0) - (b.zIndex ?? 0));
       const zRank = new Map(orderedByZ.map((s, i) => [s.id, i]));
       const zCount = orderedByZ.length;
@@ -668,7 +695,7 @@ export function Canvas({
           // "only top-level shapes carry an absolute position" rule
           // handleReorderPagesWithShapes/handleResizePageContent rely on.
           position: m.parentId ? m.position : { x: m.position.x, y: m.position.y + dy },
-          zIndex: -1 + (zRank.get(m.id)! + 1) / (zCount + 1),
+          zIndex: zRank.get(m.id)! - zCount,
           draggable: false,
           selectable: true,
           connectable: false,
@@ -3372,7 +3399,12 @@ export function Canvas({
       position: { x: minX, y: minY },
       width: maxX - minX,
       height: maxY - minY,
-      zIndex: -0.5,
+      // A plain -1, not -0.5 — CSS z-index only accepts integers, and a
+      // fractional value here is silently discarded by the browser (same
+      // bug just fixed in inheritedMasterNodes above), leaving this newly
+      // wrapped group/container with no effective z-index at all instead of
+      // reliably sitting just behind the real content it's meant to frame.
+      zIndex: -1,
       parentId: commonParentId,
       extent: commonParentId ? ('parent' as const) : undefined,
       data: kind === 'group'
@@ -3415,7 +3447,12 @@ export function Canvas({
       position: { x: PAGE_X + 60, y: origin + 60 },
       width: 320,
       height: 220,
-      zIndex: -0.5,
+      // A plain -1, not -0.5 — CSS z-index only accepts integers, and a
+      // fractional value here is silently discarded by the browser (same
+      // bug just fixed in inheritedMasterNodes above), leaving this newly
+      // wrapped group/container with no effective z-index at all instead of
+      // reliably sitting just behind the real content it's meant to frame.
+      zIndex: -1,
       data: { kind: 'container', pageId, label: 'Container', containerTheme: 'plain' },
     };
     await saveShape(diagramId, pageId, node);
