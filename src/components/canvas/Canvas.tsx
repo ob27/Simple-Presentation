@@ -200,7 +200,15 @@ function arrowMarker(style: ArrowStyle | undefined, fallback: ArrowStyle) {
   const resolved = style ?? fallback;
   if (resolved === 'none') return undefined;
   const customId = CUSTOM_ARROW_MARKER_IDS[resolved];
-  if (customId) return `url(#${customId})`;
+  // React Flow's own EdgeMarkerType is `string | EdgeMarker` — for a plain
+  // string it treats the value AS the raw marker id and wraps it in
+  // url(#...) itself downstream (see @xyflow/system's getMarkerId: a
+  // string marker is returned verbatim, then wrapped once by the edge
+  // renderer). Passing an ALREADY-wrapped "url(#id)" string here — as this
+  // used to — got wrapped a second time into the nonsensical
+  // "url('#url(#id)')", which never resolves to the real <marker> element,
+  // so no custom arrowhead (diamond/triangle/circle) ever rendered at all.
+  if (customId) return customId;
   return { type: resolved === 'arrow' ? MarkerType.Arrow : MarkerType.ArrowClosed, color: '#8a93a6' };
 }
 
@@ -4571,6 +4579,20 @@ export function Canvas({
         if (!activePage) return null;
         return (
           <PageSettingsPanel
+            // Every field here (name, paperSize, masterPageId, margins,
+            // header/footer, ...) is seeded via useState ONCE at mount and
+            // never resynced from props afterward (see its own commit()).
+            // Without this key, switching the represented page while the
+            // panel stays open (e.g. clicking a different thumbnail right
+            // after an action like duplicate/insert, before activePageId's
+            // own scroll-driven update lands) kept the PREVIOUS page's
+            // stale field values mounted under the NEW page's identity —
+            // clicking Save then silently overwrote the new page's real
+            // name/master/margins with the old page's. Keying by page id
+            // forces a full remount on every page switch, so the panel's
+            // fields are always freshly seeded from the page it currently
+            // represents.
+            key={activePage.id}
             diagramId={diagramId}
             page={activePage}
             pages={regularPages}

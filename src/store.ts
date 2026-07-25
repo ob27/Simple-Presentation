@@ -1,6 +1,6 @@
 import {
   doc, getDoc, getDocFromServer, setDoc, deleteDoc, collection,
-  query, where, getDocs, updateDoc, onSnapshot, writeBatch, serverTimestamp, arrayUnion, arrayRemove,
+  query, where, getDocs, updateDoc, onSnapshot, writeBatch, serverTimestamp, arrayUnion, arrayRemove, deleteField,
 } from 'firebase/firestore';
 import { db } from './firebase';
 import type { DiagramDocument, DiagramPage, PresentationSettings, PresentState, DiagramFolder, DiagramFolderInviteInfo, FolderRole } from './types/document';
@@ -271,7 +271,24 @@ export async function addPage(diagramId: string, pages: DiagramPage[], afterOrde
 }
 
 export async function updatePage(diagramId: string, pageId: string, patch: Partial<DiagramPage>): Promise<void> {
-  await updateDoc(doc(db, 'diagrams', diagramId, 'pages', pageId), patch);
+  // db is initialized with ignoreUndefinedProperties: true (see firebase.ts)
+  // — a real convenience for callers that spread optional fields without
+  // filtering, but it means `{ masterPageId: undefined }` isn't "clear this
+  // field," it's SILENTLY DROPPED from the update entirely, leaving
+  // whatever value was already there untouched. Every caller here passes
+  // `undefined` meaning "remove this" (clearing a page's assigned master,
+  // its background color, header/footer text, notes — see
+  // PageSettingsPanel's commit() and the master-page-deleted cascades in
+  // this file and Canvas.tsx) and every one of them was silently a no-op.
+  // Firestore's actual "remove this field" sentinel is deleteField(), not
+  // a plain JS undefined — swap in the sentinel for anything the caller
+  // explicitly set to undefined, so every existing call site starts doing
+  // what it already assumed it did.
+  const resolved: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(patch)) {
+    resolved[key] = value === undefined ? deleteField() : value;
+  }
+  await updateDoc(doc(db, 'diagrams', diagramId, 'pages', pageId), resolved);
 }
 
 // Duplicates one page WITHIN the same diagram — its own `shapes`/`connectors`
