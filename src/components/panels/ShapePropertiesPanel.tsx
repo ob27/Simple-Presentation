@@ -58,6 +58,15 @@ const PX_PER_MM = 96 / 25.4;
 
 interface Props {
   node: Node;
+  // Set (to 2+) when 2+ shapes are selected — `node` is just the first of
+  // them, used to seed every field's displayed value (not a true "mixed
+  // values" indicator, same convention already used by the connector
+  // toolbar's own bulk-edit). `onChange` in this mode applies to every
+  // selected shape at once; onResize/onMove stay scoped to just `node` —
+  // geometry isn't meaningfully bulk-editable this way (the dedicated
+  // multi-select resize overlay already covers that, accounting for each
+  // shape's own position/size instead of forcing them identical).
+  bulkCount?: number;
   diagramId: string;
   pages: DiagramPage[];
   allShapes: Node[];
@@ -82,7 +91,7 @@ interface Props {
   onDetachFromMaster?: () => void;
 }
 
-export function ShapePropertiesPanel({ node, diagramId, pages, allShapes, variables, connectorEdges, onChange, onResize, onMove, pageOrigin, onDeleteEdge, onClose, onDetachFromMaster }: Props) {
+export function ShapePropertiesPanel({ node, bulkCount, diagramId, pages, allShapes, variables, connectorEdges, onChange, onResize, onMove, pageOrigin, onDeleteEdge, onClose, onDetachFromMaster }: Props) {
   const data = node.data as ShapeNodeData;
   const [downsampling, setDownsampling] = useState(false);
 
@@ -210,7 +219,7 @@ export function ShapePropertiesPanel({ node, diagramId, pages, allShapes, variab
       display: 'flex', flexDirection: 'column',
     }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', borderBottom: '1px solid #f0f0f0' }}>
-        <span style={{ fontWeight: 600, fontSize: 13, color: '#1a1a2e' }}>Shape</span>
+        <span style={{ fontWeight: 600, fontSize: 13, color: '#1a1a2e' }}>{bulkCount ? `${bulkCount} shapes selected` : 'Shape'}</span>
         <Button size="small" type="text" icon={<IconClose />} onClick={onClose} />
       </div>
 
@@ -337,10 +346,17 @@ export function ShapePropertiesPanel({ node, diagramId, pages, allShapes, variab
                       <div style={{ display: 'flex', gap: 8 }}>
                         <ColorPickerField
                           value={data.fillGradient.stops[0]?.color ?? '#E3EAFD'}
-                          // Left-anchored — the panel is a narrow, right-
-                          // docked strip with no room for the popup to open
-                          // rightward without spilling off the viewport.
-                          placement="left"
+                          // Opens downward-and-left-aligned rather than
+                          // sideways — the panel is only ~260-320px wide
+                          // total, so EITHER side has too little horizontal
+                          // clearance for the picker's own width (that's what
+                          // was clipping to the right before, and clipped to
+                          // the left once this was pointed the other way).
+                          // Below has the panel's own scroll room plus
+                          // whatever's left of the viewport, which is far
+                          // more forgiving than squeezing sideways.
+                          placement="bottomLeft"
+                          getPopupContainer={() => document.body}
                           onChangeComplete={hex => {
                             const stops = [...data.fillGradient!.stops];
                             stops[0] = { color: hex, offset: stops[0]?.offset ?? 0 };
@@ -349,7 +365,8 @@ export function ShapePropertiesPanel({ node, diagramId, pages, allShapes, variab
                         />
                         <ColorPickerField
                           value={data.fillGradient.stops[1]?.color ?? '#ffffff'}
-                          placement="left"
+                          placement="bottomLeft"
+                          getPopupContainer={() => document.body}
                           onChangeComplete={hex => {
                             const stops = [...data.fillGradient!.stops];
                             stops[1] = { color: hex, offset: stops[1]?.offset ?? 100 };

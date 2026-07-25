@@ -142,56 +142,64 @@ export function DocumentEditor() {
   return (
     <div style={{ width: '100vw', height: '100vh', display: 'flex', flexDirection: 'column', background: '#EEF0F5' }}>
       <div style={{
-        height: 48, flexShrink: 0, position: 'relative', display: 'flex', alignItems: 'center', gap: 12,
+        height: 48, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 12,
         padding: '0 16px', background: '#fff', borderBottom: '1px solid #e6e8ef',
       }}>
-        <Tooltip title="Back to dashboard">
-          <Button icon={<IconArrowLeft />} type="text" onClick={() => navigate('/')} />
-        </Tooltip>
-        <Input
-          value={diagramName}
-          placeholder="Untitled diagram"
-          variant="borderless"
-          onFocus={() => { isEditingTitleRef.current = true; }}
-          onChange={e => setDiagramName(e.target.value)}
-          onPressEnter={e => (e.target as HTMLInputElement).blur()}
-          onBlur={e => commitTitle(e.target.value)}
-          style={{ width: 220, fontSize: 15, fontWeight: 500, padding: '4px 8px' }}
-        />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexShrink: 0 }}>
+          <Tooltip title="Back to dashboard">
+            <Button icon={<IconArrowLeft />} type="text" onClick={() => navigate('/')} />
+          </Tooltip>
+          <Input
+            value={diagramName}
+            placeholder="Untitled diagram"
+            variant="borderless"
+            onFocus={() => { isEditingTitleRef.current = true; }}
+            onChange={e => setDiagramName(e.target.value)}
+            onPressEnter={e => (e.target as HTMLInputElement).blur()}
+            onBlur={e => commitTitle(e.target.value)}
+            style={{ width: 220, fontSize: 15, fontWeight: 500, padding: '4px 8px' }}
+          />
+        </div>
+        {/* A real flex child (flex:1, minWidth:0) instead of the old
+            position:absolute+translateX(-50%) centering trick — that
+            centered the toolbar on the WHOLE header regardless of how much
+            room the title/right-side controls actually left it, so a long
+            title or several right-side buttons made it visually collide
+            with both. This gives Toolbar.tsx's own responsive overflow
+            (see its ResizeObserver) a genuine, measurable available width
+            to react to. */}
         <div
           ref={setToolbarSlotEl}
-          style={{
-            position: 'absolute', left: '50%', top: 0, bottom: 0, transform: 'translateX(-50%)',
-            display: 'flex', alignItems: 'center',
-          }}
+          style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}
         />
-        <div style={{ flex: 1 }} />
-        {role === 'edit' && (
-          <Tooltip title="Copy invite link">
-            <Button icon={<IconShare />} onClick={() => copyInviteLink(inviteToken)}>Share</Button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+          {role === 'edit' && (
+            <Tooltip title="Copy invite link">
+              <Button icon={<IconShare />} onClick={() => copyInviteLink(inviteToken)} />
+            </Tooltip>
+          )}
+          {role === 'edit' && (
+            <Segmented
+              size="small"
+              value={viewMode}
+              onChange={v => setViewMode(v as 'pages' | 'masters')}
+              options={[{ label: 'Pages', value: 'pages' }, { label: 'Master Pages', value: 'masters' }]}
+            />
+          )}
+          <Tooltip title="Version history">
+            <Button icon={<IconHistory />} onClick={() => setVersionHistoryOpen(true)} />
           </Tooltip>
-        )}
-        {role === 'edit' && (
-          <Segmented
-            size="small"
-            value={viewMode}
-            onChange={v => setViewMode(v as 'pages' | 'masters')}
-            options={[{ label: 'Pages', value: 'pages' }, { label: 'Master Pages', value: 'masters' }]}
-          />
-        )}
-        <Tooltip title="Version history">
-          <Button icon={<IconHistory />} onClick={() => setVersionHistoryOpen(true)} />
-        </Tooltip>
-        {viewMode === 'pages' && (
-          <>
-            <Tooltip title="Presenter view (notes + next slide — open on your own screen, then Present on the shared one)">
-              <Button icon={<IconPresenterNotes />} onClick={() => window.open(`/simple-presentation/d/${id}/present?mode=presenter`, '_blank')} />
-            </Tooltip>
-            <Tooltip title="Present">
-              <Button icon={<IconPlayCircle />} onClick={() => window.open(`/simple-presentation/d/${id}/present`, '_blank')} />
-            </Tooltip>
-          </>
-        )}
+          {viewMode === 'pages' && (
+            <>
+              <Tooltip title="Presenter view (notes + next slide — open on your own screen, then Present on the shared one)">
+                <Button icon={<IconPresenterNotes />} onClick={() => window.open(`/simple-presentation/d/${id}/present?mode=presenter`, '_blank')} />
+              </Tooltip>
+              <Tooltip title="Present">
+                <Button icon={<IconPlayCircle />} onClick={() => window.open(`/simple-presentation/d/${id}/present`, '_blank')} />
+              </Tooltip>
+            </>
+          )}
+        </div>
       </div>
       <div style={{ flex: 1, minHeight: 0 }}>
         <ReactFlowProvider>

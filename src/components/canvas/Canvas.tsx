@@ -74,7 +74,7 @@ import type { DiagramVariable } from '../../types/variables';
 import {
   subscribeShapes, subscribeConnectors, saveShape, deleteShape, saveConnector, deleteConnector,
   subscribeVariables, upsertVariable, deleteVariable, updatePage, duplicatePage, detachMasterShape,
-  subscribeComments, saveComment, deleteComment, setCoverPage,
+  subscribeComments, saveComment, deleteComment, setCoverPage, deletePage,
 } from '../../store';
 import type { DiagramComment } from '../../types/comments';
 import { useAuth } from '../../AuthContext';
@@ -612,6 +612,20 @@ export function Canvas({
       const masterById = new Map(masterShapes.map(s => [s.id, s]));
       const overridden = new Set(page.overriddenMasterShapeIds ?? []);
       const dy = (pageOrigins.get(page.id) ?? 0) - (masterOrigins.get(page.masterPageId) ?? 0);
+      // Every inherited shape used to collapse to the exact same zIndex
+      // (-0.5) regardless of its real stacking order on the master — an
+      // opaque background shape and the logo/title/text meant to sit ON TOP
+      // of it became stacking TIES, and whichever one happened to land
+      // later in this array/DOM order won, silently painting over the
+      // other. A background shape winning that tie makes the text/logo
+      // it's covering look like it simply never inherited at all. Ranking
+      // each master shape by its own zIndex and spreading those ranks
+      // across the (-1, 0) band (still behind every real page shape, still
+      // in front of the page frame at -1) preserves their relative order
+      // instead of flattening it.
+      const orderedByZ = [...masterShapes].sort((a, b) => (a.zIndex ?? 0) - (b.zIndex ?? 0));
+      const zRank = new Map(orderedByZ.map((s, i) => [s.id, i]));
+      const zCount = orderedByZ.length;
       for (const m of sortByParentDepth(masterShapes)) {
         if (isOverriddenOrAncestor(m.id, masterById, overridden)) continue;
         const inheritedId = `inherited-${page.id}-${m.id}`;
@@ -624,14 +638,7 @@ export function Canvas({
           // "only top-level shapes carry an absolute position" rule
           // handleReorderPagesWithShapes/handleResizePageContent rely on.
           position: m.parentId ? m.position : { x: m.position.x, y: m.position.y + dy },
-          // Behind every real shape (which default to zIndex 0 — see
-          // nextZIndexForPage) but ABOVE the page frame's own opaque
-          // background (zIndex -1) — matches this file's own existing
-          // -0.5 "just behind normal content" convention used elsewhere
-          // (e.g. the dimmed/ghost layers around line 2828). -1000 here
-          // would paint UNDER the frame's background, making inherited
-          // shapes invisible despite genuinely being in the node tree.
-          zIndex: -0.5,
+          zIndex: -1 + (zRank.get(m.id)! + 1) / (zCount + 1),
           draggable: false,
           selectable: true,
           connectable: false,
@@ -1436,6 +1443,20 @@ export function Canvas({
       selectable: false,
       draggable: false,
       zIndex: maxSelectedZ + 1,
+      // `selectable`/`draggable` above only stop REACT FLOW's own node
+      // logic from treating this node as interactive — they don't touch
+      // the wrapper DIV React Flow itself renders for every node, which
+      // defaults to pointer-events:auto regardless. Sitting a full pointer-
+      // events:auto box directly on top of every selected shape (by
+      // definition — this node's bbox is exactly their union) swallowed
+      // every ordinary click-and-drag on the group before it ever reached
+      // a real shape underneath: the drag never started, so nothing moved.
+      // MultiSelectOverlayNode's own root div already sets pointer-
+      // events:none and re-enables it only on the actual resize handles
+      // (NodeResizer/EdgeResizeHandles' lineStyle/handleStyle) — this does
+      // the same for the outer wrapper the component itself has no control
+      // over, via the one thing that CAN reach it: the node's own `style`.
+      style: { pointerEvents: 'none' },
       data: { onResizeStart: handleMultiSelectResizeStart, onResizeEnd: handleMultiSelectResizeEnd },
     }];
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2075,6 +2096,19 @@ export function Canvas({
         }
       }
     }
+    // Position/dimension commits from every change in THIS batch are
+    // collected here and written to shapesSlices.current in one
+    // commitShapeUpdates() call after the loop, not one call per shape. Two
+    // reasons: (1) it's the exact multi-shape-drag case the single-call
+    // form would otherwise re-render N times for (drag/resize a
+    // multi-selection and every change above arrives in one `changes`
+    // array), and (2) more importantly, calling rebuildShapes() partway
+    // through this loop — while some of THIS SAME drag's shapes are still
+    // only reflected in `shapeNodes`, not yet in the slice — reintroduces
+    // the exact stale-slice rebuild this fix exists to close, just with a
+    // narrower window (see the comment on commitShapeUpdates itself for
+    // the full "why").
+    const shapeUpdates: { id: string; pageId: string; node: DiagramNode }[] = [];
     for (const change of changes) {
       if (change.type === 'position' && change.dragging === false && change.position) {
         const node = shapeNodes.find(n => n.id === change.id);
@@ -2091,7 +2125,23 @@ export function Canvas({
               redo: () => applyReparent(change.id, { parentId: container.id, extent: 'parent', position: relativePosition }),
             });
           } else {
-            saveShape(diagramId, pageId, toPersistableShape({ ...node, position: nextPosition }));
+            // Was a bare saveShape() with no write into shapesSlices.current
+            // and no rebuildShapes() — every OTHER mutation path in this file
+            // (applyPosition, applySize, applyReparent, commitShapeUpdates)
+            // writes the slice before saving specifically because the
+            // per-page Firestore listener calls rebuildShapes() on every
+            // echo, including the echo of the write this is about to issue.
+            // Skipping that write left a window, between "drag released"
+            // and "our own echo comes back", where the slice still held the
+            // PRE-drag position. Any OTHER shape's echo on the same page
+            // landing in that window (near-instant locally, but common
+            // under real network latency, and more likely the longer a drag
+            // itself lags) called rebuildShapes() off the stale slice and
+            // reverted this shape's on-screen position back to pre-drag —
+            // then the real echo landed a moment later and corrected it
+            // again, reading as a shape briefly duplicating/tearing away
+            // from a multi-shape drag rather than moving as one unit.
+            shapeUpdates.push({ id: change.id, pageId, node: toPersistableShape({ ...node, position: nextPosition }) });
             if (prevPosition && (prevPosition.x !== nextPosition.x || prevPosition.y !== nextPosition.y)) {
               pushHistory({ undo: () => applyPosition(change.id, prevPosition), redo: () => applyPosition(change.id, nextPosition) });
             }
@@ -2105,7 +2155,8 @@ export function Canvas({
           const nextSize = change.dimensions;
           const committed = getCommittedShape(change.id);
           const prevSize = committed ? { width: committed.width ?? 100, height: committed.height ?? 70 } : undefined;
-          saveShape(diagramId, pageId, toPersistableShape({ ...node, width: nextSize.width, height: nextSize.height }));
+          // Same stale-slice race as the position commit above.
+          shapeUpdates.push({ id: change.id, pageId, node: toPersistableShape({ ...node, width: nextSize.width, height: nextSize.height }) });
           if (prevSize && (prevSize.width !== nextSize.width || prevSize.height !== nextSize.height)) {
             pushHistory({ undo: () => applySize(change.id, prevSize), redo: () => applySize(change.id, nextSize) });
           }
@@ -2150,6 +2201,7 @@ export function Canvas({
         }
       }
     }
+    if (shapeUpdates.length > 0) commitShapeUpdates(shapeUpdates);
   }, [frameNodes, shapeNodes, connectorEdges, diagramId]);
 
   const onEdgesChange = useCallback((changes: EdgeChange[]) => {
@@ -2412,6 +2464,29 @@ export function Canvas({
 
   function handleShapePlaceMouseDown(e: React.MouseEvent) {
     if (!placingShapeKind) return;
+    // This fires on EVERY mousedown anywhere in the canvas wrapper (it's
+    // composed into handleWrapperMouseDown below), with no check on what
+    // was actually clicked — so a mousedown landing on an EXISTING shape
+    // while placement mode was still armed (e.g. the user picked a shape
+    // from the gallery, then changed their mind and went to drag something
+    // else instead, without first pressing Escape) placed and PERSISTED a
+    // brand-new stray shape at that exact point via commitPlaceShape's own
+    // saveShape/crypto.randomUUID() — while React Flow's own independent
+    // node-drag machinery, having already armed on that same native
+    // mousedown, went on to move the EXISTING shape normally. The result:
+    // the shape you meant to drag moves to its new spot as expected, PLUS
+    // a genuine second, real, refresh-surviving shape is left behind
+    // wherever the drag started. Matches handleMarqueeMouseDown's own
+    // established pattern just below — only the page's own background
+    // (.react-flow__node-pageFrame) counts as "empty canvas" to place on;
+    // anything else means the click was actually meant for a real shape,
+    // so cancel placement instead of stamping a copy of it.
+    const target = e.target as HTMLElement;
+    if (!target.closest('.react-flow__node-pageFrame')) {
+      setPlacingShapeKind(null);
+      setPendingMediaPlacement(null);
+      return;
+    }
     e.preventDefault();
     const flowPoint = screenToFlowPosition({ x: e.clientX, y: e.clientY });
     commitPlaceShape(placingShapeKind, flowPoint);
@@ -3125,6 +3200,15 @@ export function Canvas({
   const singleSelectedShape = selectedShapeIds.length === 1
     ? (shapeNodes.find(n => n.id === selectedShapeIds[0]) ?? inheritedMasterNodes.find(n => n.id === selectedShapeIds[0]))
     : undefined;
+  // 2+ real (never inherited-from-master — those are locked/read-only)
+  // selected shapes, for ShapePropertiesPanel's bulk-edit mode: style/font/
+  // etc. fields apply to every one of these at once, while geometry
+  // (position/size, via onResize/onMove) stays scoped to just the first —
+  // the dedicated multi-select resize overlay already covers bulk resize in
+  // a way that actually accounts for each shape's own position/size.
+  const bulkSelectedShapes = selectedShapeIds.length >= 2
+    ? selectedShapeIds.map(id => shapeNodes.find(n => n.id === id)).filter((n): n is Node => !!n)
+    : [];
   const selectedEdges = connectorEdges.filter(e => e.selected);
   const singleSelectedEdge = selectedEdges.length === 1 ? selectedEdges[0] : undefined;
   const BOOLEAN_ELIGIBLE_KINDS = new Set(['path', 'ellipse', 'rectangle', 'stickyNote', 'container']);
@@ -3641,6 +3725,39 @@ export function Canvas({
     const sourcePage = regularPages.find(p => p.id === pageId);
     if (!sourcePage) return;
     await duplicatePage(diagramId, sourcePage, masterPages, true);
+  }
+
+  // Same guard/warning logic as PageSettingsPanel's own delete button
+  // (Popconfirm there vs. Modal.confirm here, since this fires from a
+  // context-menu click rather than a button that can wrap a Popconfirm) —
+  // kept in sync deliberately so deleting a page reads the same regardless
+  // of which affordance was used.
+  function handleDeletePage(pageId: string) {
+    const page = pages.find(p => p.id === pageId);
+    if (!page) return;
+    if (!page.isMaster && regularPages.length <= 1) return;
+    const referencing = page.isMaster ? regularPages.filter(p => p.masterPageId === page.id) : [];
+    // Every page after this one (within its own kind's stack — regular vs
+    // master) needs its shapes shifted up by this page's height+gap once
+    // it's gone, or its content silently stays exactly where it was while
+    // its page frame jumps to close the gap — see deletePage's own comment
+    // in store.ts for the full "why."
+    const ownStack = page.isMaster ? masterPages : regularPages;
+    const pageIndex = ownStack.findIndex(p => p.id === pageId);
+    const subsequentPageIds = pageIndex >= 0 ? ownStack.slice(pageIndex + 1).map(p => p.id) : [];
+    const { height } = getPageDimensions(page.paperSize, page.orientation, page.customWidth, page.customHeight);
+    const deltaY = height + PAGE_GAP;
+    Modal.confirm({
+      title: page.isMaster ? 'Delete this master?' : 'Delete this page?',
+      content: page.isMaster && referencing.length > 0
+        ? `${referencing.length} page${referencing.length === 1 ? '' : 's'} using this master will lose its shape content, background, header & footer — not just fall back to a default.`
+        : undefined,
+      okText: 'Delete', okButtonProps: { danger: true },
+      onOk: async () => {
+        for (const p of referencing) await updatePage(diagramId, p.id, { masterPageId: undefined });
+        await deletePage(diagramId, pageId, subsequentPageIds, deltaY);
+      },
+    });
   }
 
   // In-memory clipboard (a ref, not the OS Clipboard API — this is a
@@ -4445,6 +4562,7 @@ export function Canvas({
           onDuplicatePage={handleDuplicatePage}
           onCloneIntoMasters={viewMode === 'masters' ? undefined : handleCloneIntoMasters}
           onSetCoverPage={handleSetCoverPage}
+          onDeletePage={handleDeletePage}
           isMastersMode={viewMode === 'masters'}
         />
       )}
@@ -4499,23 +4617,30 @@ export function Canvas({
         </div>
       )}
 
-      {!isPresent && singleSelectedShape && !gridRulersPanelOpen && !tagsPanelOpen && !pageSettingsPanelOpen && (
-        <ShapePropertiesPanel
-          node={singleSelectedShape}
-          diagramId={diagramId}
-          pages={pages}
-          allShapes={shapeNodes}
-          variables={variables}
-          connectorEdges={connectorEdges}
-          onChange={patch => onCommit(singleSelectedShape.id, patch)}
-          onResize={(w, h) => handleResizeShape(singleSelectedShape.id, w, h)}
-          onMove={(x, y) => handleMoveShape(singleSelectedShape.id, x, y)}
-          pageOrigin={pageOrigins.get(findPageIdFor(singleSelectedShape) ?? '') ?? 0}
-          onDeleteEdge={id => onEdgesChange([{ type: 'remove', id }])}
-          onClose={deselectAll}
-          onDetachFromMaster={handleDetachMasterShape}
-        />
-      )}
+      {!isPresent && (singleSelectedShape || bulkSelectedShapes.length > 1) && !gridRulersPanelOpen && !tagsPanelOpen && !pageSettingsPanelOpen && (() => {
+        const referenceNode = singleSelectedShape ?? bulkSelectedShapes[0];
+        return (
+          <ShapePropertiesPanel
+            node={referenceNode}
+            bulkCount={bulkSelectedShapes.length > 1 ? bulkSelectedShapes.length : undefined}
+            diagramId={diagramId}
+            pages={pages}
+            allShapes={shapeNodes}
+            variables={variables}
+            connectorEdges={connectorEdges}
+            onChange={patch => {
+              if (bulkSelectedShapes.length > 1) { for (const n of bulkSelectedShapes) onCommit(n.id, patch); }
+              else onCommit(referenceNode.id, patch);
+            }}
+            onResize={(w, h) => handleResizeShape(referenceNode.id, w, h)}
+            onMove={(x, y) => handleMoveShape(referenceNode.id, x, y)}
+            pageOrigin={pageOrigins.get(findPageIdFor(referenceNode) ?? '') ?? 0}
+            onDeleteEdge={id => onEdgesChange([{ type: 'remove', id }])}
+            onClose={deselectAll}
+            onDetachFromMaster={handleDetachMasterShape}
+          />
+        );
+      })()}
 
       {dataPanelOpen && !singleSelectedShape && (
         <DataPanel

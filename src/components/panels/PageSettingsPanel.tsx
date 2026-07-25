@@ -4,6 +4,7 @@ import { Button, Input, Select, Radio, Switch, InputNumber, Popconfirm, Tooltip 
 import { IconClose, IconDelete } from '../icons';
 import type { DiagramPage, HeaderFooterZones, PageNumberPosition, PageNumberStyle } from '../../types/document';
 import { FRAME_PRESETS, getPageDimensions } from '../../utils/paperSizes';
+import { PAGE_GAP } from '../../constants';
 import { updatePage, deletePage } from '../../store';
 import { ColorPickerField } from './ColorPickerField';
 import { PeekableDrawer } from './PeekableDrawer';
@@ -299,7 +300,14 @@ export function PageSettingsPanel({ diagramId, page, pages, masterPages, pageOri
             // again, and would keep offering a "Detach from master" action
             // for shapes that no longer have a live source.
             for (const p of referencing) updatePage(diagramId, p.id, { masterPageId: undefined });
-            deletePage(diagramId, page.id);
+            // Every page after this one (within its own kind's stack)
+            // needs its shapes shifted up by this page's height+gap once
+            // it's gone — see deletePage's own comment in store.ts.
+            const ownStack = page.isMaster ? masterPages : pages;
+            const pageIndex = ownStack.findIndex(p => p.id === page.id);
+            const subsequentPageIds = pageIndex >= 0 ? ownStack.slice(pageIndex + 1).map(p => p.id) : [];
+            const { height } = getPageDimensions(page.paperSize, page.orientation, page.customWidth, page.customHeight);
+            deletePage(diagramId, page.id, subsequentPageIds, height + PAGE_GAP);
             onClose();
           }
           return (

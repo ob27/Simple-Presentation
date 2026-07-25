@@ -1,6 +1,6 @@
 import { useState, Fragment } from 'react';
 import { Tooltip, Button, Dropdown } from 'antd';
-import { IconAdd, IconDuplicate } from '../icons';
+import { IconAdd, IconDuplicate, IconDelete } from '../icons';
 import { LoadingOutlined } from '@ant-design/icons';
 import {
   DndContext, PointerSensor, KeyboardSensor, useSensor, useSensors, closestCenter,
@@ -37,6 +37,11 @@ interface Props {
   // source page's.
   onCloneIntoMasters?: (pageId: string) => void;
   onSetCoverPage?: (pageId: string) => void;
+  // Guard/confirmation (can't delete the last regular page, warns if a
+  // master's referencing pages will lose their inherited content) lives in
+  // Canvas.tsx's handleDeletePage, same as PageSettingsPanel's own delete
+  // button — this is just the second entry point into it.
+  onDeletePage: (pageId: string) => void;
   isMastersMode?: boolean;
 }
 
@@ -59,7 +64,7 @@ export const THUMB_MAX_HEIGHT = 132;
 export function PageNavigatorRail({
   pages, pageOrigins, pageDimensions, shapeNodes, pageSnapshots, generatingSnapshotPageIds,
   onSelectPage, onInsertPageAt, onReorderPages, onOpenPageSettings, onDuplicatePage,
-  onCloneIntoMasters, onSetCoverPage, isMastersMode,
+  onCloneIntoMasters, onSetCoverPage, onDeletePage, isMastersMode,
 }: Props) {
   const activePageId = useActivePageId(pages, pageOrigins, pageDimensions);
 
@@ -116,6 +121,7 @@ export function PageNavigatorRail({
                   onDuplicatePage={onDuplicatePage}
                   onCloneIntoMasters={!isMastersMode ? onCloneIntoMasters : undefined}
                   onSetCoverPage={onSetCoverPage}
+                  onDeletePage={onDeletePage}
                 />
                 <PageGap afterOrder={page.order} onInsert={onInsertPageAt} />
               </Fragment>
@@ -161,7 +167,7 @@ function PageGap({ afterOrder, onInsert }: { afterOrder: number; onInsert: (afte
 
 function SortablePageThumb({
   page, index, activePageId, thumbW, thumbH, dims, origin, pageShapes, snapshot, generating,
-  onSelectPage, onOpenPageSettings, onDuplicatePage, onCloneIntoMasters, onSetCoverPage,
+  onSelectPage, onOpenPageSettings, onDuplicatePage, onCloneIntoMasters, onSetCoverPage, onDeletePage,
 }: {
   page: DiagramPage;
   index: number;
@@ -178,6 +184,7 @@ function SortablePageThumb({
   onDuplicatePage: (pageId: string) => void;
   onCloneIntoMasters?: (pageId: string) => void;
   onSetCoverPage?: (pageId: string) => void;
+  onDeletePage: (pageId: string) => void;
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: page.id });
   const [contextMenuOpen, setContextMenuOpen] = useState(false);
@@ -186,6 +193,8 @@ function SortablePageThumb({
     { key: 'duplicate', icon: <IconDuplicate />, label: 'Duplicate page' },
     ...(onCloneIntoMasters ? [{ key: 'cloneIntoMasters', icon: <IconAdd />, label: 'Clone into Master Pages' }] : []),
     ...(onSetCoverPage ? [{ key: 'setCover', icon: <IconAdd />, label: 'Set as cover' }] : []),
+    { type: 'divider' as const },
+    { key: 'delete', icon: <IconDelete />, label: 'Delete page', danger: true },
   ];
 
   return (
@@ -209,6 +218,7 @@ function SortablePageThumb({
             if (key === 'duplicate') onDuplicatePage(page.id);
             else if (key === 'cloneIntoMasters') onCloneIntoMasters?.(page.id);
             else if (key === 'setCover') onSetCoverPage?.(page.id);
+            else if (key === 'delete') onDeletePage(page.id);
           },
         }}
       >

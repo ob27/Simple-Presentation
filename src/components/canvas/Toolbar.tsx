@@ -1,10 +1,10 @@
-import { useRef } from 'react';
-import { Tooltip } from 'antd';
+import { useLayoutEffect, useRef, useState } from 'react';
+import { Tooltip, Popover } from 'antd';
 import {
   IconShapes, IconPenTool, IconDirectSelect, IconConnector, IconHotspot, IconImage,
   IconLayers, IconBranchHighlight, IconAnimationPanel, IconVariables, IconExport, IconContainer,
   IconSelect, IconComment, IconBrush, IconStylePaint, IconUndo, IconRedo, IconHelp,
-  IconRulerGrid, IconTags, IconValidation, IconSettingsGear, IconTextTool,
+  IconRulerGrid, IconTags, IconValidation, IconSettingsGear, IconTextTool, IconMore,
 } from '../icons';
 import type { ToolId } from '../../types/tools';
 
@@ -31,6 +31,17 @@ interface Props {
   onOpenShortcuts: () => void;
 }
 
+const BUTTON_W = 28;
+const GAP = 6;
+const DIVIDER_W = 9; // 1px border + ~4px margin each side
+
+// Rough (not pixel-exact) width estimate for a run of N fixed-size icon
+// buttons with a `gap: 6` between them — good enough to decide an overflow
+// threshold, not meant to be exact to the pixel.
+function runWidth(buttonCount: number): number {
+  return buttonCount * BUTTON_W + Math.max(0, buttonCount - 1) * GAP;
+}
+
 function ToolButton({
   active, disabled, onClick, title, children,
 }: { active?: boolean; disabled?: boolean; onClick: () => void; title: string; children: React.ReactNode }) {
@@ -42,7 +53,7 @@ function ToolButton({
         style={{
           width: 28, height: 28, border: `1px solid ${active ? '#1677ff' : '#d4d7e0'}`, cursor: disabled ? 'default' : 'pointer',
           background: active ? '#EEF4FF' : '#fff', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
-          borderRadius: 6, fontSize: 14, color: active ? '#1677ff' : '#555', opacity: disabled ? 0.4 : 1,
+          borderRadius: 6, fontSize: 14, color: active ? '#1677ff' : '#555', opacity: disabled ? 0.4 : 1, flexShrink: 0,
         }}
       >
         {children}
@@ -52,7 +63,7 @@ function ToolButton({
 }
 
 function Divider() {
-  return <div style={{ width: 1, background: '#e6e8ef', margin: '4px 2px' }} />;
+  return <div style={{ width: 1, background: '#e6e8ef', margin: '4px 2px', flexShrink: 0 }} />;
 }
 
 // Replaces ShapePalette.tsx — merges the old left-side shape palette AND the
@@ -63,6 +74,18 @@ function Divider() {
 // Rendered into a slot inside the document header (via portal from
 // Canvas.tsx) rather than floating over the canvas, so it needs no
 // positioning of its own — just an inline row of buttons.
+//
+// Responsive: with 24 buttons across 6 groups, this row can easily out-grow
+// the space DocumentEditor.tsx's header actually has between the title and
+// the right-side controls (Share/Pages-Master toggle/version history/
+// Presenter/Present), especially with a long document title. Rather than
+// silently overlapping those neighbors, the two least-core groups ("panels"
+// and "misc" below) collapse into a single "…" button + popover once a
+// ResizeObserver on this row's own container reports too little width —
+// first "misc" (branch highlight/grid/tags/export/help), then "panels"
+// (layers/animation/data/validation/page settings) if space is tighter
+// still. The core interaction groups (history, select, creation tools,
+// connector/comment) never collapse.
 export function Toolbar({
   onUndo, onRedo,
   activeTool, onSelectTool, directSelectDisabled,
@@ -70,18 +93,28 @@ export function Toolbar({
   onOpenExport, onOpenShortcuts,
 }: Props) {
   const fileRef = useRef<HTMLInputElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [availableWidth, setAvailableWidth] = useState<number | null>(null);
 
-  return (
-    <div style={{ display: 'flex', flexDirection: 'row', gap: 6 }}>
-      <ToolButton title="Undo (Cmd/Ctrl+Z)" onClick={onUndo}>
-        <IconUndo />
-      </ToolButton>
-      <ToolButton title="Redo (Cmd/Ctrl+Shift+Z)" onClick={onRedo}>
-        <IconRedo />
-      </ToolButton>
+  useLayoutEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver(entries => {
+      const width = entries[0]?.contentRect.width;
+      if (width !== undefined) setAvailableWidth(width);
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
 
-      <Divider />
-
+  const history = (
+    <>
+      <ToolButton title="Undo (Cmd/Ctrl+Z)" onClick={onUndo}><IconUndo /></ToolButton>
+      <ToolButton title="Redo (Cmd/Ctrl+Shift+Z)" onClick={onRedo}><IconRedo /></ToolButton>
+    </>
+  );
+  const selection = (
+    <>
       <ToolButton title="Select — click shapes, or drag to select multiple" active={activeTool === null} onClick={() => onSelectTool('select')}>
         <IconSelect />
       </ToolButton>
@@ -91,9 +124,10 @@ export function Toolbar({
       >
         <IconDirectSelect />
       </ToolButton>
-
-      <Divider />
-
+    </>
+  );
+  const creation = (
+    <>
       <ToolButton title="Shapes — browse the shape library" active={activeTool === 'shapeGallery' || activeTool === 'shapes'} onClick={() => onSelectTool('shapeGallery')}>
         <IconShapes />
       </ToolButton>
@@ -132,18 +166,20 @@ export function Toolbar({
           if (file) onUploadMedia(file);
         }}
       />
-
-      <Divider />
-
+    </>
+  );
+  const connect = (
+    <>
       <ToolButton title={activeTool === 'connect' ? 'Exit arrow tool (Esc)' : 'Arrow tool — click-drag from one shape to another to connect them'} active={activeTool === 'connect'} onClick={() => onSelectTool('connect')}>
         <IconConnector />
       </ToolButton>
       <ToolButton title="Comment — click the canvas to drop a comment pin" active={activeTool === 'comment'} onClick={() => onSelectTool('comment')}>
         <IconComment />
       </ToolButton>
-
-      <Divider />
-
+    </>
+  );
+  const panels = (
+    <>
       <ToolButton title="Layers" active={activeTool === 'layers'} onClick={() => onSelectTool('layers')}>
         <IconLayers />
       </ToolButton>
@@ -159,9 +195,10 @@ export function Toolbar({
       <ToolButton title="Page settings — size, margins, master, header/footer, page numbers" active={activeTool === 'pageSettings'} onClick={() => onSelectTool('pageSettings')}>
         <IconSettingsGear />
       </ToolButton>
-
-      <Divider />
-
+    </>
+  );
+  const misc = (
+    <>
       <ToolButton title={activeTool === 'highlight' ? 'Exit branch highlight' : 'Branch highlight — click a shape to trace its downstream path'} active={activeTool === 'highlight'} onClick={() => onSelectTool('highlight')}>
         <IconBranchHighlight />
       </ToolButton>
@@ -177,6 +214,70 @@ export function Toolbar({
       <ToolButton title="Keyboard shortcuts (?)" onClick={onOpenShortcuts}>
         <IconHelp />
       </ToolButton>
+    </>
+  );
+
+  // Fixed widths for the always-visible groups (never collapse) plus the
+  // dividers between them — history | select | creation | connect.
+  const coreWidth = runWidth(2) + DIVIDER_W + runWidth(2) + DIVIDER_W + runWidth(8) + DIVIDER_W + runWidth(2);
+  const panelsWidth = runWidth(5);
+  const miscWidth = runWidth(5);
+  const overflowButtonWidth = BUTTON_W;
+
+  // Unknown width yet (first paint, before the ResizeObserver reports) —
+  // show everything rather than flash a collapsed state that immediately
+  // expands once the real width is known.
+  const showPanels = availableWidth === null || availableWidth >= coreWidth + DIVIDER_W + panelsWidth + DIVIDER_W + miscWidth;
+  const showMisc = showPanels;
+  // Panels alone (misc collapsed) still fits without needing the overflow
+  // button reserved, since it's already accounted for below.
+  const showPanelsOnly = !showMisc && (availableWidth === null || availableWidth >= coreWidth + DIVIDER_W + panelsWidth + GAP + overflowButtonWidth);
+
+  const overflowContent: React.ReactNode[] = [];
+  if (!showMisc && !showPanelsOnly) overflowContent.push(<div key="panels" style={{ display: 'flex', gap: 6 }}>{panels}</div>);
+  if (!showMisc) overflowContent.push(<div key="misc" style={{ display: 'flex', gap: 6 }}>{misc}</div>);
+
+  return (
+    <div ref={containerRef} style={{ display: 'flex', flexDirection: 'row', gap: 6, alignItems: 'center', minWidth: 0, overflow: 'hidden' }}>
+      {history}
+      <Divider />
+      {selection}
+      <Divider />
+      {creation}
+      <Divider />
+      {connect}
+      {(showPanels || showPanelsOnly) && (
+        <>
+          <Divider />
+          {panels}
+        </>
+      )}
+      {showMisc && (
+        <>
+          <Divider />
+          {misc}
+        </>
+      )}
+      {overflowContent.length > 0 && (
+        <>
+          <Divider />
+          <Popover
+            trigger="click"
+            placement="bottomRight"
+            content={<div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>{overflowContent}</div>}
+          >
+            <button
+              title="More tools"
+              style={{
+                width: 28, height: 28, border: '1px solid #d4d7e0', cursor: 'pointer', background: '#fff', padding: 0,
+                display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6, color: '#555', flexShrink: 0,
+              }}
+            >
+              <IconMore />
+            </button>
+          </Popover>
+        </>
+      )}
     </div>
   );
 }

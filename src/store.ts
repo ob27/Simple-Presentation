@@ -9,8 +9,45 @@ import type { DiagramEdge } from './types/edges';
 import type { DiagramVariable } from './types/variables';
 import type { DiagramComment } from './types/comments';
 import { getPageDimensions } from './utils/paperSizes';
-import { DEFAULT_ORIENTATION, DEFAULT_PAPER_SIZE } from './constants';
+import { DEFAULT_ORIENTATION, DEFAULT_PAPER_SIZE, PAGE_GAP } from './constants';
 import { buildTemplateThumbnailSvgDataUrl } from './utils/templateThumbnail';
+
+// Shared by addPage/addMasterPage (insert — shifts subsequent pages' shapes
+// DOWN by the new page's height+gap) and deletePage (removal — shifts them
+// UP by the removed page's height+gap). A page's own Y-origin in the
+// stacked canvas is purely derived from the OTHER pages that come before
+// it (see Canvas.tsx's pageOrigins), so inserting or removing a page
+// anywhere but the very end changes every LATER page's origin — but
+// nothing previously moved those later pages' own shapes to match: their
+// absolute position kept assuming the old layout, so a page's frame would
+// visually jump to its new slot while its actual content stayed exactly
+// where it was (or, worse, appeared to land on the wrong page entirely
+// once two pages' content overlapped in the same Y-range). Only top-level
+// (parentless) shapes carry an absolute, page-relative Y — a grouped/
+// contained child's position is already local to its parent.
+async function reflowPageShapes(diagramId: string, pageIds: string[], deltaY: number): Promise<void> {
+  if (pageIds.length === 0 || deltaY === 0) return;
+  const snaps = await Promise.all(
+    pageIds.map(pid => getDocs(collection(db, 'diagrams', diagramId, 'pages', pid, 'shapes'))),
+  );
+  const updates: { ref: ReturnType<typeof doc>; data: DiagramNode }[] = [];
+  pageIds.forEach((pid, i) => {
+    for (const d of snaps[i].docs) {
+      const shape = d.data() as DiagramNode;
+      if (shape.parentId) continue;
+      updates.push({
+        ref: doc(db, 'diagrams', diagramId, 'pages', pid, 'shapes', shape.id),
+        data: { ...shape, position: { x: shape.position.x, y: shape.position.y + deltaY } },
+      });
+    }
+  });
+  const CHUNK = 400;
+  for (let i = 0; i < updates.length; i += CHUNK) {
+    const batch = writeBatch(db);
+    for (const u of updates.slice(i, i + CHUNK)) batch.set(u.ref, u.data);
+    await batch.commit();
+  }
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -216,13 +253,20 @@ export async function addPage(diagramId: string, pages: DiagramPage[], afterOrde
     customWidth: options.customWidth,
     customHeight: options.customHeight,
   };
+  const bumped = pages.filter(p => p.order >= newOrder);
   const batch = writeBatch(db);
-  for (const p of pages) {
-    if (p.order >= newOrder) batch.update(doc(db, 'diagrams', diagramId, 'pages', p.id), { order: p.order + 1 });
+  for (const p of bumped) {
+    batch.update(doc(db, 'diagrams', diagramId, 'pages', p.id), { order: p.order + 1 });
   }
   batch.set(doc(db, 'diagrams', diagramId, 'pages', pageId), page);
   batch.update(doc(db, 'diagrams', diagramId), { updatedAt: Date.now() });
   await batch.commit();
+  // Every bumped page shifts DOWN by this new page's height+gap — inserting
+  // anywhere but the very end otherwise leaves their shapes exactly where
+  // they were while their page frame jumps down to its new slot. See
+  // reflowPageShapes' own comment for the full "why."
+  const { height } = getPageDimensions(page.paperSize, page.orientation, page.customWidth, page.customHeight);
+  await reflowPageShapes(diagramId, bumped.map(p => p.id), height + PAGE_GAP);
   return page;
 }
 
@@ -267,6 +311,34 @@ export async function duplicatePage(
     overriddenMasterShapeIds: undefined,
   };
 
+  // The clone always lands at the END of destinationPages (newOrder is
+  // always max+1 — the "bump existing pages" branch below is dead in
+  // practice, since nothing is ever already >= newOrder), which almost
+  // always gives it a DIFFERENT origin than sourcePage had. Every shape's
+  // position is an absolute, page-relative Y (see reflowPageShapes' own
+  // comment in this file for the full "why") — copying it verbatim from
+  // source, as this used to do, put the clone's content at source's OLD
+  // origin instead of the new page's, then any later reorder compounded
+  // the error further (its delta math assumes a freshly-created page's
+  // shapes already sit at that page's true current origin). Computing both
+  // origins the same way pageOrigins/reflowPageShapes do — summing
+  // height+gap over every page ordered before the target — and shifting by
+  // the difference keeps the clone's content exactly where it visually was.
+  function originOf(pageId: string): number {
+    const sorted = [...destinationPages].sort((a, b) => a.order - b.order);
+    let cursorY = 0;
+    for (const p of sorted) {
+      if (p.id === pageId) return cursorY;
+      const { height } = getPageDimensions(p.paperSize, p.orientation, p.customWidth, p.customHeight);
+      cursorY += height + PAGE_GAP;
+    }
+    // Not found among destinationPages (true for the brand-new page being
+    // inserted here) — its origin is past every existing page, i.e. the
+    // running total after summing all of them.
+    return cursorY;
+  }
+  const deltaY = originOf(newPageId) - originOf(sourcePage.id);
+
   const batch = writeBatch(db);
   for (const p of destinationPages) {
     if (p.order >= newOrder) batch.update(doc(db, 'diagrams', diagramId, 'pages', p.id), { order: p.order + 1 });
@@ -285,7 +357,11 @@ export async function duplicatePage(
     if (data.link?.targetNodeId && shapeIdMap.has(data.link.targetNodeId)) {
       data.link = { ...data.link, targetNodeId: shapeIdMap.get(data.link.targetNodeId) };
     }
-    batch.set(doc(db, 'diagrams', diagramId, 'pages', newPageId, 'shapes', newShapeId), { ...s, id: newShapeId, parentId: newParentId, data });
+    // Only top-level (parentless) shapes carry an absolute, page-relative Y
+    // — a grouped/contained child's position is already local to its
+    // parent and must NOT be shifted again.
+    const position = s.parentId ? s.position : { x: s.position.x, y: s.position.y + deltaY };
+    batch.set(doc(db, 'diagrams', diagramId, 'pages', newPageId, 'shapes', newShapeId), { ...s, id: newShapeId, parentId: newParentId, position, data });
   }
   for (const e of connectors) {
     const newSource = shapeIdMap.get(e.source);
@@ -324,13 +400,18 @@ export async function addMasterPage(
     customHeight: options.customHeight,
     isMaster: true,
   };
+  const bumped = masterPages.filter(m => m.order >= newOrder);
   const batch = writeBatch(db);
-  for (const m of masterPages) {
-    if (m.order >= newOrder) batch.update(doc(db, 'diagrams', diagramId, 'pages', m.id), { order: m.order + 1 });
+  for (const m of bumped) {
+    batch.update(doc(db, 'diagrams', diagramId, 'pages', m.id), { order: m.order + 1 });
   }
   batch.set(doc(db, 'diagrams', diagramId, 'pages', pageId), page);
   batch.update(doc(db, 'diagrams', diagramId), { updatedAt: Date.now() });
   await batch.commit();
+  // See addPage's identical comment — bumped masters shift DOWN to make
+  // room for this new one.
+  const { height } = getPageDimensions(page.paperSize, page.orientation, page.customWidth, page.customHeight);
+  await reflowPageShapes(diagramId, bumped.map(m => m.id), height + PAGE_GAP);
   return page;
 }
 
@@ -394,24 +475,41 @@ export async function reorderPages(diagramId: string, orderedPageIds: string[]):
 // orphaned in Firestore forever, since nothing else ever queries/cleans up
 // a subcollection whose parent page doc no longer exists. Same chunked-batch
 // pattern restoreVersion uses for its own bulk deletes.
-export async function deletePage(diagramId: string, pageId: string): Promise<void> {
+// `subsequentPageIds`/`deltaY` reflow every page that comes AFTER the
+// deleted one in the same stack (regular pages after a regular page, master
+// pages after a master) — removing a page from the middle shifts every
+// later page's Y-ORIGIN up by this page's height+gap (pageOrigins is purely
+// derived from the remaining pages), but nothing previously moved those
+// later pages' own SHAPES to match: their absolute position kept assuming
+// the deleted page still existed, so a page's frame would visually jump to
+// its new slot while its actual content stayed exactly where it was — the
+// same class of bug handleReorderPagesWithShapes already accounts for on
+// reorder, just never applied here. Pass `[]`/`0` from a caller that hasn't
+// computed this (e.g. deleting the very last page in a stack, where there's
+// nothing after it to shift).
+export async function deletePage(
+  diagramId: string, pageId: string, subsequentPageIds: string[] = [], deltaY = 0,
+): Promise<void> {
   const [shapesSnap, connectorsSnap, commentsSnap] = await Promise.all([
     getDocs(collection(db, 'diagrams', diagramId, 'pages', pageId, 'shapes')),
     getDocs(collection(db, 'diagrams', diagramId, 'pages', pageId, 'connectors')),
     getDocs(collection(db, 'diagrams', diagramId, 'pages', pageId, 'comments')),
   ]);
-  const refs = [
+  const deleteRefs = [
     ...shapesSnap.docs.map(d => d.ref),
     ...connectorsSnap.docs.map(d => d.ref),
     ...commentsSnap.docs.map(d => d.ref),
     doc(db, 'diagrams', diagramId, 'pages', pageId),
   ];
   const CHUNK = 400;
-  for (let i = 0; i < refs.length; i += CHUNK) {
+  for (let i = 0; i < deleteRefs.length; i += CHUNK) {
     const batch = writeBatch(db);
-    for (const ref of refs.slice(i, i + CHUNK)) batch.delete(ref);
+    for (const ref of deleteRefs.slice(i, i + CHUNK)) batch.delete(ref);
     await batch.commit();
   }
+  // Subsequent pages shift UP (negative delta) to close the gap this page
+  // leaves behind — see reflowPageShapes' own comment for the full "why."
+  await reflowPageShapes(diagramId, subsequentPageIds, -deltaY);
 }
 
 export function getPageOrigin(pageOrderIndex: number, pageHeight: number, pageGap: number): number {

@@ -42,17 +42,26 @@ const CURVED_KINDS = new Set<ShapeNodeData['kind']>(['cylinder', 'cloud', 'docum
 
 const CURVED_PATHS: Record<string, string> = {
   cylinder: 'M0,10 C0,4 100,4 100,10 L100,90 C100,96 0,96 0,90 Z',
-  // Renormalized to fit exactly within the 0-100 viewBox — the original path
-  // (control points reaching x=108/114) exceeded its own declared bounding
-  // box, so the rightmost "bump" was silently clipped by every renderer that
-  // assumes viewBox 0-100 == the node's full width/height (resize handles,
-  // hit-testing, thumbnails, ...). Same proportions, just rescaled to fit.
-  cloud: 'M14.8,100 C0,100 0,57.6 14.8,51.5 C14.8,6.1 46.3,0 57.4,27.3 C77.8,6.1 94.4,36.4 83.3,57.6 C100,66.7 96.3,100 77.8,100 Z',
+  // Renormalized to fit within the 0-100 viewBox with a small 4-unit margin
+  // — the original path (control points reaching x=108/114) exceeded its
+  // own declared bounding box, so the rightmost "bump" was silently clipped
+  // by every renderer that assumes viewBox 0-100 == the node's full width/
+  // height (resize handles, hit-testing, thumbnails, ...). An exact-to-0-100
+  // fit (no margin) traded that for a different clipping bug — the stroke,
+  // centered on the path, would have its outer half cut off anywhere the
+  // path touches the viewBox edge (see halfCircle's comment below for the
+  // same issue caught directly). Same proportions either way, just rescaled.
+  cloud: 'M17.6,96.0 C4.0,96.0 4.0,57.0 17.6,51.4 C17.6,9.6 46.6,4.0 56.8,29.1 C75.6,9.6 90.8,37.5 80.6,57.0 C96.0,65.4 92.6,96.0 75.6,96.0 Z',
   document: 'M0,0 L100,0 L100,82 L50,100 L0,82 Z',
-  // A flat diameter along the bottom, full-height dome — spans the whole
-  // bounding box (not a fixed-height half like a print icon might use) so
-  // it scales the same way every other shape's independent width/height do.
-  halfCircle: 'M0,100 A50,100 0 0 1 100,100 Z',
+  // A flat diameter along the bottom, full-height dome — spans (almost) the
+  // whole bounding box, not a fixed-height half like a print icon would use,
+  // so it scales the same way every other shape's independent width/height
+  // do. A small 4-unit inset on all sides — rather than touching x/y 0 and
+  // 100 exactly — matters because the stroke is centered on the path
+  // (vectorEffect="non-scaling-stroke" below): a path flush against the
+  // viewBox edge gets its outer half of stroke width clipped by the
+  // viewBox itself, which is what "a bit clipped" was actually seeing.
+  halfCircle: 'M4,96 A46,92 0 0 1 96,96 Z',
   // The scalloped "engineering revision cloud" convention (distinct from
   // the plain 'cloud' shape's smooth 4-5-lobe silhouette above) — 14
   // uniform semicircular bumps evenly spaced around an ellipse, each arc's

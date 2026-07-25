@@ -11,7 +11,20 @@
          cost at this size, cached across sessions once visited. -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Roboto:wght@400;700&family=Open+Sans:wght@400;700&family=Lato:wght@400;700&family=Montserrat:wght@400;700&family=Playfair+Display:wght@400;700&family=Merriweather:wght@400;700&family=Caveat:wght@400;700&display=swap" rel="stylesheet" />
+    <!-- crossorigin is required here, not just on the preconnect above —
+         page-thumbnail generation (html-to-image, via exportPageAsImage)
+         walks every stylesheet in the document trying to inline its CSS
+         rules, and reading .cssRules off a cross-origin stylesheet fetched
+         WITHOUT crossorigin throws a SecurityError. Google Fonts' CSS
+         endpoint does send Access-Control-Allow-Origin, so fetching it in
+         CORS mode (crossorigin="anonymous") is enough to make that readable
+         instead of throwing on every single debounced thumbnail cycle —
+         previously flooding the console until the accumulated error volume
+         itself visibly slowed the tab down over a long editing session. -->
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Roboto:wght@400;700&family=Open+Sans:wght@400;700&family=Lato:wght@400;700&family=Montserrat:wght@400;700&family=Playfair+Display:wght@400;700&family=Merriweather:wght@400;700&family=Caveat:wght@400;700&display=swap"
+      rel="stylesheet" crossorigin="anonymous"
+    />
   </head>
   <body>
     <div id="root"></div>

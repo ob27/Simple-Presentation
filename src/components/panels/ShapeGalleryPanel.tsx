@@ -21,6 +21,13 @@ function ShapeCard({ entry, onClick, favorited, favoritesFull, onToggleFavorite 
       style={{
         position: 'relative', border: '1.5px solid #e6e8ef', borderRadius: 8, padding: '10px 4px', cursor: 'pointer', textAlign: 'center',
         display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6,
+        // A grid item's default min-width is `auto` (its content's own
+        // min-content size), not 0 — without this override, a longer label
+        // like "Application Component" could keep this card from shrinking
+        // to its 1fr share of the grid at all, forcing the whole 3-column
+        // grid wider than the panel and turning into a horizontal scroll
+        // instead of the label just ellipsing the way it's already styled to.
+        minWidth: 0,
       }}
       onMouseEnter={e => (e.currentTarget.style.borderColor = '#1677ff')}
       onMouseLeave={e => (e.currentTarget.style.borderColor = '#e6e8ef')}
@@ -80,7 +87,7 @@ export function ShapeGalleryPanel({ onSelect, isFavorite, favoritesFull, onToggl
           allowClear
         />
       </div>
-      <div style={{ flex: 1, overflowY: 'auto', padding: '8px 10px' }}>
+      <div style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: '8px 10px' }}>
         <Tabs
           size="small"
           defaultActiveKey="Basic"
@@ -90,8 +97,15 @@ export function ShapeGalleryPanel({ onSelect, isFavorite, favoritesFull, onToggl
               key: category,
               label: category,
               children: (
-                <div style={{ maxHeight: 460, overflowY: 'auto', paddingTop: 4 }}>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
+                // width/minWidth here (not just on the grid below) matter —
+                // antd's Tabs lays every tab's content out in a flex row
+                // internally (for its slide animation) before clipping to
+                // just the active one; without an explicit width this pane
+                // can end up sized by its own content rather than the panel,
+                // which is what was producing the horizontal scrollbar
+                // instead of the grid ever getting a chance to wrap/shrink.
+                <div style={{ width: '100%', minWidth: 0, maxHeight: 460, overflowY: 'auto', overflowX: 'hidden', paddingTop: 4 }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8, width: '100%', minWidth: 0 }}>
                     {entries.map(entry => (
                       <ShapeCard
                         key={`${entry.kind}-${entry.label}`}
