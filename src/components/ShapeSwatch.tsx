@@ -18,6 +18,10 @@ const BASE_CATALOG: ShapeCatalogEntry[] = [
   // Same 'rectangle' kind, just seeded with a larger corner radius — no new
   // ShapeKind needed, since cornerRadius already fully drives this visually.
   { kind: 'rectangle', label: 'Rounded rectangle', category: 'Basic', preview: { borderRadius: 10 }, extraData: { cornerRadius: 10 } },
+  // Also a plain 'rectangle' preset (no new ShapeKind) — a thin, translucent
+  // red bar for marking up/highlighting existing content, same mechanism as
+  // "Rounded rectangle" above.
+  { kind: 'rectangle', label: 'Highlight bar', category: 'Basic', preview: { background: 'rgba(255, 59, 48, 0.35)', borderRadius: 2 }, extraData: { fillColor: 'rgba(255, 59, 48, 0.35)', strokeWidth: 0 } },
   { kind: 'ellipse', label: 'Ellipse', category: 'Basic', preview: { borderRadius: '50%' } },
   { kind: 'diamond', label: 'Diamond', category: 'Basic', preview: { clipPath: 'polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%)' } },
   { kind: 'stickyNote', label: 'Sticky note', category: 'Basic', preview: { borderRadius: 2, background: '#FFF3B0', border: '1px solid #E8D77A' } },
@@ -39,6 +43,7 @@ const BASE_CATALOG: ShapeCatalogEntry[] = [
   { kind: 'star', label: 'Star', category: 'Complex', preview: {} },
   { kind: 'document', label: 'Document', category: 'Complex', preview: {} },
   { kind: 'revisionCloud', label: 'Revision cloud', category: 'Complex', preview: {} },
+  { kind: 'calloutCloud', label: 'Callout cloud', category: 'Complex', preview: {} },
   { kind: 'pieChart', label: 'Pie chart', category: 'Complex', preview: {} },
   { kind: 'table', label: 'Table', category: 'Complex', preview: {} },
   { kind: 'chart', label: 'Bar/line chart', category: 'Complex', preview: {} },
@@ -123,6 +128,19 @@ export function ShapeSwatch({ kind, preview, extraData }: { kind: ShapeKind; pre
         <path
           d="M24.0,10.0 A3.3,3.3 0 0 1 20.8,15.7 A4.1,4.1 0 0 1 13.0,18.0 A4.1,4.1 0 0 1 5.2,15.7 A3.3,3.3 0 0 1 2.0,10.0 A3.3,3.3 0 0 1 5.2,4.3 A4.1,4.1 0 0 1 13.0,2.0 A4.1,4.1 0 0 1 20.8,4.3 A3.3,3.3 0 0 1 24.0,10.0 Z"
           fill="none" stroke="#5B6B99" strokeWidth="1.5"
+        />
+      </svg>
+    );
+  }
+  if (kind === 'calloutCloud') {
+    // Same path authored for ShapeNode.tsx's CURVED_PATHS, in its native
+    // 0-100 coordinate space — reused verbatim rather than re-deriving a
+    // separate small-scale version.
+    return (
+      <svg width="24" height="24" viewBox="0 0 100 100">
+        <path
+          d="M17.6,66.0 C4.0,66.0 4.0,39.3 17.6,35.5 C17.6,6.8 46.6,3.0 56.8,20.2 C75.6,6.8 90.8,25.9 80.6,39.3 C96.0,45.0 92.6,66.0 75.6,66.0 L45.0,66.0 L28.0,97.0 L22.0,66.0 Z"
+          fill="#8CA3E8" stroke="#5B6B99" strokeWidth="2"
         />
       </svg>
     );

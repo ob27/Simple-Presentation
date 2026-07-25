@@ -38,7 +38,7 @@ const POLYGON_POINTS: Record<string, string> = {
 
 // Kinds whose outline needs a curve, not just straight polygon edges — drawn
 // as a single SVG <path> instead of a <polygon>, same rationale as above.
-const CURVED_KINDS = new Set<ShapeNodeData['kind']>(['cylinder', 'cloud', 'document', 'halfCircle', 'revisionCloud']);
+const CURVED_KINDS = new Set<ShapeNodeData['kind']>(['cylinder', 'cloud', 'document', 'halfCircle', 'revisionCloud', 'calloutCloud']);
 
 const CURVED_PATHS: Record<string, string> = {
   cylinder: 'M0,10 C0,4 100,4 100,10 L100,90 C100,96 0,96 0,90 Z',
@@ -69,6 +69,15 @@ const CURVED_PATHS: Record<string, string> = {
   // closes with no gaps or overlaps. Generated once (not authored by hand)
   // to keep every bump geometrically consistent.
   revisionCloud: 'M92.0,50.0 A8.5,8.5 0 0 1 87.8,66.5 A8.8,8.8 0 0 1 76.2,79.7 A9.2,9.2 0 0 1 59.3,87.0 A9.3,9.3 0 0 1 40.7,87.0 A9.2,9.2 0 0 1 23.8,79.7 A8.8,8.8 0 0 1 12.2,66.5 A8.5,8.5 0 0 1 8.0,50.0 A8.5,8.5 0 0 1 12.2,33.5 A8.8,8.8 0 0 1 23.8,20.3 A9.2,9.2 0 0 1 40.7,13.0 A9.3,9.3 0 0 1 59.3,13.0 A9.2,9.2 0 0 1 76.2,20.3 A8.8,8.8 0 0 1 87.8,33.5 A8.5,8.5 0 0 1 92.0,50.0 Z',
+  // A markup callout: the same smooth 'cloud' silhouette above, vertically
+  // compressed to the top ~2/3 of the box (a coordinate-transform of that
+  // exact path, not hand-derived) to leave room for a pointer tail — the
+  // cloud's own bottom edge already closes with a straight implicit Z
+  // (start and end points share the same y), so the tail is spliced in
+  // there as three explicit line segments (down to a tip, back up, then
+  // the same implicit close) rather than needing to re-author the smooth
+  // curve boundary itself.
+  calloutCloud: 'M17.6,66.0 C4.0,66.0 4.0,39.3 17.6,35.5 C17.6,6.8 46.6,3.0 56.8,20.2 C75.6,6.8 90.8,25.9 80.6,39.3 C96.0,45.0 92.6,66.0 75.6,66.0 L45.0,66.0 L28.0,97.0 L22.0,66.0 Z',
 };
 
 // A stray ellipse companion path for the cylinder's top rim — drawn as a
@@ -255,7 +264,14 @@ function polarToCartesian(cx: number, cy: number, r: number, angleDeg: number) {
 
 // Segments default to an evenly-split 3-wedge placeholder so a freshly
 // placed pie chart never renders blank before the user has entered any data.
-function PieChartSvg({ segments, innerRadiusFrac }: { segments?: PieSegment[]; innerRadiusFrac?: number }) {
+// Memoized — this recomputes real slice-angle geometry from scratch on
+// every call, which is otherwise redone on every ShapeNode re-render (e.g.
+// a sibling shape's edit triggering rebuildShapes) even when this shape's
+// own segments never changed. `segments`/`innerRadiusFrac` come straight
+// from the shape's own Firestore-synced data field, which keeps the same
+// array reference across an unrelated rebuild, so the default shallow
+// prop comparison here is correct, not just "close enough."
+const PieChartSvg = memo(function PieChartSvg({ segments, innerRadiusFrac }: { segments?: PieSegment[]; innerRadiusFrac?: number }) {
   const data = segments && segments.length > 0 ? segments : DEFAULT_PIE_SEGMENTS;
   const total = data.reduce((sum, s) => sum + Math.max(0, s.value), 0) || 1;
   const cx = 50, cy = 50, r = 48;
@@ -292,13 +308,14 @@ function PieChartSvg({ segments, innerRadiusFrac }: { segments?: PieSegment[]; i
       })}
     </svg>
   );
-}
+});
 
 // Hand-rolled SVG, same convention as PieChartSvg above — bars/a polyline
 // are strictly simpler than the arc math pie charts already need, so a
 // charting library isn't warranted here either. Static data only (no live
-// variable binding — see ChartDataPoint's doc comment for why).
-function ChartSvg({ chartType, data }: { chartType?: 'bar' | 'line'; data?: ChartDataPoint[] }) {
+// variable binding — see ChartDataPoint's doc comment for why). Memoized
+// for the same reason as PieChartSvg above.
+const ChartSvg = memo(function ChartSvg({ chartType, data }: { chartType?: 'bar' | 'line'; data?: ChartDataPoint[] }) {
   const points = data && data.length > 0 ? data : DEFAULT_CHART_DATA;
   const maxValue = Math.max(1, ...points.map(p => Math.max(0, p.value)));
   const padding = 6;
@@ -336,7 +353,7 @@ function ChartSvg({ chartType, data }: { chartType?: 'bar' | 'line'; data?: Char
       })}
     </svg>
   );
-}
+});
 
 function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
   const shapeData = data as unknown as ShapeNodeData & ShapeNodeRuntimeData & {

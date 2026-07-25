@@ -10,7 +10,7 @@ import { useAuth } from '../AuthContext';
 import {
   subscribeUserDiagrams, isDiagramOwner, deleteDiagram, renameDiagram,
   subscribeUserFolders, createFolder, deleteFolder, renameFolder, addDiagramToFolder, removeDiagramFromFolder,
-  generateEditorInvite, saveDiagramAsTemplate, setDiagramPublicShareRole,
+  generateEditorInvite, generateViewerInvite, saveDiagramAsTemplate, setDiagramPublicShareRole,
 } from '../store';
 import { uploadFolderLogo, deleteFolderLogo } from '../utils/folderLogoUpload';
 import { getWorkspaceSettings, type WorkspaceSettings } from '../utils/workspaceSettings';
@@ -90,8 +90,9 @@ export function Dashboard() {
     }
   }
 
-  function handleCopyInvite(diagram: DiagramDocument) {
-    copyInviteLink(diagram.inviteToken);
+  async function handleCopyInviteAs(diagram: DiagramDocument, kind: 'edit' | 'viewer') {
+    const token = kind === 'viewer' ? (diagram.publicShareToken ?? await generateViewerInvite(diagram)) : diagram.inviteToken;
+    copyInviteLink(token, kind);
   }
 
   async function handleRenameDiagram() {
@@ -237,9 +238,20 @@ export function Dashboard() {
         </div>
         {isOwner && (
           <div style={{ display: 'flex', gap: 8 }} onClick={e => e.stopPropagation()}>
-            <Tooltip title="Copy invite link">
-              <Button size="small" icon={<IconShare />} onClick={() => handleCopyInvite(d)} />
-            </Tooltip>
+            <Dropdown
+              trigger={['click']}
+              menu={{
+                items: [
+                  { key: 'edit', icon: <IconPencil />, label: 'Copy editor invite link' },
+                  { key: 'viewer', icon: <IconShare />, label: 'Copy viewer invite link' },
+                ],
+                onClick: ({ key }) => handleCopyInviteAs(d, key as 'edit' | 'viewer'),
+              }}
+            >
+              <Tooltip title="Share">
+                <Button size="small" icon={<IconShare />} />
+              </Tooltip>
+            </Dropdown>
             <Dropdown
               trigger={['click']}
               menu={{

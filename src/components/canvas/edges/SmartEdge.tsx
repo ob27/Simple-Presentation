@@ -10,6 +10,11 @@ import { TravelingDot } from './TravelingDot';
 interface RuntimeEdgeData {
   __dimmed?: boolean;
   __hidden?: boolean;
+  // Populated by Canvas.tsx's `edges` memo for straight-routed connectors
+  // that visually cross another straight connector — see its own comment
+  // for the intersection math. Absolute canvas coordinates, not yet ordered
+  // along this edge's own source->target direction (done below).
+  __crossingPoints?: { x: number; y: number }[];
 }
 
 function SmartEdgeImpl({ id, source, target, style, markerStart, markerEnd, selected, data }: EdgeProps) {
@@ -44,7 +49,27 @@ function SmartEdgeImpl({ id, source, target, style, markerStart, markerEnd, sele
   if (effectiveRouting === 'curved') {
     [path, labelX, labelY] = getBezierPath({ sourceX: sx, sourceY: sy, sourcePosition: sPos, targetX: tx, targetY: ty, targetPosition: tPos });
   } else if (effectiveRouting === 'straight') {
-    path = `M ${sx},${sy} L ${tx},${ty}`;
+    const crossingPoints = edgeData?.__crossingPoints;
+    if (crossingPoints?.length) {
+      const dx = tx - sx, dy = ty - sy;
+      const len = Math.hypot(dx, dy) || 1;
+      const ux = dx / len, uy = dy / len;
+      const bumpRadius = 6;
+      // Splice a small semicircular detour around each crossing point
+      // instead of one unbroken L segment — sorted by projection onto the
+      // source->target direction so multiple crossings on one connector are
+      // spliced in path order, not array order.
+      const ordered = [...crossingPoints].sort(
+        (a, b) => (a.x - sx) * ux + (a.y - sy) * uy - ((b.x - sx) * ux + (b.y - sy) * uy),
+      );
+      path = ordered.reduce((d, pt) => {
+        const before = { x: pt.x - ux * bumpRadius, y: pt.y - uy * bumpRadius };
+        const after = { x: pt.x + ux * bumpRadius, y: pt.y + uy * bumpRadius };
+        return `${d} L ${before.x},${before.y} A ${bumpRadius},${bumpRadius} 0 0 1 ${after.x},${after.y}`;
+      }, `M ${sx},${sy}`) + ` L ${tx},${ty}`;
+    } else {
+      path = `M ${sx},${sy} L ${tx},${ty}`;
+    }
     labelX = (sx + tx) / 2;
     labelY = (sy + ty) / 2;
   } else {

@@ -45,7 +45,7 @@ export function InvitePage() {
     if (!invite) return;
     setJoining(true);
     try {
-      await joinDiagram(invite.diagramId, user!.uid, user!.email ?? undefined);
+      await joinDiagram(invite.diagramId, user!.uid, user!.email ?? undefined, invite.role);
       navigate(`/d/${invite.diagramId}`);
     } finally {
       setJoining(false);
@@ -60,7 +60,7 @@ export function InvitePage() {
           Join "{invite?.diagramName}"
         </div>
         <div style={{ fontSize: 13, color: '#888', marginBottom: 24 }}>
-          You've been invited to collaborate on this diagram.
+          {invite?.role === 'viewer' ? "You've been invited to view this diagram." : "You've been invited to collaborate on this diagram."}
         </div>
         <Button type="primary" size="large" loading={joining} onClick={handleJoin} block>
           Join diagram

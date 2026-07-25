@@ -187,16 +187,23 @@ function buildParagraphContent(container: HTMLElement, runs: RichTextRun[]) {
   }
 }
 
-function newListElement(listType: 'bullet' | 'ordered'): HTMLElement {
-  const list = document.createElement(listType === 'bullet' ? 'ul' : 'ol');
+// Matches RichTextDisplay's committed rendering exactly (also hardcoded
+// left/no-margin) — a list left to inherit the contentEditable root's own
+// textAlign (commonly center) looks visibly wrong ONLY while editing, then
+// snaps to this styling the moment it's committed. Exported so callers that
+// style an list element the BROWSER created directly (e.g. RichTextEditor's
+// Tab-indent handler, via document.execCommand('indent') — which builds a
+// bare, unstyled <ul>/<ol> of its own that this same gap otherwise applies
+// to) can reuse the identical three properties instead of duplicating them.
+export function styleListElement(list: HTMLElement): void {
   list.style.margin = '0';
   list.style.paddingLeft = '1.4em';
-  // Matches RichTextDisplay's committed rendering exactly (also hardcoded
-  // left) — the shape's own textAlign otherwise leaks onto the list while
-  // editing (inherited from the contentEditable root) and then visibly
-  // snaps left the moment it's committed, which is what made bullets look
-  // "off" only while editing.
   list.style.textAlign = 'left';
+}
+
+function newListElement(listType: 'bullet' | 'ordered'): HTMLElement {
+  const list = document.createElement(listType === 'bullet' ? 'ul' : 'ol');
+  styleListElement(list);
   return list;
 }
 

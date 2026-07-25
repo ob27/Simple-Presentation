@@ -1,7 +1,7 @@
 import { initializeApp, setLogLevel } from 'firebase/app';
 import { getAnalytics } from 'firebase/analytics';
 import { getAuth, connectAuthEmulator } from 'firebase/auth';
-import { initializeFirestore, connectFirestoreEmulator } from 'firebase/firestore';
+import { initializeFirestore, connectFirestoreEmulator, persistentLocalCache, persistentMultipleTabManager } from 'firebase/firestore';
 import { getStorage, connectStorageEmulator } from 'firebase/storage';
 import { getDatabase, connectDatabaseEmulator } from 'firebase/database';
 import { initializeAppCheck, ReCaptchaV3Provider } from 'firebase/app-check';
@@ -37,7 +37,16 @@ export const app = initializeApp(firebaseConfig);
 setLogLevel('silent');
 export const analytics = useEmulator ? undefined : getAnalytics(app);
 export const auth = getAuth(app);
-export const db = initializeFirestore(app, { ignoreUndefinedProperties: true });
+// Persisted (IndexedDB-backed) local cache — reopening a previously-viewed
+// diagram now hydrates instantly from disk instead of a full network
+// re-fetch of every document, only pulling deltas from there. The
+// multiple-tab variant keeps that cache correctly shared/coherent across
+// more than one open tab on the same diagram, rather than each tab paying
+// for its own independent full fetch.
+export const db = initializeFirestore(app, {
+  ignoreUndefinedProperties: true,
+  localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }),
+});
 export const storage = getStorage(app);
 export const rtdb = getDatabase(app);
 

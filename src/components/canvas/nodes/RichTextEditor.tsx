@@ -4,7 +4,7 @@ import {
   IconUnorderedList, IconOrderedList,
 } from '../../icons';
 import type { RichTextParagraph } from '../../../types/shapes';
-import { buildEditableDom, parseEditableElement } from '../../../utils/richText';
+import { buildEditableDom, parseEditableElement, styleListElement } from '../../../utils/richText';
 import { ColorPickerField } from '../../panels/ColorPickerField';
 
 interface Props {
@@ -199,6 +199,21 @@ export function RichTextEditor({ paragraphs, baseStyle, baseColorHex, textAlign,
               }
               document.execCommand(e.shiftKey ? 'outdent' : 'indent');
               placeholder?.remove();
+              // execCommand builds any list level it creates/moves `li`
+              // into completely bare — no inline styles at all — which
+              // then inherits this shape's own textAlign (commonly center)
+              // from the contentEditable root via plain CSS inheritance,
+              // instead of the forced-left styling newListElement() already
+              // gives every list this editor seeds at edit-mode entry. That
+              // gap is exactly why a bullet just Tab-indented mid-edit
+              // visibly re-centers relative to its parent until you exit
+              // edit mode and RichTextDisplay rebuilds every list level
+              // with correct styling from scratch. Reapplying it here closes
+              // the gap for the one path that skipped it. Harmless/idempotent
+              // to reapply after outdent too, where `li`'s new parent list
+              // already existed and was already styled correctly.
+              const list = li.closest('ul, ol');
+              if (list instanceof HTMLElement) styleListElement(list);
             }
           }
           e.stopPropagation();

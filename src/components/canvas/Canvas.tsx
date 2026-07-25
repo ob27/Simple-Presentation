@@ -60,6 +60,7 @@ import { LayersPanel } from '../panels/LayersPanel';
 import { PageSettingsPanel } from '../panels/PageSettingsPanel';
 import { ExportModal } from '../ExportModal';
 import { ShortcutsHelpModal } from '../ShortcutsHelpModal';
+import { getFloatingEdgeParams } from './edges/edgeRouting';
 import { RemoteCursorsLayer } from './RemoteCursorsLayer';
 import { PresentationFrame } from './PresentationFrame';
 import { usePresence } from '../../hooks/usePresence';
@@ -79,7 +80,10 @@ import {
 import type { DiagramComment } from '../../types/comments';
 import { useAuth } from '../../AuthContext';
 
-const nodeTypes: NodeTypes = {
+// Exported so VersionPreview.tsx's read-only snapshot renderer can reuse the
+// exact same type-registration map rather than keeping a second, driftable
+// copy in sync by hand.
+export const nodeTypes: NodeTypes = {
   pageFrame: PageFrameNode,
   shape: ShapeNode,
   group: GroupNode,
@@ -87,7 +91,7 @@ const nodeTypes: NodeTypes = {
   comment: CommentPinNode,
   multiSelectOverlay: MultiSelectOverlayNode,
 };
-const edgeTypes: EdgeTypes = {
+export const edgeTypes: EdgeTypes = {
   smart: SmartEdge,
 };
 
@@ -210,6 +214,24 @@ function arrowMarker(style: ArrowStyle | undefined, fallback: ArrowStyle) {
   // so no custom arrowhead (diamond/triangle/circle) ever rendered at all.
   if (customId) return customId;
   return { type: resolved === 'arrow' ? MarkerType.Arrow : MarkerType.ArrowClosed, color: '#8a93a6' };
+}
+
+// Standard 2D line-segment (not infinite-line) intersection — used by the
+// `edges` memo below to find where two straight connectors visually cross.
+// The 0.02-0.98 margin on t/u excludes intersections right at either
+// segment's own endpoints, which happens routinely for two connectors that
+// share a source/target node and fan out at similar angles — that shared
+// point isn't a genuine mid-line crossing and shouldn't get a bump.
+function segmentIntersection(
+  p1: { x: number; y: number }, p2: { x: number; y: number },
+  p3: { x: number; y: number }, p4: { x: number; y: number },
+): { x: number; y: number } | null {
+  const d = (p2.x - p1.x) * (p4.y - p3.y) - (p2.y - p1.y) * (p4.x - p3.x);
+  if (Math.abs(d) < 1e-6) return null;
+  const t = ((p3.x - p1.x) * (p4.y - p3.y) - (p3.y - p1.y) * (p4.x - p3.x)) / d;
+  const u = ((p3.x - p1.x) * (p2.y - p1.y) - (p3.y - p1.y) * (p2.x - p1.x)) / d;
+  if (t <= 0.02 || t >= 0.98 || u <= 0.02 || u >= 0.98) return null;
+  return { x: p1.x + t * (p2.x - p1.x), y: p1.y + t * (p2.y - p1.y) };
 }
 
 // Mounted once at the ReactFlow SVG root (see the <svg><defs> render below,
@@ -1550,9 +1572,9 @@ export function Canvas({
       });
     }
     return [...frameNodes, ...inheritedMasterNodes, ...styled, ...commentNodes, ...multiSelectOverlayNode];
-  }, [frameNodes, inheritedMasterNodes, shapeNodes, variables, highlighted, animationPanelOpen, revealStep, isPresent, commentsEnabled, presentPage, presentThresholdOrder, connectMode, toolActive, directSelectMode, handleShapeEditingChange, comments, activeCommentId, draftComment, hiddenTags, multiSelectOverlayNode]);
+  }, [frameNodes, inheritedMasterNodes, shapeNodes, variables, highlighted, animationPanelOpen, revealStep, isPresent, commentsEnabled, presentPage, presentThresholdOrder, connectMode, toolActive, isSpaceDown, directSelectMode, handleShapeEditingChange, comments, activeCommentId, draftComment, hiddenTags, multiSelectOverlayNode]);
 
-  const edges = useMemo(() => [...connectorEdges, ...inheritedMasterEdges].map(e => {
+  const baseEdges = useMemo(() => [...connectorEdges, ...inheritedMasterEdges].map(e => {
     const edgeData = e.data as SmartEdgeData | undefined;
     const edgePageId = findPageIdFor(shapeNodes.find(n => n.id === e.source));
     let hidden = false;
@@ -1568,6 +1590,53 @@ export function Canvas({
       data: { ...e.data, __dimmed: highlighted ? !highlighted.edgeIds.has(e.id) : false, __hidden: hidden },
     };
   }), [connectorEdges, inheritedMasterEdges, shapeNodes, highlighted, animationPanelOpen, revealStep, isPresent, presentPage, presentThresholdOrder]);
+
+  // G24: give overlapping straight connectors a small bump where they
+  // visually cross (v1 — orthogonal/curved routing untouched; an
+  // anchor-docked edge is excluded too, since an interior anchor point isn't
+  // worth the extra intersection-math case for this first cut). Endpoints
+  // are computed via getInternalNode/getFloatingEdgeParams — the same
+  // per-edge intersection math SmartEdge itself already uses — rather than
+  // reading `shapeNodes` positions directly, since a page-frame/group-child
+  // shape's position there is parent-relative, not absolute. `shapeNodes` is
+  // still a dependency purely to force a recompute on every drag frame (see
+  // onNodesChange's continuous applyNodeChanges calls during a live drag),
+  // not to read from directly.
+  const edges = useMemo(() => {
+    const straightEndpoints = baseEdges
+      .map((e, index) => {
+        const data = e.data as unknown as SmartEdgeData | undefined;
+        if (data?.routing !== 'straight' || data?.sourceAnchorIndex !== undefined || data?.targetAnchorIndex !== undefined) return null;
+        const sourceNode = getInternalNode(e.source);
+        const targetNode = getInternalNode(e.target);
+        if (!sourceNode || !targetNode) return null;
+        const { sx, sy, tx, ty } = getFloatingEdgeParams(sourceNode, targetNode);
+        return { index, id: e.id, p1: { x: sx, y: sy }, p2: { x: tx, y: ty } };
+      })
+      .filter((e): e is { index: number; id: string; p1: { x: number; y: number }; p2: { x: number; y: number } } => e !== null);
+
+    const crossingPoints = new Map<string, { x: number; y: number }[]>();
+    for (let i = 0; i < straightEndpoints.length; i++) {
+      for (let j = i + 1; j < straightEndpoints.length; j++) {
+        const a = straightEndpoints[i];
+        const b = straightEndpoints[j];
+        const point = segmentIntersection(a.p1, a.p2, b.p1, b.p2);
+        if (!point) continue;
+        // Stable tiebreak: whichever edge appears later in array order gets
+        // the bump — arbitrary but deterministic, and matches the intuitive
+        // "the earlier connector stays visually on top" convention.
+        const later = b.index > a.index ? b : a;
+        const list = crossingPoints.get(later.id) ?? [];
+        list.push(point);
+        crossingPoints.set(later.id, list);
+      }
+    }
+    if (crossingPoints.size === 0) return baseEdges;
+    return baseEdges.map(e => {
+      const points = crossingPoints.get(e.id);
+      return points ? { ...e, data: { ...e.data, __crossingPoints: points } } : e;
+    });
+  }, [baseEdges, getInternalNode]);
 
   function renumberSequence(items: SequenceItem[]) {
     const sequenced = items.filter(i => i.revealOrder !== undefined).sort((a, b) => (a.revealOrder ?? 0) - (b.revealOrder ?? 0));
@@ -2512,8 +2581,16 @@ export function Canvas({
   // gesture, scoped specifically to drags starting on a page's own
   // background, so RF's native pane-background case (already working) is
   // left untouched.
+  //
+  // Requires Alt held (matching selectionKeyCode above) now that plain
+  // left-drag pans by default instead of marquee-selecting — without Alt,
+  // this returns early and does nothing, letting the drag fall through to
+  // React Flow's own (now button-0-enabled) native pan handling instead.
+  // No explicit hand-off/stopPropagation needed: RF independently
+  // suppresses its own panOnDrag activation whenever selectionKeyPressed
+  // (Alt) is true, so the two can never both try to claim the same drag.
   function handleMarqueeMouseDown(e: React.MouseEvent) {
-    if (toolActive || e.button !== 0) return;
+    if (toolActive || e.button !== 0 || !e.altKey) return;
     const target = e.target as HTMLElement;
     if (!target.closest('.react-flow__node-pageFrame')) return;
     const startScreen = { x: e.clientX, y: e.clientY };
@@ -2607,15 +2684,44 @@ export function Canvas({
     let fileToUpload: File | Blob = file;
     let downsampled = false;
     if (isDownsamplable) {
-      downsampled = await new Promise<boolean>(resolve => {
-        Modal.confirm({
+      // Previously a plain Modal.confirm with only Downsample/Keep original
+      // — every dismissal path (including the X/Escape, once closable is
+      // enabled) fell through to Modal.confirm's shared onCancel, which
+      // meant "keep original" and "actually cancel this upload" were the
+      // exact same outcome: there was no way to back out of the paste/drop
+      // entirely. A custom footer gives "Cancel upload" its own explicit
+      // button (and its own outcome) separate from the built-in
+      // onCancel, which is left to mean ONLY "dismissed without an
+      // explicit choice" (X, Escape) — mapped to 'cancel' too, since
+      // silently falling through to an upload on a stray Escape press is
+      // exactly the surprising behavior being fixed here.
+      const outcome = await new Promise<'downsample' | 'keep' | 'cancel'>(resolve => {
+        let modalInstance: { destroy: () => void } | null = null;
+        let resolved = false;
+        function settle(result: 'downsample' | 'keep' | 'cancel') {
+          if (resolved) return;
+          resolved = true;
+          resolve(result);
+        }
+        modalInstance = Modal.confirm({
           title: 'Downsample this image?',
           content: `This image is ${formatBytes(file.size)}. Downsampling can significantly reduce storage use, usually with little visible quality loss. You can also downsample it later from the shape's Settings tab.`,
-          okText: 'Downsample', cancelText: 'Keep original',
-          onOk: () => resolve(true),
-          onCancel: () => resolve(false),
+          closable: true,
+          maskClosable: false,
+          okText: 'Downsample',
+          footer: (_, { OkBtn }) => (
+            <>
+              <Button onClick={() => { settle('cancel'); modalInstance?.destroy(); }}>Cancel upload</Button>
+              <Button onClick={() => { settle('keep'); modalInstance?.destroy(); }}>Keep original</Button>
+              <OkBtn />
+            </>
+          ),
+          onOk: () => settle('downsample'),
+          onCancel: () => settle('cancel'),
         });
       });
+      if (outcome === 'cancel') return;
+      downsampled = outcome === 'downsample';
       if (downsampled) fileToUpload = await downsampleImageFile(file);
     }
 
@@ -4271,7 +4377,19 @@ export function Canvas({
           // Presenting is a slide deck, not a Miro board — no free panning or
           // zooming. The camera moves only programmatically (step/page nav,
           // hyperlink/hotspot jumps), never by the viewer dragging or scrolling.
-          panOnDrag={isPresent ? false : isSpaceDown ? true : [1, 2]}
+          // Plain left-drag on empty canvas now pans by default (previously
+          // only middle/right-click or Space-held did) — marquee-select
+          // moved behind holding Alt instead, see selectionKeyCode below.
+          // Tool-active behavior is unchanged: left-drag stays the tool's
+          // own gesture (drawing a connector, a pen path, ...), only
+          // middle/right-click still pans through it; Space still overrides
+          // everything to force full-button panning regardless of tool.
+          // Every non-tool-active branch spells out [0, 1, 2] rather than
+          // `true` — @xyflow/system's own button filter for `panOnDrag ===
+          // true` (as opposed to an explicit array) only allows buttons 0/1,
+          // silently dropping right-click-drag panning entirely; confirmed
+          // live via Playwright after `true` here broke right-click pan.
+          panOnDrag={isPresent ? false : isSpaceDown ? [0, 1, 2] : toolActive ? [1, 2] : [0, 1, 2]}
           zoomOnScroll={!isPresent}
           zoomOnPinch={!isPresent}
           // Explicitly disabled — camera zoom/pan should only ever change from
@@ -4279,14 +4397,24 @@ export function Canvas({
           // programmatic setCenter calls in this file), never as a side
           // effect of double-clicking a shape to rename it.
           zoomOnDoubleClick={false}
-          selectionOnDrag={!isPresent && !toolActive && !isSpaceDown}
-          // Plain-drag-on-empty-canvas already starts a selection box via
-          // selectionOnDrag above, so RF's default Shift-triggered selection
-          // mode is redundant — and actively harmful, since it hijacks any
-          // Shift+drag (e.g. Shift-drag a resize handle for aspect-ratio
-          // lock) into a marquee-select that clears the current selection
-          // mid-drag instead of resizing.
-          selectionKeyCode={null}
+          // Marquee-select no longer triggers on plain drag (that's pan now,
+          // see panOnDrag above) — it's driven entirely by selectionKeyCode
+          // below instead.
+          selectionOnDrag={false}
+          // Holding Alt marquee-selects instead of panning — Shift was the
+          // obvious first choice but is already taken (resize aspect-ratio
+          // lock, and multiSelectionKeyCode below for additive click-select),
+          // and reusing it here would reintroduce the exact
+          // Shift+drag-hijacks-a-resize-into-a-marquee conflict that using
+          // Shift as this key previously caused (see the removed comment
+          // this replaced). React Flow auto-suppresses its own panOnDrag
+          // handling whenever this key is held (regardless of the panOnDrag
+          // value above), so no extra pan/select arbitration is needed here
+          // — only handleMarqueeMouseDown's own guard (below) needs updating
+          // to match, since it's a hand-rolled replacement for drags starting
+          // on a page frame rather than the raw pane background RF's own
+          // selectionOnDrag only ever covered.
+          selectionKeyCode={isPresent || toolActive ? null : 'Alt'}
           // Users reach for either modifier to add a shape to the current
           // selection — RF's own default only recognizes Meta/Control (never
           // Shift), so Shift-click silently replaced the selection instead

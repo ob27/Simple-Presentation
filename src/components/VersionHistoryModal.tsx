@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
-import { Modal, Button, Input, Popconfirm, Empty, message } from 'antd';
-import { IconSave, IconHistory, IconDelete } from './icons';
+import { Modal, Drawer, Button, Input, Popconfirm, Empty, message } from 'antd';
+import { IconSave, IconHistory, IconDelete, IconEyeOpen } from './icons';
 import { subscribeVersions, saveVersion, restoreVersion, deleteVersion, type DiagramVersion } from '../store';
+import { VersionPreview } from './VersionPreview';
 
 interface Props {
   open: boolean;
@@ -25,6 +26,7 @@ export function VersionHistoryModal({ open, onClose, diagramId, uid }: Props) {
   const [saving, setSaving] = useState(false);
   const [restoringId, setRestoringId] = useState<string | null>(null);
   const [name, setName] = useState('');
+  const [previewVersion, setPreviewVersion] = useState<DiagramVersion | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -49,6 +51,7 @@ export function VersionHistoryModal({ open, onClose, diagramId, uid }: Props) {
     try {
       await restoreVersion(diagramId, version);
       message.success('Version restored');
+      setPreviewVersion(null);
       onClose();
     } catch {
       message.error('Failed to restore version');
@@ -94,6 +97,7 @@ export function VersionHistoryModal({ open, onClose, diagramId, uid }: Props) {
                   </div>
                 </div>
                 <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+                  <Button size="small" icon={<IconEyeOpen />} onClick={() => setPreviewVersion(v)}>Preview</Button>
                   <Popconfirm
                     title="Restore this version?"
                     description="This overwrites the current document with this version's content."
@@ -111,6 +115,25 @@ export function VersionHistoryModal({ open, onClose, diagramId, uid }: Props) {
           </div>
         )}
       </div>
+      <Drawer
+        title={previewVersion ? (previewVersion.name || formatTimestamp(previewVersion.createdAt)) : ''}
+        open={!!previewVersion}
+        onClose={() => setPreviewVersion(null)}
+        width="90%"
+        destroyOnClose
+        extra={previewVersion && (
+          <Popconfirm
+            title="Restore this version?"
+            description="This overwrites the current document with this version's content."
+            onConfirm={() => handleRestore(previewVersion)}
+            okText="Restore"
+          >
+            <Button type="primary" loading={restoringId === previewVersion.id}>Restore this version</Button>
+          </Popconfirm>
+        )}
+      >
+        {previewVersion && <VersionPreview version={previewVersion} />}
+      </Drawer>
     </Modal>
   );
 }

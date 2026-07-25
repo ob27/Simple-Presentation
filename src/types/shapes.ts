@@ -9,7 +9,7 @@ export type ShapeKind =
   | 'umlClass' | 'umlPackage' | 'umlComponent' | 'umlNote'
   | 'icon' | 'archimateElement' | 'cylinder' | 'cloud' | 'cross' | 'star' | 'document' | 'pieChart'
   | 'brushStroke' | 'table' | 'chart'
-  | 'halfCircle' | 'trapezoid' | 'arrowShape' | 'revisionCloud';
+  | 'halfCircle' | 'trapezoid' | 'arrowShape' | 'revisionCloud' | 'calloutCloud';
 
 export interface PieSegment {
   id: string;

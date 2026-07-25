@@ -113,6 +113,7 @@ export function subscribeUserDiagrams(uid: string, onChange: (diagrams: DiagramD
 export async function createDiagram(uid: string, name: string, email?: string): Promise<DiagramDocument> {
   const id = crypto.randomUUID();
   const inviteToken = crypto.randomUUID();
+  const publicShareToken = crypto.randomUUID();
   const pageId = crypto.randomUUID();
 
   const page: DiagramPage = {
@@ -133,6 +134,7 @@ export async function createDiagram(uid: string, name: string, email?: string): 
     memberEmails: {},
     viewerIds: [],
     inviteToken,
+    publicShareToken,
     pageOrder: [pageId],
     createdAt: Date.now(),
     updatedAt: Date.now(),
@@ -140,11 +142,12 @@ export async function createDiagram(uid: string, name: string, email?: string): 
 
   // The page doc's security rule does a get() on the parent diagram doc, which
   // isn't visible to rule evaluation until the parent write commits — so the
-  // diagram (+ invite) must land in its own write before the page doc, not a
+  // diagram (+ invites) must land in its own write before the page doc, not a
   // single atomic batch with it.
   const batch = writeBatch(db);
   batch.set(doc(db, 'diagrams', id), diagram);
-  batch.set(doc(db, 'diagramInvites', inviteToken), { diagramId: id, diagramName: name, ownerId: uid });
+  batch.set(doc(db, 'diagramInvites', inviteToken), { diagramId: id, diagramName: name, ownerId: uid, role: 'edit' });
+  batch.set(doc(db, 'diagramInvites', publicShareToken), { diagramId: id, diagramName: name, ownerId: uid, role: 'viewer' });
   await batch.commit();
 
   await setDoc(doc(db, 'diagrams', id, 'pages', pageId), page);
@@ -188,28 +191,47 @@ export async function updatePresentState(diagramId: string, state: PresentState)
   await updateDoc(doc(db, 'diagrams', diagramId), { presentState: state });
 }
 
-export function subscribeDiagram(diagramId: string, onChange: (diagram: DiagramDocument | null) => void): () => void {
-  const ref = doc(db, 'diagrams', diagramId);
-  function emit(snap: { exists: () => boolean; id: string; data: () => unknown }) {
-    onChange(snap.exists() ? ({ id: snap.id, ...(snap.data() as object) } as DiagramDocument) : null);
-  }
-  const unsub = onSnapshot(ref, emit);
+export function subscribeDiagram(
+  diagramId: string, onChange: (diagram: DiagramDocument | null) => void,
   // The realtime listener has been observed to occasionally miss a push
   // from another tab/client entirely (seen concretely with Presenter View's
   // cross-tab presentState sync — a page-change navigated from the
   // presenter tab sometimes never arrived at the audience tab's listener,
   // even after several seconds). This periodic re-fetch is a cheap safety
-  // net: any missed push self-corrects within a few seconds instead of the
-  // subscriber staying silently stale for the rest of the session.
-  const pollId = setInterval(() => { getDocFromServer(ref).then(emit).catch(() => {}); }, 3000);
+  // net: any missed push self-corrects within `pollIntervalMs` instead of
+  // the subscriber staying silently stale for the rest of the session.
+  // Default relaxed to 20s now that Firestore has a persisted local cache
+  // (see firebase.ts) making every poll here a genuine network round trip
+  // rather than a cache hit — 3s (20/min) was needlessly aggressive for the
+  // general edit-view case. PresentationView explicitly passes back the
+  // original tighter 3s: staleness there is a live slide lagging behind
+  // the presenter in front of an audience, not just a background safety
+  // net, so it keeps the short interval this mechanism was built for.
+  pollIntervalMs = 20000,
+): () => void {
+  const ref = doc(db, 'diagrams', diagramId);
+  function emit(snap: { exists: () => boolean; id: string; data: () => unknown }) {
+    onChange(snap.exists() ? ({ id: snap.id, ...(snap.data() as object) } as DiagramDocument) : null);
+  }
+  const unsub = onSnapshot(ref, emit);
+  const pollId = setInterval(() => { getDocFromServer(ref).then(emit).catch(() => {}); }, pollIntervalMs);
   return () => { unsub(); clearInterval(pollId); };
 }
 
 export async function deleteDiagram(diagram: DiagramDocument): Promise<void> {
-  await Promise.all([
+  const ops = [
     deleteDoc(doc(db, 'diagrams', diagram.id)),
     deleteDoc(doc(db, 'diagramInvites', diagram.inviteToken)),
-  ]);
+  ];
+  // `.catch()`-wrapped rather than unconditional — pre-existing diagrams
+  // created before generateViewerInvite/the eager createDiagram write have
+  // no publicShareToken at all, and a deleteDoc on a non-existent doc id is
+  // harmless but there's nothing to guard against anyway; kept defensive in
+  // case a diagram was ever created without one for any other reason.
+  if (diagram.publicShareToken) {
+    ops.push(deleteDoc(doc(db, 'diagramInvites', diagram.publicShareToken)).catch(() => {}));
+  }
+  await Promise.all(ops);
   // Note: subcollections (pages/shapes/connectors/variables) are not recursively
   // deleted client-side here — acceptable for v1, revisit with a Cloud Function
   // if orphaned subcollection cost becomes material.
@@ -621,19 +643,42 @@ export async function deleteVariable(diagramId: string, variableId: string): Pro
 export interface DiagramInviteInfo {
   diagramId: string;
   diagramName: string;
+  // Absent on invite docs created before this field existed — those all
+  // predate any viewer-invite concept, so they resolve to 'edit', the only
+  // role that existed then.
+  role: 'edit' | 'viewer';
 }
 
 export async function resolveDiagramInvite(token: string): Promise<DiagramInviteInfo | null> {
   const snap = await getDoc(doc(db, 'diagramInvites', token));
   if (!snap.exists()) return null;
   const d = snap.data();
-  return { diagramId: d.diagramId as string, diagramName: d.diagramName as string };
+  return {
+    diagramId: d.diagramId as string,
+    diagramName: d.diagramName as string,
+    role: (d.role as 'edit' | 'viewer' | undefined) ?? 'edit',
+  };
 }
 
-export async function joinDiagram(diagramId: string, uid: string, email?: string): Promise<void> {
-  const update: Record<string, unknown> = { memberIds: arrayUnion(uid) };
+export async function joinDiagram(diagramId: string, uid: string, email?: string, role: 'edit' | 'viewer' = 'edit'): Promise<void> {
+  const update: Record<string, unknown> = role === 'viewer' ? { viewerIds: arrayUnion(uid) } : { memberIds: arrayUnion(uid) };
   if (email) update[`memberEmails.${uid}`] = email;
   await updateDoc(doc(db, 'diagrams', diagramId), update);
+}
+
+// Mirrors generateEditorInvite (DiagramFolder's own dual-token pattern) —
+// resurrects the previously-declared-but-dead `publicShareToken` field as
+// the viewer-tier invite token, resolved through the same `diagramInvites`
+// collection as the existing editor invite, distinguished only by `role`.
+export async function generateViewerInvite(diagram: Pick<DiagramDocument, 'id' | 'name' | 'ownerId'>): Promise<string> {
+  const token = crypto.randomUUID();
+  await Promise.all([
+    updateDoc(doc(db, 'diagrams', diagram.id), { publicShareToken: token }),
+    setDoc(doc(db, 'diagramInvites', token), {
+      diagramId: diagram.id, diagramName: diagram.name, ownerId: diagram.ownerId, role: 'viewer',
+    }),
+  ]);
+  return token;
 }
 
 export async function loadUserDiagrams(uid: string): Promise<DiagramDocument[]> {

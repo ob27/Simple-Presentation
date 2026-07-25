@@ -1,10 +1,10 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { Spin, Button, Tooltip, Input, Segmented } from 'antd';
+import { Spin, Button, Tooltip, Input, Segmented, Dropdown } from 'antd';
 import { IconArrowLeft, IconPlayCircle, IconPresenterNotes, IconHistory, IconShare } from '../components/icons';
 import { ReactFlowProvider } from '@xyflow/react';
 import {
-  subscribePages, subscribeDiagram, addPage, addMasterPage, reorderPages, renameDiagram, getDiagramRole,
+  subscribePages, subscribeDiagram, addPage, addMasterPage, reorderPages, renameDiagram, getDiagramRole, generateViewerInvite,
   type NewPageOptions,
 } from '../store';
 import { copyInviteLink } from '../utils/shareLinks';
@@ -30,6 +30,15 @@ export function DocumentEditor() {
   // the current user — defaults to full edit so there's no flash of a
   // restricted UI for the common (editor/owner) case while this is loading.
   const [role, setRole] = useState<'edit' | 'comment' | 'present'>('edit');
+  // Distinct from `role` itself — `role` defaults to 'edit' until the
+  // diagram doc's first snapshot resolves a real value (see the comment
+  // above), so gating the redirect effect below on `role !== 'edit'` alone
+  // would never fire for a genuine non-editor if it happened to also check
+  // too early; this tracks "we've actually heard from the diagram doc at
+  // least once" so the redirect only ever acts on a resolved role.
+  const [diagramLoaded, setDiagramLoaded] = useState(false);
+  const [publicShareToken, setPublicShareToken] = useState<string | undefined>(undefined);
+  const [ownerId, setOwnerId] = useState('');
   const [loading, setLoading] = useState(true);
   const [newPageOpen, setNewPageOpen] = useState(false);
   const [newPageAfterOrder, setNewPageAfterOrder] = useState<number | null>(null);
@@ -67,11 +76,24 @@ export function DocumentEditor() {
       if (d) {
         setMembers(d.memberIds.map(uid => ({ uid, email: d.memberEmails?.[uid] ?? uid })));
         setInviteToken(d.inviteToken);
+        setPublicShareToken(d.publicShareToken ?? undefined);
+        setOwnerId(d.ownerId);
         setRole(user ? getDiagramRole(d, user.uid) : 'edit');
+        setDiagramLoaded(true);
       }
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, user?.uid]);
+
+  // A viewer/commenter who landed here (e.g. via a viewer invite link)
+  // belongs in the real fullscreen Present route, not this editor shell —
+  // PresentationView itself now computes the same role and keeps whatever
+  // comment/present capability it grants, and its own exit button routes a
+  // non-editor back to the Dashboard rather than here, so this redirect
+  // can't loop.
+  useEffect(() => {
+    if (diagramLoaded && role !== 'edit' && id) navigate(`/d/${id}/present`, { replace: true });
+  }, [diagramLoaded, role, id, navigate]);
 
   function commitTitle(name: string) {
     isEditingTitleRef.current = false;
@@ -131,7 +153,24 @@ export function DocumentEditor() {
     if (id) reorderPages(id, reordered.map(p => p.id));
   }
 
-  if (loading) {
+  async function handleCopyInviteAs(kind: 'edit' | 'viewer') {
+    if (!id) return;
+    const token = kind === 'viewer'
+      ? (publicShareToken ?? await generateViewerInvite({ id, name: diagramName, ownerId }))
+      : inviteToken;
+    if (kind === 'viewer') setPublicShareToken(token);
+    copyInviteLink(token, kind);
+  }
+
+  // `loading` alone only reflects the pages subscription, which resolves
+  // independently of (and often before) the diagram doc subscription that
+  // `role` depends on — gating on `diagramLoaded && role !== 'edit'` left a
+  // real window where pages had loaded but the diagram doc hadn't resolved
+  // yet, `role` still sat at its optimistic 'edit' default, and the full
+  // edit shell (Share dropdown, Pages/Master Pages toggle) mounted for a
+  // visitor who was about to get redirected to Present a moment later.
+  // Requiring `diagramLoaded` outright closes that gap.
+  if (loading || !diagramLoaded || role !== 'edit') {
     return (
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', background: '#EEF0F5' }}>
         <Spin size="large" />
@@ -174,9 +213,20 @@ export function DocumentEditor() {
         />
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
           {role === 'edit' && (
-            <Tooltip title="Copy invite link">
-              <Button icon={<IconShare />} onClick={() => copyInviteLink(inviteToken)} />
-            </Tooltip>
+            <Dropdown
+              trigger={['click']}
+              menu={{
+                items: [
+                  { key: 'edit', label: 'Copy editor invite link' },
+                  { key: 'viewer', label: 'Copy viewer invite link' },
+                ],
+                onClick: ({ key }) => handleCopyInviteAs(key as 'edit' | 'viewer'),
+              }}
+            >
+              <Tooltip title="Share">
+                <Button icon={<IconShare />} />
+              </Tooltip>
+            </Dropdown>
           )}
           {role === 'edit' && (
             <Segmented
@@ -186,9 +236,16 @@ export function DocumentEditor() {
               options={[{ label: 'Pages', value: 'pages' }, { label: 'Master Pages', value: 'masters' }]}
             />
           )}
-          <Tooltip title="Version history">
-            <Button icon={<IconHistory />} onClick={() => setVersionHistoryOpen(true)} />
-          </Tooltip>
+          {/* Labeled, unlike the icon-only Share/Presenter/Present buttons
+              around it — those use near-universal icon conventions (share
+              arrow, notes, play triangle), but a clock/history icon doesn't,
+              and is easily mistaken for "recent" or notifications (this app
+              already has a separate bell icon in a similar family). A
+              permanent label fixes discoverability every session, not just
+              a first-time nudge that stops helping after one missed visit. */}
+          <Button icon={<IconHistory />} onClick={() => setVersionHistoryOpen(true)}>
+            Version history
+          </Button>
           {viewMode === 'pages' && (
             <>
               <Tooltip title="Presenter view (notes + next slide — open on your own screen, then Present on the shared one)">
