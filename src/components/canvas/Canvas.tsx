@@ -441,6 +441,12 @@ export function Canvas({
     return origins;
   }, [masterPages]);
 
+  // Moved up from further down in this file so selection-driven floating UI
+  // (selectedShapeIds/selectedEdges below) can scope itself to "is this
+  // actually on the page I'm looking at" — see their own comments for why
+  // that scoping exists.
+  const activePageId = useActivePageId(pages, pageOrigins, pageDimensions);
+
   // Fit-to-page zoom — used both for the initial view and for page-switching,
   // replacing the old "whole document" fitView and "keep whatever zoom was
   // already active" goToPage. fitBounds already contains RF's own
@@ -3342,7 +3348,19 @@ export function Canvas({
   // them here meant a selected path never got a ShapePropertiesPanel at all
   // (pre-existing gap, only surfaced now that paths have panel controls to
   // reach, like "Edit points").
-  const selectedShapeIds = nodes.filter(n => n.selected && (n.type === 'shape' || n.type === 'path')).map(n => n.id);
+  //
+  // Scoped to activePageId — every page in the current viewMode stays
+  // mounted simultaneously (continuous canvas), and React Flow's own
+  // click-elsewhere deselection only fires from an actual pane click.
+  // Navigating to a different page via the left rail (or anything else
+  // that doesn't click the pane) left a shape/edge selected on a page you'd
+  // since scrolled away from, and its floating properties bar kept showing
+  // with nothing visibly selected — confirmed live for the connector
+  // routing bar specifically, fixed here for both shapes and edges since
+  // they share the identical root cause.
+  const selectedShapeIds = nodes
+    .filter(n => n.selected && (n.type === 'shape' || n.type === 'path') && (!activePageId || (n.data as ShapeNodeData | undefined)?.pageId === activePageId))
+    .map(n => n.id);
   const selectedGroup = nodes.find(n => n.selected && n.type === 'group');
   // Falls back to the ephemeral inherited-master layer — those synthetic
   // `inherited-*` ids are never in shapeNodes (the real committed state),
@@ -3360,7 +3378,17 @@ export function Canvas({
   const bulkSelectedShapes = selectedShapeIds.length >= 2
     ? selectedShapeIds.map(id => shapeNodes.find(n => n.id === id)).filter((n): n is Node => !!n)
     : [];
-  const selectedEdges = connectorEdges.filter(e => e.selected);
+  // Same activePageId scoping as selectedShapeIds above, and for the same
+  // reason — connectorEdges keeps every page's connectors loaded at once,
+  // so an edge selected on a page you've since navigated away from (via the
+  // rail, not a pane click) stayed marked selected forever, which is what
+  // made the routing/arrow-style bar pop up with nothing visibly selected.
+  const selectedEdges = connectorEdges.filter(e => {
+    if (!e.selected) return false;
+    if (!activePageId) return true;
+    const sourcePageId = (nodes.find(n => n.id === e.source)?.data as ShapeNodeData | undefined)?.pageId;
+    return sourcePageId === activePageId;
+  });
   const singleSelectedEdge = selectedEdges.length === 1 ? selectedEdges[0] : undefined;
   const BOOLEAN_ELIGIBLE_KINDS = new Set(['path', 'ellipse', 'rectangle', 'stickyNote', 'container']);
   const canBooleanOp = selectedShapeIds.length === 2 && selectedShapeIds.every(id => {
@@ -3808,8 +3836,6 @@ export function Canvas({
   function deleteSelected() {
     onNodesChange(selectedShapeIds.filter(id => !isLocked(id)).map(id => ({ type: 'remove', id })));
   }
-
-  const activePageId = useActivePageId(pages, pageOrigins, pageDimensions);
 
   // Real (but bandwidth-free) page-navigator thumbnails: a session-scoped,
   // in-memory-only cache of small raster snapshots, keyed by pageId — never
