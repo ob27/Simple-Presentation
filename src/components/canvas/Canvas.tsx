@@ -73,7 +73,7 @@ import { exportPageAsImage } from '../../utils/exportImage';
 import { THUMB_MAX_WIDTH, THUMB_MAX_HEIGHT } from './PageNavigatorRail';
 import type { DiagramVariable } from '../../types/variables';
 import {
-  subscribeShapes, subscribeConnectors, saveShape, deleteShape, saveConnector, deleteConnector,
+  subscribeShapes, subscribeConnectors, saveShape, saveShapes, deleteShape, saveConnector, deleteConnector,
   subscribeVariables, upsertVariable, deleteVariable, updatePage, duplicatePage, detachMasterShape,
   subscribeComments, saveComment, deleteComment, setCoverPage, deletePage,
 } from '../../store';
@@ -995,6 +995,28 @@ export function Canvas({
       }
     }
   }
+  // Batched version for multi-shape undo/redo (align/distribute/nudge) —
+  // one call covering every id, not applyPosition called per-id in a loop —
+  // so it commits as one atomic write. See saveShapes' own comment in
+  // store.ts for why an unbatched per-shape write here let subscribeShapes'
+  // listener rebuild this app's shape state from a partial mix of updated/
+  // stale docs mid-flight.
+  function applyPositionBatch(entries: Map<string, { x: number; y: number }>) {
+    const updates: { pageId: string; node: DiagramNode }[] = [];
+    for (const [id, position] of entries) {
+      for (const slice of shapesSlices.current.values()) {
+        const existing = slice.get(id);
+        if (existing) {
+          const updated: DiagramNode = { ...existing, position };
+          slice.set(id, updated);
+          updates.push({ pageId: existing.data.pageId, node: updated });
+          break;
+        }
+      }
+    }
+    rebuildShapes();
+    if (updates.length > 0) saveShapes(diagramId, updates);
+  }
   // Precise numeric move (the properties panel's mm-based X/Y inputs) —
   // same "lives on the node, not `.data`" reasoning as handleResizeShape.
   const handleMoveShape = useCallback((id: string, x: number, y: number) => {
@@ -1496,16 +1518,17 @@ export function Canvas({
     const minY = Math.min(...boxes.map(b => b.y));
     const maxX = Math.max(...boxes.map(b => b.x + b.w));
     const maxY = Math.max(...boxes.map(b => b.y + b.h));
-    // React Flow itself boosts every SELECTED node's effective z-index by
-    // +1000 by default (SELECTED_NODE_Z, elevateNodesOnSelect) — since every
-    // shape in a multi-selection is, definitionally, selected, a fixed
-    // zIndex of 1000 here loses the corner-handle hit-test to whichever
-    // selected shape's own corner happens to coincide with the overlay's
-    // (virtually always true — a bbox corner IS one of the selected shapes'
-    // own corners), so dragging a corner only ever resized that one shape.
-    // Computed relative to the highest already-elevated selected shape
-    // instead of a bare constant so this can't regress if any shape's own
-    // zIndex is ever pushed above 1000 by repeated "bring to front" use.
+    // This overlay must render above every shape it wraps, or a fixed
+    // zIndex here loses the corner-handle hit-test to whichever selected
+    // shape's own corner happens to coincide with the overlay's (virtually
+    // always true — a bbox corner IS one of the selected shapes' own
+    // corners), so dragging a corner only ever resized that one shape.
+    // Computed relative to the highest selected shape's own real zIndex
+    // (elevateNodesOnSelect is off — see the main <ReactFlow> element's own
+    // comment — so that's exactly what actually renders, no automatic RF
+    // boost to account for) plus a generous margin, so this can't regress
+    // if a shape's own zIndex is ever pushed unusually high by repeated
+    // "bring to front" use.
     const maxSelectedZ = Math.max(0, ...multiSelectTargets.map(n => (n.zIndex ?? 0) + 1000));
     return [{
       id: '__multiselect__',
@@ -1867,14 +1890,16 @@ export function Canvas({
     shapeNudgeTimerRef.current = setTimeout(() => {
       const originals = new Map(shapeNudgeOriginalRef.current);
       const finals = new Map<string, { x: number; y: number }>();
+      const nudgeUpdates: { pageId: string; node: DiagramNode }[] = [];
       for (const n of shapeNudgePendingRef.current.values()) {
         const pageId = (n.data as ShapeNodeData | undefined)?.pageId;
-        if (pageId) saveShape(diagramId, pageId, toPersistableShape(n));
+        if (pageId) nudgeUpdates.push({ pageId, node: toPersistableShape(n) });
         finals.set(n.id, n.position);
       }
+      if (nudgeUpdates.length > 0) saveShapes(diagramId, nudgeUpdates);
       pushHistory({
-        undo: () => { for (const [id, pos] of originals) applyPosition(id, pos); },
-        redo: () => { for (const [id, pos] of finals) applyPosition(id, pos); },
+        undo: () => applyPositionBatch(originals),
+        redo: () => applyPositionBatch(finals),
       });
       shapeNudgePendingRef.current.clear();
       shapeNudgeOriginalRef.current.clear();
@@ -3552,12 +3577,23 @@ export function Canvas({
 
   // Saves whichever of `targetIds` changed in `updatedNodes` — not tied to
   // any one field, used by z-order, align, and distribute alike.
+  // Batches every changed shape into ONE atomic write (see saveShapes' own
+  // comment in store.ts) — critical here specifically because this is the
+  // shared path behind bringToFront/sendToBack/alignSelected/
+  // distributeSelected, all of which can touch many shapes on one page at
+  // once. N independent unbatched writes let subscribeShapes' whole-
+  // collection listener rebuild this app's shape state from a genuinely
+  // partial mix of updated/stale docs mid-flight — confirmed live as the
+  // exact cause of z-index reordering "sometimes working, sometimes
+  // reverting until a hard reload."
   function persistNodes(updatedNodes: Node[], targetIds: string[]) {
+    const updates: { pageId: string; node: DiagramNode }[] = [];
     for (const n of updatedNodes) {
       if (!targetIds.includes(n.id)) continue;
       const pageId = findPageIdFor(n);
-      if (pageId) saveShape(diagramId, pageId, toPersistableShape(n));
+      if (pageId) updates.push({ pageId, node: toPersistableShape(n) });
     }
+    if (updates.length > 0) saveShapes(diagramId, updates);
   }
 
   function getBBox(n: Node): { x: number; y: number; w: number; h: number } {
@@ -3602,28 +3638,38 @@ export function Canvas({
     pushHistory({ undo: () => commitShapeUpdates(before), redo: () => commitShapeUpdates(after) });
   }
 
-  function applyZIndex(id: string, zIndex: number) {
-    for (const slice of shapesSlices.current.values()) {
-      const existing = slice.get(id);
-      if (existing) {
-        const updated: DiagramNode = { ...existing, zIndex };
-        slice.set(id, updated);
-        saveShape(diagramId, existing.data.pageId, updated);
-        rebuildShapes();
-        return;
+  // Batched across every id in one call — same reasoning as
+  // applyPositionBatch above: pushZIndexHistory's undo/redo can cover many
+  // shapes at once (undoing a bringToFront/sendToBack/reorder that touched
+  // a whole page), and looping a single-shape write per id let
+  // subscribeShapes' listener rebuild this app's shape state from a
+  // partial mix of updated/stale docs mid-flight.
+  function applyZIndexBatch(entries: Map<string, number>) {
+    const updates: { pageId: string; node: DiagramNode }[] = [];
+    for (const [id, zIndex] of entries) {
+      for (const slice of shapesSlices.current.values()) {
+        const existing = slice.get(id);
+        if (existing) {
+          const updated: DiagramNode = { ...existing, zIndex };
+          slice.set(id, updated);
+          updates.push({ pageId: existing.data.pageId, node: updated });
+          break;
+        }
       }
     }
+    rebuildShapes();
+    if (updates.length > 0) saveShapes(diagramId, updates);
   }
   function pushPositionHistory(before: Map<string, { x: number; y: number }>, after: Map<string, { x: number; y: number }>) {
     pushHistory({
-      undo: () => { for (const [id, pos] of before) applyPosition(id, pos); },
-      redo: () => { for (const [id, pos] of after) applyPosition(id, pos); },
+      undo: () => applyPositionBatch(before),
+      redo: () => applyPositionBatch(after),
     });
   }
   function pushZIndexHistory(before: Map<string, number>, after: Map<string, number>) {
     pushHistory({
-      undo: () => { for (const [id, z] of before) applyZIndex(id, z); },
-      redo: () => { for (const [id, z] of after) applyZIndex(id, z); },
+      undo: () => applyZIndexBatch(before),
+      redo: () => applyZIndexBatch(after),
     });
   }
 
@@ -4274,6 +4320,15 @@ export function Canvas({
     handleLayerSelect(newShapeId, false);
   }
 
+  // Used to fire its two saveShape writes independently with no local
+  // optimistic update at all — the ONLY visual feedback came from waiting
+  // on subscribeShapes' async round-trip, so a rebuild triggered between
+  // the two writes landing (or arriving out of order) could show no change
+  // at all until a later firing (or a reload) caught up, and undo/redo
+  // wasn't wired up here the way every other z-index operation has it.
+  // Now matches bringToFront/sendToBack's own pattern: optimistic
+  // setShapeNodes update, persistNodes' batched (atomic) write, and real
+  // undo/redo history.
   function handleReorderLayer(id: string, direction: -1 | 1) {
     const node = shapeNodes.find(n => n.id === id);
     if (!node || isLocked(id)) return;
@@ -4288,8 +4343,12 @@ export function Canvas({
     const b = siblings[swapIdx];
     const az = a.zIndex ?? 0;
     const bz = b.zIndex ?? 0;
-    saveShape(diagramId, pageId, toPersistableShape({ ...a, zIndex: bz }));
-    saveShape(diagramId, pageId, toPersistableShape({ ...b, zIndex: az }));
+    setShapeNodes(prev => {
+      const next = prev.map(n => n.id === a.id ? { ...n, zIndex: bz } : n.id === b.id ? { ...n, zIndex: az } : n);
+      persistNodes(next, [a.id, b.id]);
+      return next;
+    });
+    pushZIndexHistory(new Map([[a.id, az], [b.id, bz]]), new Map([[a.id, bz], [b.id, az]]));
   }
 
   function handleIndentLayer(id: string) {
@@ -4439,6 +4498,24 @@ export function Canvas({
           onlyRenderVisibleElements={!isExporting}
           minZoom={0.1}
           maxZoom={2}
+          // React Flow's own default (true) invisibly boosts every SELECTED
+          // node's rendered z-index by a large fixed offset, on top of
+          // whatever its own zIndex prop says — harmless for apps with no
+          // z-order model of their own, but this one has a full explicit
+          // layering system (zIndex field, Layers panel, bring-to-front/
+          // send-to-back). With the default left on, "send to back" (or
+          // "move backward" in the Layers panel) on a shape that STAYS
+          // selected afterward — the normal state right after clicking a
+          // toolbar button targeting it — correctly updated the shape's
+          // real zIndex, but the shape kept rendering on top regardless,
+          // because RF's own automatic elevation overrode it. It only
+          // "worked" once the shape was deselected some other way, which
+          // is exactly the reported "inconsistent, sometimes needs a
+          // refresh" behavior — deselecting doesn't refetch anything, but
+          // it does stop RF from overriding the (already-correct) real
+          // zIndex, so the shape visibly snaps to where it already was.
+          elevateNodesOnSelect={false}
+          elevateEdgesOnSelect={false}
           // Disables RF's own per-node tabIndex/keyboard-a11y layer (Space
           // toggling node selection, Arrow keys nudging the selected node) —
           // it was silently fighting the Space-drag-pan and new WASD/arrow

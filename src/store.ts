@@ -582,6 +582,32 @@ export async function saveShape(diagramId: string, pageId: string, node: Diagram
   await setDoc(doc(db, 'diagrams', diagramId, 'pages', pageId, 'shapes', node.id), node);
 }
 
+// Multi-shape z-index/align/distribute operations (bringToFront, sendToBack,
+// alignSelected, distributeSelected in Canvas.tsx) used to fire one
+// independent saveShape per shape — each an unbatched setDoc, so the
+// Firestore SDK's local cache applied them one at a time as their own
+// promises resolved. The whole-collection subscribeShapes listener re-fires
+// on EVERY individual doc change, and each firing rebuilds this app's entire
+// shape-node state from whatever the local cache currently holds — so a
+// rebuild triggered partway through N independent writes landing could
+// (and did) render a genuinely inconsistent mix of updated and stale
+// zIndex/position values, which then either self-corrected on a LATER
+// firing or, if that partial firing happened to be the LAST one, stuck
+// until a full reload re-fetched the fully-settled server state. A single
+// writeBatch commits every shape's write as one atomic local-cache
+// transaction — subscribeShapes' listener only ever sees the fully-before
+// or fully-after state, never a partial one.
+export async function saveShapes(diagramId: string, updates: { pageId: string; node: DiagramNode }[]): Promise<void> {
+  const CHUNK = 400;
+  for (let i = 0; i < updates.length; i += CHUNK) {
+    const batch = writeBatch(db);
+    for (const u of updates.slice(i, i + CHUNK)) {
+      batch.set(doc(db, 'diagrams', diagramId, 'pages', u.pageId, 'shapes', u.node.id), u.node);
+    }
+    await batch.commit();
+  }
+}
+
 export async function updateShapePosition(
   diagramId: string, pageId: string, nodeId: string,
   position: { x: number; y: number }, rotation: number | undefined, updatedBy: string,
