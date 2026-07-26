@@ -2,7 +2,7 @@ import { useMemo, useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import {
   ReactFlow, Background, Controls, addEdge, applyNodeChanges, applyEdgeChanges,
-  MarkerType, ConnectionMode, useReactFlow, type Node, type Edge, type NodeTypes, type EdgeTypes,
+  MarkerType, ConnectionMode, useReactFlow, useUpdateNodeInternals, type Node, type Edge, type NodeTypes, type EdgeTypes,
   type OnConnect, type NodeChange, type EdgeChange, type OnReconnect,
 } from '@xyflow/react';
 import { Button, Tooltip, Select, Popover, Switch, ColorPicker, Modal, Progress } from 'antd';
@@ -302,6 +302,7 @@ export function Canvas({
 
   const { user } = useAuth();
   const { screenToFlowPosition, setCenter, getZoom, getInternalNode, fitBounds, getViewport, setViewport, updateNodeData } = useReactFlow();
+  const updateNodeInternals = useUpdateNodeInternals();
   const isPresent = mode !== 'edit';
   // Only comment pins carve an exception out of the blanket isPresent gate
   // above — see the 'comment' mode doc comment on the Props type.
@@ -950,11 +951,21 @@ export function Canvas({
     for (const slice of connectorsSlices.current.values()) {
       for (const e of slice.values()) merged.push(e);
     }
-    // Same selection-loss hazard as rebuildShapes — Firestore docs never carry
-    // `selected`, so an unconditional rebuild would clear it every echo.
+    // Same selection-loss hazard as rebuildShapes — Firestore docs aren't
+    // SUPPOSED to carry `selected` (saveConnector strips it before every
+    // write), so re-applying local selection state on top of the merged
+    // docs is what preserves it across a rebuild. But unlike rebuildShapes
+    // (whose merged source is structurally guaranteed selected-free via
+    // toPersistableShape), a connector doc written before that strip existed
+    // — or by any future write path that forgets to go through
+    // saveConnector — could still carry a stale `selected: true`. Explicitly
+    // forcing `false` for every id NOT in prevSelected (not just leaving
+    // whatever the doc says) means a single tainted doc can't silently
+    // resurrect itself as "selected" and get swept up in an unrelated later
+    // Delete keypress.
     setConnectorEdges(prev => {
       const prevSelected = new Set(prev.filter(e => e.selected).map(e => e.id));
-      return merged.map(e => prevSelected.has(e.id) ? { ...e, selected: true } : e);
+      return merged.map(e => ({ ...e, selected: prevSelected.has(e.id) }));
     });
   }
 
@@ -4858,9 +4869,43 @@ export function Canvas({
       updateDragPreview({ shapeIds: [node.id], dx: node.position.x - committed.x, dy: node.position.y - committed.y });
     }
   }
-  function onNodeDragStop() {
+  function onNodeDragStop(_event: MouseEvent | TouchEvent, _node: Node, draggedNodes: Node[]) {
     setGuides(null);
     updateDragPreview(null);
+    // React Flow's own adoptUserNodes resets a node's internal handleBounds
+    // (and measured width/height) to undefined whenever it receives a new
+    // object reference for that node — which every position update
+    // produces (ours, via applyNodeChanges' own immutable spread), since
+    // this app never sets `measured`/`handles` on its own node objects (it
+    // renders real `<Handle>` components instead of RF's declarative
+    // `node.handles` config — see ConnectionHandles.tsx — and
+    // parseHandles() only preserves the PREVIOUS handleBounds when
+    // `userNode.measured` is already truthy, which ours never is). Normally
+    // something repopulates that reset almost immediately, but it doesn't
+    // reliably happen for every node after a MULTI-node drag — leaving
+    // those nodes permanently "not initialized" from RF's own perspective,
+    // which makes getEdgePosition (and thus every connector touching them)
+    // return null forever, until a full reload re-mounts everything from
+    // scratch. Confirmed live: calling updateNodeInternals synchronously
+    // here does NOT fix it — this callback fires BEFORE React commits the
+    // position update that triggers adoptUserNodes' own reset, so the
+    // immediate call gets stomped by that reset happening right after it.
+    // Deferring to the next tick (after the reset has already run) is what
+    // actually lets it stick — this is React Flow's own documented pattern
+    // for apps with custom Handle-based nodes needing a forced re-measure.
+    // A single deferred call raced adoptUserNodes' own reset unreliably in
+    // testing — 50ms was enough most of the time but not always, and a
+    // same-tick (0ms) call never was. Rather than tune a fragile magic
+    // number, call it a few times across a spread of delays: each call is
+    // harmless/idempotent (a node that's already correctly measured just
+    // gets re-measured to the same values), so the only cost of "extra"
+    // calls is negligible, while missing the one call that lands after the
+    // reset has actually happened means this connector's edges silently
+    // vanish until a full reload.
+    const ids = draggedNodes.map(n => n.id);
+    for (const delay of [0, 50, 150, 300]) {
+      setTimeout(() => updateNodeInternals(ids), delay);
+    }
   }
 
   function handlePaneMouseMove(e: React.MouseEvent) {

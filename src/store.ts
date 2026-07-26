@@ -633,7 +633,19 @@ export function subscribeConnectors(
 }
 
 export async function saveConnector(diagramId: string, pageId: string, edge: DiagramEdge): Promise<void> {
-  await setDoc(doc(db, 'diagrams', diagramId, 'pages', pageId, 'connectors', edge.id), edge);
+  // `selected` is ephemeral per-viewer UI state, never fine to persist —
+  // unlike shapes (saved exclusively via Canvas.tsx's toPersistableShape,
+  // which structurally excludes it), every saveConnector call site passes
+  // the raw edge object, so reconnecting/pasting/alt-drag-duplicating a
+  // connector WHILE it was selected baked `selected: true` into its
+  // Firestore doc permanently (nothing ever writes it back to false).
+  // rebuildConnectors() only ever ADDS `selected: true` for locally-tracked
+  // ids and never clears a stale true from a freshly-merged doc, so a single
+  // tainted connector stayed "selected" forever — and the next Delete
+  // keypress (React Flow's own built-in deleteKeyCode handler, which isn't
+  // page-scoped) removed it and every other real selection at once.
+  const { selected: _selected, ...persistable } = edge;
+  await setDoc(doc(db, 'diagrams', diagramId, 'pages', pageId, 'connectors', persistable.id), persistable);
 }
 
 export async function deleteConnector(diagramId: string, pageId: string, edgeId: string): Promise<void> {
