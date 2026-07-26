@@ -39,8 +39,14 @@ export function VersionHistoryModal({ open, onClose, diagramId, uid }: Props) {
       await saveVersion(diagramId, uid, name.trim() || undefined);
       setName('');
       message.success('Version saved');
-    } catch {
-      message.error('Failed to save version');
+    } catch (err) {
+      // Previously swallowed entirely (a bare "Failed to save version" with
+      // nothing in the console either) — surfacing the SDK's own message
+      // directly in the toast means the next failure is actually
+      // diagnosable without needing devtools open.
+      console.error('Failed to save version:', err);
+      const detail = err instanceof Error ? err.message : String(err);
+      message.error(`Failed to save version: ${detail}`);
     } finally {
       setSaving(false);
     }

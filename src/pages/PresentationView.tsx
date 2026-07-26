@@ -26,7 +26,22 @@ export function PresentationView() {
   // 'commenter' viewer needs commentsEnabled to stay true, which hardcoding
   // mode="present" below used to silently strip from everyone regardless of
   // their real role.
-  const mode: DiagramAccessRole = user && diagram ? getDiagramRole(diagram, user.uid) : 'present';
+  //
+  // getDiagramRole answers "what CAN this uid do" — for the diagram's own
+  // owner/editor that's unconditionally 'edit', regardless of context. That
+  // was fine for gating (e.g. DocumentEditor deciding whether to redirect
+  // someone here), but using it directly as THIS route's own render mode
+  // broke the ordinary case: the owner clicking their own editor's Present
+  // button got mode='edit' here too, which made Canvas render the full
+  // editing shell (page-name label, no device frame, etc.) instead of an
+  // actual presentation — this route has no editing wiring at all, so
+  // 'edit' never made sense as ITS mode. An editor visiting `/present` is
+  // choosing to VIEW the presentation, same as anyone else who lands here;
+  // only handleExit below still needs to know they're actually an editor,
+  // so it can route them back to the editor instead of the Dashboard.
+  const resolvedRole: DiagramAccessRole = user && diagram ? getDiagramRole(diagram, user.uid) : 'present';
+  const isEditorViewing = resolvedRole === 'edit';
+  const mode: DiagramAccessRole = isEditorViewing ? 'present' : resolvedRole;
 
   useEffect(() => {
     if (!id) return;
@@ -63,8 +78,9 @@ export function PresentationView() {
     // role !== 'edit' visitor here), an infinite loop. Only an editor
     // (who navigated in via the header's own Present button) goes back to
     // the editor; anyone else goes to the Dashboard, where their diagram
-    // already appears via the existing viewer-tier query.
-    navigate(mode === 'edit' ? `/d/${id}` : '/');
+    // already appears via the existing viewer-tier query. Checks
+    // isEditorViewing, not mode — mode itself is now always non-'edit' here.
+    navigate(isEditorViewing ? `/d/${id}` : '/');
   }
 
   if (loading) {

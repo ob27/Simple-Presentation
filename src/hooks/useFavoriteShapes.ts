@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback } from 'react';
+import { usePersistedState } from './usePersistedState';
 
 // Favorites are a personal UI preference, not diagram content — stored in
 // localStorage (global across every diagram this browser opens) rather than
@@ -16,23 +17,12 @@ export interface FavoriteShapeId {
   label: string;
 }
 
-function load(): FavoriteShapeId[] {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
+function mergeFavorites(defaults: FavoriteShapeId[], parsed: unknown): FavoriteShapeId[] {
+  return Array.isArray(parsed) ? parsed : defaults;
 }
 
 export function useFavoriteShapes() {
-  const [favorites, setFavorites] = useState<FavoriteShapeId[]>(load);
-
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(favorites));
-  }, [favorites]);
+  const [favorites, setFavorites] = usePersistedState<FavoriteShapeId[]>(STORAGE_KEY, [], mergeFavorites);
 
   const isFavorite = useCallback(
     (kind: string, label: string) => favorites.some(f => f.kind === kind && f.label === label),
@@ -47,7 +37,7 @@ export function useFavoriteShapes() {
       if (prev.length >= MAX_FAVORITE_SHAPES) return prev;
       return [...prev, { kind, label }];
     });
-  }, []);
+  }, [setFavorites]);
 
   return { favorites, isFavorite, toggleFavorite };
 }

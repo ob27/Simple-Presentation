@@ -9,7 +9,7 @@ import { Button, Tooltip, Select, Popover, Switch, ColorPicker, Modal, Progress 
 import {
   IconDelete, IconAlignTop, IconAlignBottom, IconAlignMiddle,
   IconAlignLeft, IconAlignCenter, IconAlignRight, IconDistributeH, IconDistributeV,
-  IconBringToFront, IconSendToBack, IconDuplicate,
+  IconBringToFront, IconSendToBack, IconDuplicate, IconMoveUp, IconMoveDown,
   IconBooleanUnion, IconBooleanSubtract, IconBooleanIntersect, IconBooleanExclude,
   IconGroup, IconUngroup, IconContainer,
   IconExit, IconChevronLeft, IconChevronRight,
@@ -38,6 +38,7 @@ import { ToolSettingsPanel } from '../panels/ToolSettingsPanel';
 import { FavoriteShapesPanel } from './FavoriteShapesPanel';
 import { useFavoriteShapes, MAX_FAVORITE_SHAPES } from '../../hooks/useFavoriteShapes';
 import { useToolDefaults } from '../../hooks/useToolDefaults';
+import { useUxPreferences } from '../../hooks/useUxPreferences';
 import { ShapeStampCursor } from './ShapeStampCursor';
 import { useActivePageId } from './useActivePageId';
 import { AlignmentGuidesOverlay } from './AlignmentGuidesOverlay';
@@ -49,7 +50,7 @@ import {
   computePathViewBox, absoluteToAnchorLocal, anchorToAbsolute, normalizePathAnchors,
   subdivideBezierAt, synthesizeSmoothHandles,
 } from '../../utils/pathAnchorGeometry';
-import { computeAlignmentGuides, type GuideLines } from './alignmentGuides';
+import { computeAlignmentGuides, computeSnapOffset, type GuideLines } from './alignmentGuides';
 import { applyBooleanOp, groupContoursByContainment, ellipseToAnchors, roundedRectToAnchors, type BooleanOp, type PathContour } from '../../utils/pathBoolean';
 import { ShapePropertiesPanel } from '../panels/ShapePropertiesPanel';
 import { DataPanel } from '../panels/DataPanel';
@@ -60,6 +61,8 @@ import { LayersPanel } from '../panels/LayersPanel';
 import { PageSettingsPanel } from '../panels/PageSettingsPanel';
 import { ExportModal } from '../ExportModal';
 import { ShortcutsHelpModal } from '../ShortcutsHelpModal';
+import { UxPreferencesDrawer } from '../UxPreferencesDrawer';
+import { ShapeContextMenu } from './ShapeContextMenu';
 import { getFloatingEdgeParams } from './edges/edgeRouting';
 import { RemoteCursorsLayer } from './RemoteCursorsLayer';
 import { PresentationFrame } from './PresentationFrame';
@@ -409,6 +412,21 @@ export function Canvas({
     historyDebounceRef.current.set(key, { timer, before: trueBefore });
   }
 
+  // Keyed on just the fields that actually affect stacking/size, not the
+  // whole `pages` array reference — `pages` comes from a live Firestore
+  // listener that hands back a brand-new array on ANY field write to ANY
+  // page, including ones with nothing to do with geometry (e.g. the page-
+  // thumbnail effect below writes `thumbnailUrl`/`thumbnailUpdatedAt` on
+  // every regenerate). Depending on `pages` directly meant THIS memo
+  // recomputed (new Map references) on every such write too, and since the
+  // thumbnail effect itself depends on these Maps, its own write fed right
+  // back into retriggering itself — a real, confirmed self-sustaining loop
+  // (regenerate → write thumbnailUrl → pages ref changes → this memo
+  // recomputes → thumbnail effect's deps change → regenerate again),
+  // visible as its corner spinner cycling every second or so with nothing
+  // actually changing on the page. This key only changes when a page's own
+  // size-relevant fields do.
+  const pageGeometryKey = pages.map(p => `${p.id}:${p.paperSize}:${p.orientation}:${p.customWidth ?? ''}:${p.customHeight ?? ''}`).join('|');
   const { pageOrigins, pageDimensions } = useMemo(() => {
     const origins = new Map<string, number>();
     const dims = new Map<string, { width: number; height: number }>();
@@ -420,7 +438,8 @@ export function Canvas({
       cursorY += height + PAGE_GAP;
     }
     return { pageOrigins: origins, pageDimensions: dims };
-  }, [pages]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pageGeometryKey]);
   const pageGeomRef = useRef({ pageOrigins, pageDimensions, pages });
   pageGeomRef.current = { pageOrigins, pageDimensions, pages };
 
@@ -515,6 +534,32 @@ export function Canvas({
   // off any shape) never reaches the pane's own click handler, so RF's
   // usual "click empty space to deselect" behavior silently doesn't fire
   // there. Deselecting explicitly on click closes that gap.
+  // Same reasoning as pageGeometryKey above, one level higher: frameNodes
+  // reads several more per-page fields (name, margins, background, header/
+  // footer, page-number settings) plus each page's master (for fallback
+  // values), but explicitly EXCLUDES thumbnailUrl/thumbnailUpdatedAt — the
+  // one field this app itself repeatedly writes back (see the page-
+  // thumbnail effect below) that has nothing to do with how a frame
+  // renders. Without this, frameNodes recomputed brand-new node objects on
+  // every thumbnail write (since `pages` itself is a fresh array from the
+  // live listener), which React Flow's own ResizeObserver treated as
+  // needing remeasurement — confirmed live as a `dimensions` NodeChange
+  // event for the page frame firing every ~1.5s indefinitely, which
+  // onNodesChange unconditionally applied to shapeNodes, which in turn
+  // retriggered the thumbnail effect's own timer. A closed, self-
+  // sustaining loop, entirely from an object reference nothing downstream
+  // actually needed to react to.
+  const pageContentKey = pages.map(p => JSON.stringify({
+    id: p.id, name: p.name, masterPageId: p.masterPageId,
+    marginTop: p.marginTop, marginRight: p.marginRight, marginBottom: p.marginBottom, marginLeft: p.marginLeft,
+    backgroundColor: p.backgroundColor, headerText: p.headerText, footerText: p.footerText,
+    headerConfig: p.headerConfig, footerConfig: p.footerConfig,
+    pageNumberEnabled: p.pageNumberEnabled, pageNumberStyle: p.pageNumberStyle, pageNumberPosition: p.pageNumberPosition,
+  })).join('|');
+  const masterContentKey = masterPages.map(m => JSON.stringify({
+    id: m.id, backgroundColor: m.backgroundColor, headerText: m.headerText, footerText: m.footerText,
+    headerConfig: m.headerConfig, footerConfig: m.footerConfig,
+  })).join('|');
   const frameNodes = useMemo<Node[]>(() => pages.map((page, i) => {
     const master = page.masterPageId ? masterPages.find(m => m.id === page.masterPageId) : undefined;
     return {
@@ -544,7 +589,8 @@ export function Canvas({
       // from any realistic master shape count.
       zIndex: -1_000_000,
     };
-  }), [pages, masterPages, pageOrigins, pageDimensions, diagramId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }), [pageContentKey, masterContentKey, pageOrigins, pageDimensions, diagramId]);
 
   const [variables, setVariables] = useState<DiagramVariable[]>([]);
   useEffect(() => subscribeVariables(diagramId, setVariables), [diagramId]);
@@ -825,11 +871,29 @@ export function Canvas({
     window.setTimeout(() => setScreenFlash(null), 500);
   }
 
+  // Firestore's onSnapshot has been observed to re-fire (with an identical
+  // document set) for reasons that have nothing to do with this app's own
+  // edits — confirmed live: on a completely untouched, empty page, this
+  // fired every ~1.5s indefinitely, each time producing a brand-new (if
+  // logically empty/identical) array via setShapeNodes, which in turn kept
+  // retriggering anything depending on shapeNodes' reference — most
+  // visibly the page-thumbnail effect's corner spinner, cycling with
+  // nothing actually changing. Skipping the setShapeNodes call entirely
+  // when the underlying raw doc data hasn't actually changed (compared via
+  // a cheap signature, BEFORE the always-fresh onCommit/readOnly etc.
+  // injection below) fixes this regardless of why the snapshot re-fired.
+  const lastShapesSignatureRef = useRef('');
   function rebuildShapes() {
-    const merged: Node[] = [];
+    const rawMerged: DiagramNode[] = [];
     for (const slice of shapesSlices.current.values()) {
-      for (const n of slice.values()) merged.push({ ...n, data: { ...n.data, onCommit, onNavigateLink: navigateToLink, onResizeGroup: handleResizeGroup, readOnly: isPresent } });
+      for (const n of slice.values()) rawMerged.push(n);
     }
+    const signature = `${isPresent}|${JSON.stringify(rawMerged.map(n => ({
+      id: n.id, position: n.position, width: n.width, height: n.height, zIndex: n.zIndex, parentId: n.parentId, type: n.type, data: n.data,
+    })))}`;
+    if (signature === lastShapesSignatureRef.current) return;
+    lastShapesSignatureRef.current = signature;
+    const merged: Node[] = rawMerged.map(n => ({ ...n, data: { ...n.data, onCommit, onNavigateLink: navigateToLink, onResizeGroup: handleResizeGroup, readOnly: isPresent } }));
     // React Flow requires a parent node to appear before its children in the
     // array. Firestore's onSnapshot delivery order is unspecified, so sort by
     // parent-chain depth (a real topological order, not just a two-way
@@ -1212,6 +1276,12 @@ export function Canvas({
   const [shapeGalleryOpen, setShapeGalleryOpen] = useState(false);
   const { favorites, isFavorite, toggleFavorite } = useFavoriteShapes();
   const { defaults: toolDefaults, updatePenDefaults, updateBrushDefaults, updateConnectorDefaults } = useToolDefaults();
+  const { prefs: uxPrefs, updatePrefs: updateUxPrefs } = useUxPreferences();
+  // Align-to-key-object: which shape (if any) is the alignment anchor,
+  // promoted by clicking an already-selected shape again while 2+ are
+  // selected — see onNodesChange's own comment for the exact click pattern
+  // this recognizes. Cleared on any other selection-changing action.
+  const [keyObjectId, setKeyObjectId] = useState<string | null>(null);
   const [placingShapeKind, setPlacingShapeKind] = useState<ShapeKind | null>(null);
   const [pendingMediaPlacement, setPendingMediaPlacement] = useState<{
     kind: 'image' | 'video'; url: string; width: number; height: number; fileSizeBytes?: number; downsampled?: boolean;
@@ -1265,7 +1335,18 @@ export function Canvas({
   const [highlightMode, setHighlightMode] = useState(false);
   const [highlighted, setHighlighted] = useState<{ nodeIds: Set<string>; edgeIds: Set<string> } | null>(null);
 
-  const toolActive = penMode || connectMode || directSelectMode || brushMode || stylePaintMode || highlightMode || !!placingShapeKind;
+  // Hand tool (Affinity/Photoshop-style) — an explicit, sticky "pan only"
+  // mode you switch into via the toolbar, distinct from Space (a held-key
+  // TEMPORARY override of whatever tool is active, see isSpaceDown below).
+  // Folded into toolActive below so every existing toolActive-gated
+  // behavior (nodes not draggable/selectable/connectable while some
+  // exclusive interaction mode owns the canvas) applies here for free —
+  // Hand mode should behave exactly like "some other tool is active" for
+  // all of those, on top of its own additional panOnDrag/selectionOnDrag
+  // handling near the <ReactFlow> element itself.
+  const [handMode, setHandMode] = useState(false);
+
+  const toolActive = penMode || connectMode || directSelectMode || brushMode || stylePaintMode || highlightMode || handMode || !!placingShapeKind;
 
   // Holding Spacebar grab-pans the camera — including over shapes, not just
   // empty canvas — by temporarily disabling node dragging/selection and
@@ -1321,6 +1402,7 @@ export function Canvas({
     setPlacingComment(false);
     setBrushMode(false);
     setStylePaintMode(false); setStylePaintSource(null);
+    setHandMode(false);
     setLayersPanelOpen(false);
     setAnimationPanelOpen(false); setRevealStep(-1);
     setDataPanelOpen(false);
@@ -1332,6 +1414,7 @@ export function Canvas({
 
     switch (toolId) {
       case 'select': break;
+      case 'hand': setHandMode(true); break;
       case 'directSelect': setDirectSelectMode(true); break;
       case 'pen': setPenMode(true); break;
       case 'brush': setBrushMode(true); break;
@@ -1553,10 +1636,13 @@ export function Canvas({
       // the same for the outer wrapper the component itself has no control
       // over, via the one thing that CAN reach it: the node's own `style`.
       style: { pointerEvents: 'none' },
-      data: { onResizeStart: handleMultiSelectResizeStart, onResizeEnd: handleMultiSelectResizeEnd },
+      data: {
+        onResizeStart: handleMultiSelectResizeStart, onResizeEnd: handleMultiSelectResizeEnd,
+        onRotateStart: uxPrefs.multiSelectRotateEnabled ? handleGroupRotateStart : undefined,
+      },
     }];
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [multiSelectTargets]);
+  }, [multiSelectTargets, uxPrefs.multiSelectRotateEnabled]);
 
   const nodes = useMemo(() => {
     const byId = new Map(shapeNodes.map(n => [n.id, n]));
@@ -1567,11 +1653,17 @@ export function Canvas({
       // picks up live tool state and can report a connect-drag start.
       // directSelectMode is injected the same way so PathNode can hide its
       // NodeResizer while anchor points are the interactive thing instead.
-      const extra: Record<string, unknown> = { connectMode, onStartConnect: handleStartConnect, directSelectMode, onEditingChange: handleShapeEditingChange };
+      const extra: Record<string, unknown> = {
+        connectMode, onStartConnect: handleStartConnect, directSelectMode, onEditingChange: handleShapeEditingChange,
+        shiftRotateConstrainEnabled: uxPrefs.shiftRotateConstrainEnabled,
+        altResizeFromCenterEnabled: uxPrefs.altResizeFromCenterEnabled,
+        onResizeAltStart: handleResizeAltStart,
+      };
       if (shapeData.dataBinding) {
         const resolved = resolveStyle(shapeData.dataBinding, variables);
         if (resolved) extra.__resolvedStyle = resolved;
       }
+      if (uxPrefs.alignToKeyObjectEnabled && keyObjectId === n.id) extra.isKeyObject = true;
       if (highlighted) extra.__dimmed = !highlighted.nodeIds.has(n.id);
       if (isPresent && shapeData.pageId === presentPage?.id && shapeData.revealOrder !== undefined) {
         extra.__hidden = shapeData.revealOrder > presentThresholdOrder;
@@ -1638,7 +1730,7 @@ export function Canvas({
       });
     }
     return [...frameNodes, ...inheritedMasterNodes, ...styled, ...commentNodes, ...multiSelectOverlayNode];
-  }, [frameNodes, inheritedMasterNodes, shapeNodes, variables, highlighted, animationPanelOpen, revealStep, isPresent, commentsEnabled, presentPage, presentThresholdOrder, connectMode, toolActive, isSpaceDown, directSelectMode, handleShapeEditingChange, comments, activeCommentId, draftComment, hiddenTags, multiSelectOverlayNode]);
+  }, [frameNodes, inheritedMasterNodes, shapeNodes, variables, highlighted, animationPanelOpen, revealStep, isPresent, commentsEnabled, presentPage, presentThresholdOrder, connectMode, toolActive, isSpaceDown, directSelectMode, handleShapeEditingChange, comments, activeCommentId, draftComment, hiddenTags, multiSelectOverlayNode, uxPrefs.shiftRotateConstrainEnabled, uxPrefs.altResizeFromCenterEnabled, uxPrefs.alignToKeyObjectEnabled, keyObjectId]);
 
   const baseEdges = useMemo(() => [...connectorEdges, ...inheritedMasterEdges].map(e => {
     const edgeData = e.data as SmartEdgeData | undefined;
@@ -2134,7 +2226,7 @@ export function Canvas({
   function clampDragChanges(changes: NodeChange[]): NodeChange[] {
     type PosChange = NodeChange & { type: 'position'; position: { x: number; y: number } };
     const posChanges = changes.filter((c): c is PosChange => c.type === 'position' && !!c.position);
-    if (posChanges.length === 0) return changes;
+    if (posChanges.length === 0) { setGuides(null); return changes; }
 
     const byPage = new Map<string, PosChange[]>();
     for (const c of posChanges) {
@@ -2146,7 +2238,7 @@ export function Canvas({
       list.push(c);
       byPage.set(pageId, list);
     }
-    if (byPage.size === 0) return changes;
+    if (byPage.size === 0) { setGuides(null); return changes; }
 
     const corrections = new Map<string, { dx: number; dy: number }>();
     const { pageOrigins: origins, pageDimensions: dims } = pageGeomRef.current;
@@ -2172,8 +2264,41 @@ export function Canvas({
         for (const c of list) corrections.set(c.id, { dx, dy });
       }
     }
-    if (corrections.size === 0) return changes;
 
+    // Smart guide snapping — single-shape drags only (a combined bbox-vs-bbox
+    // comparison across a multi-shape drag is a materially different, out-of-
+    // scope computation for v1). Applied AFTER page-boundary clamping, as a
+    // further correction on top of whatever position that already settled
+    // on — so a shape already hard-clamped to the page edge doesn't also get
+    // pulled off it by an in-range guide. When both grid-snap (RF's own
+    // snapToGrid, applied upstream of this function, opaque to it) and
+    // object-snap are enabled: object-snap wins whenever a guide is in
+    // range (this correction runs regardless of what grid-snap already did),
+    // otherwise grid-snap's result stands untouched.
+    let guideResult: GuideLines | null = null;
+    if (uxPrefs.smartGuideSnapEnabled && posChanges.length === 1) {
+      const c = posChanges[0];
+      const node = shapeNodes.find(n => n.id === c.id);
+      const pageId = node && findPageIdFor(node);
+      if (node && !node.parentId && pageId) {
+        const boundaryCorr = corrections.get(c.id) ?? { dx: 0, dy: 0 };
+        const w = node.width ?? node.measured?.width ?? 100;
+        const h = node.height ?? node.measured?.height ?? 100;
+        const draggedX = c.position.x + boundaryCorr.dx;
+        const draggedY = c.position.y + boundaryCorr.dy;
+        const siblings = shapeNodes.filter(n =>
+          n.id !== c.id && !n.parentId && (n.type === 'shape' || n.type === 'path') && findPageIdFor(n) === pageId,
+        );
+        guideResult = computeAlignmentGuides({ x: draggedX, y: draggedY, width: w, height: h }, siblings);
+        const snap = computeSnapOffset({ x: draggedX, y: draggedY, width: w, height: h }, guideResult);
+        if (snap.dx !== 0 || snap.dy !== 0) {
+          corrections.set(c.id, { dx: boundaryCorr.dx + snap.dx, dy: boundaryCorr.dy + snap.dy });
+        }
+      }
+    }
+    setGuides(guideResult && (guideResult.vertical.length > 0 || guideResult.horizontal.length > 0) ? guideResult : null);
+
+    if (corrections.size === 0) return changes;
     return changes.map(c => {
       if (c.type !== 'position' || !c.position) return c;
       const corr = corrections.get(c.id);
@@ -2229,7 +2354,44 @@ export function Canvas({
   }
 
   const onNodesChange = useCallback((rawChanges: NodeChange[]) => {
-    const changes = clampDragChanges(rawChanges);
+    let changes = clampDragChanges(rawChanges);
+
+    // Align-to-key-object: clicking an ALREADY-selected shape again, while
+    // 2+ shapes are selected, normally collapses the selection down to just
+    // that one shape (RF's default plain-click behavior) — that batch is
+    // selection-only (no accompanying position/dimensions change, which
+    // would mean an actual drag/resize instead of a plain click) and has the
+    // specific shape "one id going true (already selected), the rest of the
+    // CURRENT selection going false". Recognizing that exact pattern lets
+    // this be reinterpreted as "promote this shape to the key object" instead
+    // of a real reselect: drop the deselecting changes so the whole
+    // multi-selection stays intact, and record which shape is now the
+    // alignment anchor. Any OTHER selection-changing batch (shift-click
+    // toggle, a fresh click on a never-selected shape, marquee reselect —
+    // none of which match this narrow shape) clears the key object instead,
+    // since the selection is genuinely changing to something else.
+    if (uxPrefs.alignToKeyObjectEnabled) {
+      const selectChanges = changes.filter((c): c is NodeChange & { type: 'select'; selected: boolean } => c.type === 'select');
+      if (selectChanges.length > 0) {
+        const currentSelectedIds = new Set(shapeNodesRef.current.filter(n => n.selected).map(n => n.id));
+        const trueChanges = selectChanges.filter(c => c.selected);
+        const falseChanges = selectChanges.filter(c => !c.selected);
+        const isPromotionPattern =
+          changes.length === selectChanges.length &&
+          trueChanges.length === 1 &&
+          currentSelectedIds.size >= 2 &&
+          currentSelectedIds.has(trueChanges[0].id) &&
+          falseChanges.length === currentSelectedIds.size - 1 &&
+          falseChanges.every(c => currentSelectedIds.has(c.id) && c.id !== trueChanges[0].id);
+        if (isPromotionPattern) {
+          changes = trueChanges;
+          setKeyObjectId(trueChanges[0].id);
+        } else {
+          setKeyObjectId(null);
+        }
+      }
+    }
+
     setShapeNodes(prev => applyNodeChanges(changes, [...frameNodes, ...prev]).filter(n => n.type !== 'pageFrame'));
 
     for (const change of changes) {
@@ -2300,10 +2462,33 @@ export function Canvas({
           const nextSize = change.dimensions;
           const committed = getCommittedShape(change.id);
           const prevSize = committed ? { width: committed.width ?? 100, height: committed.height ?? 70 } : undefined;
+          // NodeResizer has no live center-anchor hook (its own onChange is
+          // built from corner-anchored math before our code ever runs), so
+          // Alt-resize-from-center is corrected here, post-hoc, at the one
+          // place a resize actually commits — not live during the drag. The
+          // on-screen preview still visually anchors to the grabbed corner
+          // while dragging; it snaps to the true center-anchored geometry
+          // only on release. `committed` (the PRE-resize-start geometry) is
+          // the anchor point growth/shrink is corrected to be symmetric around.
+          const altCenter = resizeAltCenterIdsRef.current.has(change.id);
+          resizeAltCenterIdsRef.current.delete(change.id);
+          let nextPosition = node.position;
+          if (altCenter && committed) {
+            const startW = committed.width ?? 100, startH = committed.height ?? 70;
+            nextPosition = {
+              x: committed.position.x - (nextSize.width - startW) / 2,
+              y: committed.position.y - (nextSize.height - startH) / 2,
+            };
+          }
           // Same stale-slice race as the position commit above.
-          shapeUpdates.push({ id: change.id, pageId, node: toPersistableShape({ ...node, width: nextSize.width, height: nextSize.height }) });
-          if (prevSize && (prevSize.width !== nextSize.width || prevSize.height !== nextSize.height)) {
-            pushHistory({ undo: () => applySize(change.id, prevSize), redo: () => applySize(change.id, nextSize) });
+          shapeUpdates.push({ id: change.id, pageId, node: toPersistableShape({ ...node, position: nextPosition, width: nextSize.width, height: nextSize.height }) });
+          const positionChanged = altCenter && committed && (nextPosition.x !== committed.position.x || nextPosition.y !== committed.position.y);
+          if ((prevSize && (prevSize.width !== nextSize.width || prevSize.height !== nextSize.height)) || positionChanged) {
+            const prevPosition = committed?.position;
+            pushHistory({
+              undo: () => { if (prevSize) applySize(change.id, prevSize); if (positionChanged && prevPosition) applyPosition(change.id, prevPosition); },
+              redo: () => { applySize(change.id, nextSize); if (positionChanged) applyPosition(change.id, nextPosition); },
+            });
           }
         }
       }
@@ -2347,7 +2532,7 @@ export function Canvas({
       }
     }
     if (shapeUpdates.length > 0) commitShapeUpdates(shapeUpdates);
-  }, [frameNodes, shapeNodes, connectorEdges, diagramId]);
+  }, [frameNodes, shapeNodes, connectorEdges, diagramId, uxPrefs.alignToKeyObjectEnabled]);
 
   const onEdgesChange = useCallback((changes: EdgeChange[]) => {
     setConnectorEdges(prev => applyEdgeChanges(changes, prev));
@@ -2650,15 +2835,17 @@ export function Canvas({
   // background, so RF's native pane-background case (already working) is
   // left untouched.
   //
-  // Requires Alt held (matching selectionKeyCode above) now that plain
-  // left-drag pans by default instead of marquee-selecting — without Alt,
-  // this returns early and does nothing, letting the drag fall through to
-  // React Flow's own (now button-0-enabled) native pan handling instead.
-  // No explicit hand-off/stopPropagation needed: RF independently
-  // suppresses its own panOnDrag activation whenever selectionKeyPressed
-  // (Alt) is true, so the two can never both try to claim the same drag.
+  // Fires on a plain left-drag (no modifier needed — matches
+  // selectionOnDrag's own gating above) as long as the Select tool owns
+  // the gesture: not some other tool/Hand mode (toolActive, which folds
+  // handMode in), and not Space held (a temporary pan override that isn't
+  // one of the toolActive flags). additive below (Shift/Meta/Ctrl) unions
+  // the marquee's result into the existing selection instead of replacing
+  // it, matching multiSelectionKeyCode's own click-selection semantics —
+  // this is a DIFFERENT mechanism from RF's selectionKeyCode (explicitly
+  // disabled above), which used to be how this gesture activated at all.
   function handleMarqueeMouseDown(e: React.MouseEvent) {
-    if (toolActive || e.button !== 0 || !e.altKey) return;
+    if (toolActive || isSpaceDown || e.button !== 0) return;
     const target = e.target as HTMLElement;
     if (!target.closest('.react-flow__node-pageFrame')) return;
     const startScreen = { x: e.clientX, y: e.clientY };
@@ -3638,6 +3825,101 @@ export function Canvas({
     pushHistory({ undo: () => commitShapeUpdates(before), redo: () => commitShapeUpdates(after) });
   }
 
+  // Multi-select group rotate — same synthetic-overlay-drives-the-real-
+  // shapes pattern as handleMultiSelectResizeStart/End above, generalized to
+  // rotation: every selected shape's center rotates around the GROUP's own
+  // combined-bbox center by the same delta angle, and that same delta is
+  // added to each shape's own stored rotation. Unlike resize (where
+  // NodeResizer gives the synthetic overlay free live visual feedback while
+  // the real shapes only snap into place on release), there's no equivalent
+  // free mechanism for a hand-rolled rotate drag — so this updates the real
+  // shapeNodes state live on every mousemove tick (a plain setShapeNodes,
+  // not yet persisted) for real-time visual feedback, then commits via
+  // commitShapeUpdates (the same function handleMultiSelectResizeEnd already
+  // uses for "multi-select-overlay gesture mutates N shapes' full geometry
+  // at once") + one pushHistory entry on mouseup.
+  function handleGroupRotateStart(e: React.MouseEvent) {
+    e.stopPropagation();
+    const targets = shapeNodesRef.current.filter(n => n.selected && !n.parentId && !(n.data as ShapeNodeData).locked);
+    if (targets.length < 2) return;
+    const boxes = targets.map(getBBox);
+    const minX = Math.min(...boxes.map(b => b.x));
+    const minY = Math.min(...boxes.map(b => b.y));
+    const maxX = Math.max(...boxes.map(b => b.x + b.w));
+    const maxY = Math.max(...boxes.map(b => b.y + b.h));
+    const centerX = (minX + maxX) / 2;
+    const centerY = (minY + maxY) / 2;
+    const shapes = targets.map(n => {
+      const b = getBBox(n);
+      return { id: n.id, cx: b.x + b.w / 2, cy: b.y + b.h / 2, startRotation: (n.data as ShapeNodeData).rotation ?? 0 };
+    });
+    const startFlow = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+    const startAngle = Math.atan2(startFlow.y - centerY, startFlow.x - centerX);
+    let finalDelta = 0;
+    // Local, gesture-scoped Shift tracking (not the per-shape useShiftHeld
+    // hook, which lives inside ShapeNode/PathNode components, out of reach
+    // here) — live, same as single-shape rotate's own constrain check.
+    let shiftDown = e.shiftKey;
+    function onShiftKeyDown(ke: KeyboardEvent) { if (ke.key === 'Shift') shiftDown = true; }
+    function onShiftKeyUp(ke: KeyboardEvent) { if (ke.key === 'Shift') shiftDown = false; }
+
+    function onMove(ev: MouseEvent) {
+      const flow = screenToFlowPosition({ x: ev.clientX, y: ev.clientY });
+      const angle = Math.atan2(flow.y - centerY, flow.x - centerX);
+      const rawDeltaDeg = ((angle - startAngle) * 180) / Math.PI;
+      const step = (uxPrefs.shiftRotateConstrainEnabled && shiftDown) ? 15 : 1;
+      finalDelta = Math.round(rawDeltaDeg / step) * step;
+      const rad = (finalDelta * Math.PI) / 180;
+      const cos = Math.cos(rad), sin = Math.sin(rad);
+      setShapeNodes(prev => prev.map(n => {
+        const s = shapes.find(t => t.id === n.id);
+        if (!s) return n;
+        const dx = s.cx - centerX, dy = s.cy - centerY;
+        const newCx = centerX + dx * cos - dy * sin;
+        const newCy = centerY + dx * sin + dy * cos;
+        const b = getBBox(n);
+        return {
+          ...n,
+          position: { x: newCx - b.w / 2, y: newCy - b.h / 2 },
+          data: { ...n.data, rotation: (s.startRotation + finalDelta + 360) % 360 },
+        };
+      }));
+    }
+    function onUp() {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('keydown', onShiftKeyDown);
+      window.removeEventListener('keyup', onShiftKeyUp);
+      const rad = (finalDelta * Math.PI) / 180;
+      const cos = Math.cos(rad), sin = Math.sin(rad);
+      const before = targets.map(n => ({ id: n.id, pageId: (n.data as ShapeNodeData).pageId, node: n as DiagramNode }));
+      const after = shapes.map(s => {
+        const original = targets.find(n => n.id === s.id)!;
+        const dx = s.cx - centerX, dy = s.cy - centerY;
+        const newCx = centerX + dx * cos - dy * sin;
+        const newCy = centerY + dx * sin + dy * cos;
+        const b = getBBox(original);
+        const position = { x: newCx - b.w / 2, y: newCy - b.h / 2 };
+        const rotation = (s.startRotation + finalDelta + 360) % 360;
+        return { id: s.id, pageId: (original.data as ShapeNodeData).pageId, node: { ...original, position, data: { ...original.data, rotation } } as DiagramNode };
+      });
+      if (finalDelta !== 0) {
+        commitShapeUpdates(after);
+        pushHistory({ undo: () => commitShapeUpdates(before), redo: () => commitShapeUpdates(after) });
+      } else {
+        // No net rotation — the live preview above already mutated
+        // shapeNodes in place for the (empty) drag, so just restore the
+        // untouched originals rather than leaving a stale, never-committed
+        // in-memory position/rotation around.
+        commitShapeUpdates(before);
+      }
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    window.addEventListener('keydown', onShiftKeyDown);
+    window.addEventListener('keyup', onShiftKeyUp);
+  }
+
   // Batched across every id in one call — same reasoning as
   // applyPositionBatch above: pushZIndexHistory's undo/redo can cover many
   // shapes at once (undoing a bringToFront/sendToBack/reorder that touched
@@ -3679,10 +3961,14 @@ export function Canvas({
     setShapeNodes(prev => {
       const before = new Map(prev.filter(n => targetIds.includes(n.id)).map(n => [n.id, n.position]));
       const boxes = prev.filter(n => targetIds.includes(n.id)).map(n => ({ id: n.id, ...getBBox(n) }));
-      const minX = Math.min(...boxes.map(b => b.x));
-      const maxRight = Math.max(...boxes.map(b => b.x + b.w));
-      const minY = Math.min(...boxes.map(b => b.y));
-      const maxBottom = Math.max(...boxes.map(b => b.y + b.h));
+      // Align-to-key-object: use that ONE shape's own bbox as the reference
+      // instead of the combined selection bbox, when it's set and still
+      // part of this selection.
+      const keyBox = uxPrefs.alignToKeyObjectEnabled && keyObjectId ? boxes.find(b => b.id === keyObjectId) : undefined;
+      const minX = keyBox ? keyBox.x : Math.min(...boxes.map(b => b.x));
+      const maxRight = keyBox ? keyBox.x + keyBox.w : Math.max(...boxes.map(b => b.x + b.w));
+      const minY = keyBox ? keyBox.y : Math.min(...boxes.map(b => b.y));
+      const maxBottom = keyBox ? keyBox.y + keyBox.h : Math.max(...boxes.map(b => b.y + b.h));
       const centerX = (minX + maxRight) / 2;
       const centerY = (minY + maxBottom) / 2;
       const next = prev.map(n => {
@@ -3703,23 +3989,42 @@ export function Canvas({
     });
   }
 
-  function distributeSelected(axis: 'horizontal' | 'vertical') {
+  // `mode: 'spacing'` (default) equalizes the GAPS between edges, accounting
+  // for each shape's own size — the existing, already-correct behavior.
+  // `mode: 'centers'` ignores size entirely and equalizes the spacing
+  // between CENTER POINTS across the same span — Illustrator/Affinity's
+  // other distribute convention, previously missing here. Not gated behind
+  // a preference (a plain second button, not a debatable interaction).
+  function distributeSelected(axis: 'horizontal' | 'vertical', mode: 'spacing' | 'centers' = 'spacing') {
     const targetIds = selectedShapeIds.filter(id => !isLocked(id));
     if (targetIds.length < 3) return;
     setShapeNodes(prev => {
       const before = new Map(prev.filter(n => targetIds.includes(n.id)).map(n => [n.id, n.position]));
       const boxes = prev.filter(n => targetIds.includes(n.id)).map(n => ({ id: n.id, ...getBBox(n) }));
-      const sorted = [...boxes].sort((a, b) => axis === 'horizontal' ? a.x - b.x : a.y - b.y);
-      const first = sorted[0];
-      const last = sorted[sorted.length - 1];
-      const totalSize = sorted.reduce((sum, b) => sum + (axis === 'horizontal' ? b.w : b.h), 0);
-      const span = axis === 'horizontal' ? (last.x + last.w) - first.x : (last.y + last.h) - first.y;
-      const gap = (span - totalSize) / (sorted.length - 1);
       const positions = new Map<string, { x: number; y: number }>();
-      let cursor = axis === 'horizontal' ? first.x : first.y;
-      for (const b of sorted) {
-        positions.set(b.id, axis === 'horizontal' ? { x: cursor, y: b.y } : { x: b.x, y: cursor });
-        cursor += (axis === 'horizontal' ? b.w : b.h) + gap;
+      if (mode === 'centers') {
+        const sorted = [...boxes].sort((a, b) => axis === 'horizontal' ? (a.x + a.w / 2) - (b.x + b.w / 2) : (a.y + a.h / 2) - (b.y + b.h / 2));
+        const first = sorted[0];
+        const last = sorted[sorted.length - 1];
+        const firstCenter = axis === 'horizontal' ? first.x + first.w / 2 : first.y + first.h / 2;
+        const lastCenter = axis === 'horizontal' ? last.x + last.w / 2 : last.y + last.h / 2;
+        const centerGap = (lastCenter - firstCenter) / (sorted.length - 1);
+        sorted.forEach((b, i) => {
+          const center = firstCenter + i * centerGap;
+          positions.set(b.id, axis === 'horizontal' ? { x: center - b.w / 2, y: b.y } : { x: b.x, y: center - b.h / 2 });
+        });
+      } else {
+        const sorted = [...boxes].sort((a, b) => axis === 'horizontal' ? a.x - b.x : a.y - b.y);
+        const first = sorted[0];
+        const last = sorted[sorted.length - 1];
+        const totalSize = sorted.reduce((sum, b) => sum + (axis === 'horizontal' ? b.w : b.h), 0);
+        const span = axis === 'horizontal' ? (last.x + last.w) - first.x : (last.y + last.h) - first.y;
+        const gap = (span - totalSize) / (sorted.length - 1);
+        let cursor = axis === 'horizontal' ? first.x : first.y;
+        for (const b of sorted) {
+          positions.set(b.id, axis === 'horizontal' ? { x: cursor, y: b.y } : { x: b.x, y: cursor });
+          cursor += (axis === 'horizontal' ? b.w : b.h) + gap;
+        }
       }
       const next = prev.map(n => positions.has(n.id) ? { ...n, position: positions.get(n.id)! } : n);
       persistNodes(next, targetIds);
@@ -3879,6 +4184,56 @@ export function Canvas({
       return next;
     });
   }
+  // Batched, whole-selection version of handleReorderLayer's single-shape
+  // step (that function stays as-is — LayersPanel's per-row buttons still
+  // want single-shape stepping). direction -1 = forward/toward front (lower
+  // index in a front-first-sorted sibling list), +1 = backward/toward back —
+  // matching handleReorderLayer's own existing -1/+1 convention exactly.
+  // Within each (parentId, pageId) sibling group, selected items move one
+  // step while preserving their relative order: scanning front-to-back for
+  // "forward" (so an already-adjacent selected run cascades past the next
+  // non-selected item as one block) or back-to-front for "backward".
+  function reorderSelection(direction: -1 | 1) {
+    const targets = new Set(selectedShapeIds.filter(id => !isLocked(id)));
+    if (targets.size === 0) return;
+    const groupKeys = new Set(
+      shapeNodes.filter(n => targets.has(n.id)).map(n => `${n.parentId ?? ''}::${findPageIdFor(n) ?? ''}`),
+    );
+    const zUpdates = new Map<string, number>();
+    for (const key of groupKeys) {
+      const [parentId, pageId] = key.split('::');
+      const siblings = shapeNodes
+        .filter(n => (n.parentId ?? '') === parentId && (findPageIdFor(n) ?? '') === pageId)
+        .sort((a, b) => (b.zIndex ?? 0) - (a.zIndex ?? 0));
+      const zVals = siblings.map(n => n.zIndex ?? 0);
+      const order = [...siblings];
+      if (direction === -1) {
+        for (let i = 1; i < order.length; i++) {
+          if (targets.has(order[i].id) && !targets.has(order[i - 1].id)) {
+            [order[i - 1], order[i]] = [order[i], order[i - 1]];
+          }
+        }
+      } else {
+        for (let i = order.length - 2; i >= 0; i--) {
+          if (targets.has(order[i].id) && !targets.has(order[i + 1].id)) {
+            [order[i], order[i + 1]] = [order[i + 1], order[i]];
+          }
+        }
+      }
+      order.forEach((n, i) => {
+        if ((n.zIndex ?? 0) !== zVals[i]) zUpdates.set(n.id, zVals[i]);
+      });
+    }
+    if (zUpdates.size === 0) return;
+    setShapeNodes(prev => {
+      const before = new Map(prev.filter(n => zUpdates.has(n.id)).map(n => [n.id, n.zIndex ?? 0]));
+      const next = prev.map(n => zUpdates.has(n.id) ? { ...n, zIndex: zUpdates.get(n.id)! } : n);
+      persistNodes(next, Array.from(zUpdates.keys()));
+      pushZIndexHistory(before, new Map(zUpdates));
+      return next;
+    });
+  }
+
   function deleteSelected() {
     onNodesChange(selectedShapeIds.filter(id => !isLocked(id)).map(id => ({ type: 'remove', id })));
   }
@@ -3998,6 +4353,18 @@ export function Canvas({
   // paste requirement, and the async permission-gated Clipboard API adds
   // real friction for no benefit over a plain ref).
   const clipboardRef = useRef<{ shapes: DiagramNode[]; edges: DiagramEdge[]; sourcePageId: string } | null>(null);
+
+  // Ids currently mid-resize with Alt held at drag-start (snapshotted once,
+  // same philosophy as resizeShiftLock — not re-checked live). Consumed and
+  // cleared at the single existing dimensions-commit site in onNodesChange
+  // below, since NodeResizer has no live center-anchor hook of its own —
+  // the correction has to be a post-hoc fix-up of the final corner-anchored
+  // geometry rather than something applied during the drag itself.
+  const resizeAltCenterIdsRef = useRef<Set<string>>(new Set());
+  function handleResizeAltStart(id: string, altHeld: boolean) {
+    if (altHeld) resizeAltCenterIdsRef.current.add(id);
+    else resizeAltCenterIdsRef.current.delete(id);
+  }
 
   // Selected shapes/group plus every descendant of a selected group
   // (recursively, so a group-of-groups copies whole), plus any connector
@@ -4168,6 +4535,10 @@ export function Canvas({
       else if (e.key === 'd') { e.preventDefault(); handleCopy(); void handlePaste(); }
       else if (e.key.toLowerCase() === 'z' && e.shiftKey) { e.preventDefault(); redo(); }
       else if (e.key.toLowerCase() === 'z') { e.preventDefault(); undo(); }
+      else if (e.key === ']' && e.shiftKey) { e.preventDefault(); bringToFront(); }
+      else if (e.key === '[' && e.shiftKey) { e.preventDefault(); sendToBack(); }
+      else if (e.key === ']') { e.preventDefault(); reorderSelection(-1); }
+      else if (e.key === '[') { e.preventDefault(); reorderSelection(1); }
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
@@ -4231,6 +4602,7 @@ export function Canvas({
   // dispatcher; every other existing direct read of penMode/brushMode/etc.
   // throughout this file is untouched.
   const activeToolId: ToolId | null = (() => {
+    if (handMode) return 'hand';
     if (directSelectMode) return 'directSelect';
     if (connectMode) return 'connect';
     if (placingComment) return 'comment';
@@ -4258,13 +4630,21 @@ export function Canvas({
   }
 
   const [shortcutsHelpOpen, setShortcutsHelpOpen] = useState(false);
+  const [preferencesOpen, setPreferencesOpen] = useState(false);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   // Snap-to-grid was previously always-on at a fixed 8px — now a user toggle
   // plus a choice of increment. The visible dot grid is drawn at 2x the
   // actual snap increment (matching the old fixed 16px-dots/8px-snap ratio),
   // so it marks every other real snap point rather than every one.
-  const [snapEnabled, setSnapEnabled] = useState(true);
-  const [gridSize, setGridSize] = useState(8);
-  const [showRulers, setShowRulers] = useState(false);
+  // These three (plus every other toggleable UX behavior) live in
+  // useUxPreferences now instead of their own useState, so they finally
+  // persist across reloads — previously they silently reset every time.
+  const snapEnabled = uxPrefs.snapToGridEnabled;
+  const setSnapEnabled = (v: boolean) => updateUxPrefs({ snapToGridEnabled: v });
+  const gridSize = uxPrefs.gridSize;
+  const setGridSize = (v: number) => updateUxPrefs({ gridSize: v });
+  const showRulers = uxPrefs.showRulers;
+  const setShowRulers = (v: boolean) => updateUxPrefs({ showRulers: v });
 
   // '?' (Shift+/) opens the shortcuts help overlay — no modifier key, so it
   // needs its own listener rather than folding into the Cmd/Ctrl-gated
@@ -4296,6 +4676,17 @@ export function Canvas({
       const h = target.height ?? target.measured?.height ?? 70;
       setCenter(target.position.x + w / 2, target.position.y + h / 2, { zoom: 1.2, duration: 500 });
     }
+  }
+
+  function handleNodeContextMenu(event: React.MouseEvent, node: Node) {
+    // Gate BEFORE preventDefault — turning the preference off must restore
+    // the native browser menu, not just leave right-click doing nothing.
+    if (!uxPrefs.rightClickContextMenuEnabled) return;
+    if (isPresent) return;
+    if (node.type !== 'shape' && node.type !== 'path' && node.type !== 'group') return;
+    event.preventDefault();
+    if (!node.selected) handleLayerSelect(node.id, false);
+    setContextMenu({ x: event.clientX, y: event.clientY });
   }
 
   function handleLayerSelect(id: string, additive: boolean) {
@@ -4396,14 +4787,72 @@ export function Canvas({
     return undefined;
   }
 
+  // Alt/Option-held-at-drag-start duplicates the current selection at its
+  // pre-drag position. React Flow's drag machinery is already locked onto
+  // the ORIGINAL node ids for the rest of this gesture — there is no
+  // supported way to redirect an in-progress drag onto newly-created nodes
+  // — so the practical equivalent of "a copy peels off and follows the
+  // cursor" is: create the copy here, left behind and unselected, while the
+  // original continues to be what actually moves under the pointer for the
+  // rest of the drag. The two nodes are pixel-identical at this instant, so
+  // this reads identically to the literal gesture even though it's
+  // internally the original that keeps moving.
+  function onNodeDragStart(event: MouseEvent | TouchEvent, _node: Node, _draggedNodes: Node[]) {
+    if (isPresent) return;
+    if (!uxPrefs.altDragDuplicateEnabled) return;
+    if (!('altKey' in event) || !event.altKey) return;
+    const { shapes, edges } = collectCopySet();
+    if (shapes.length === 0) return;
+    const pageId = findPageIdFor(shapes[0]);
+    if (!pageId) return;
+
+    const idMap = new Map<string, string>();
+    for (const s of shapes) idMap.set(s.id, crypto.randomUUID());
+
+    const clones: DiagramNode[] = shapes.map(n => {
+      const s = toPersistableShape(n);
+      const newParentId = s.parentId ? idMap.get(s.parentId) : undefined;
+      return {
+        ...s,
+        id: idMap.get(s.id)!,
+        parentId: newParentId,
+        extent: newParentId ? ('parent' as const) : undefined,
+        data: cloneShapeData({ ...s.data, pageId }),
+      };
+    });
+    const cloneEdges: DiagramEdge[] = edges
+      .filter(e => idMap.has(e.source!) && idMap.has(e.target!))
+      .map(e => ({ ...e, id: crypto.randomUUID(), source: idMap.get(e.source!)!, target: idMap.get(e.target!)! })) as DiagramEdge[];
+
+    const ordered = topoSortByParent(clones);
+    setShapeNodes(prev => [...prev, ...ordered.map(s => ({ ...s, selected: false }))]);
+    setConnectorEdges(prev => [...prev, ...cloneEdges]);
+    for (const s of ordered) saveShape(diagramId, pageId, s);
+    for (const e of cloneEdges) saveConnector(diagramId, pageId, e);
+
+    pushHistory({
+      undo: () => {
+        for (const s of clones) deleteShape(diagramId, pageId, s.id);
+        for (const e of cloneEdges) deleteConnector(diagramId, pageId, e.id);
+        setShapeNodes(prev => prev.filter(n => !clones.some(s => s.id === n.id)));
+        setConnectorEdges(prev => prev.filter(e => !cloneEdges.some(ce => ce.id === e.id)));
+      },
+      redo: () => {
+        for (const s of topoSortByParent(clones)) saveShape(diagramId, pageId, s);
+        for (const e of cloneEdges) saveConnector(diagramId, pageId, e);
+        setShapeNodes(prev => [...prev, ...clones]);
+        setConnectorEdges(prev => [...prev, ...cloneEdges]);
+      },
+    });
+  }
+
   function onNodeDrag(_event: MouseEvent | TouchEvent, node: Node) {
     if (node.type !== 'shape') return;
-    const pageId = findPageIdFor(node);
-    const siblings = shapeNodes.filter(n => n.id !== node.id && n.type === 'shape' && findPageIdFor(n) === pageId);
-    setGuides(computeAlignmentGuides(
-      { x: node.position.x, y: node.position.y, width: node.width ?? node.measured?.width ?? 0, height: node.height ?? node.measured?.height ?? 0 },
-      siblings,
-    ));
+    // Guide computation/setGuides now lives entirely in clampDragChanges
+    // (called from onNodesChange for this same drag tick) — consolidated
+    // there so the rendered guide lines always match exactly what smart
+    // guide snapping actually snapped to, with no separate, potentially
+    // one-frame-stale computation running here too.
     const committed = getCommittedPosition(node.id);
     if (committed) {
       updateDragPreview({ shapeIds: [node.id], dx: node.position.x - committed.x, dy: node.position.y - committed.y });
@@ -4474,8 +4923,8 @@ export function Canvas({
         so other pages stacked in flow-space are hidden, not resized around.
       */}
       <div
-        style={{ width: '100%', height: '100%', cursor: isSpaceDown ? (isSpaceDragging ? 'grabbing' : 'grab') : undefined }}
-        onMouseDown={() => { if (isSpaceDown) setIsSpaceDragging(true); }}
+        style={{ width: '100%', height: '100%', cursor: (isSpaceDown || handMode) ? (isSpaceDragging ? 'grabbing' : 'grab') : undefined }}
+        onMouseDown={() => { if (isSpaceDown || handMode) setIsSpaceDragging(true); }}
         onMouseUp={() => setIsSpaceDragging(false)}
       >
         <ArrowMarkerDefs />
@@ -4491,7 +4940,9 @@ export function Canvas({
           edgesReconnectable={!isPresent}
           onReconnect={onReconnect}
           onNodeClick={handleNodeClick}
+          onNodeContextMenu={handleNodeContextMenu}
           onPaneClick={() => setHighlighted(null)}
+          onNodeDragStart={isPresent ? undefined : onNodeDragStart}
           onNodeDrag={isPresent ? undefined : onNodeDrag}
           onNodeDragStop={isPresent ? undefined : onNodeDragStop}
           connectionMode={ConnectionMode.Loose}
@@ -4527,19 +4978,25 @@ export function Canvas({
           // Presenting is a slide deck, not a Miro board — no free panning or
           // zooming. The camera moves only programmatically (step/page nav,
           // hyperlink/hotspot jumps), never by the viewer dragging or scrolling.
-          // Plain left-drag on empty canvas now pans by default (previously
-          // only middle/right-click or Space-held did) — marquee-select
-          // moved behind holding Alt instead, see selectionKeyCode below.
-          // Tool-active behavior is unchanged: left-drag stays the tool's
-          // own gesture (drawing a connector, a pen path, ...), only
-          // middle/right-click still pans through it; Space still overrides
-          // everything to force full-button panning regardless of tool.
-          // Every non-tool-active branch spells out [0, 1, 2] rather than
+          //
+          // Plain left-drag under the Select tool (the default, nothing else
+          // active) marquee-selects — matching Affinity/Illustrator/Figma's
+          // own convention. An earlier pass made left-drag pan by default
+          // instead, on the theory that panning needed to be reachable
+          // without a modifier — reverted per direct feedback: making the
+          // Select tool itself act like a hand tool broke plain click-drag
+          // multi-select outright, which is a more common gesture than
+          // reaching for a Hand tool/Space just to pan a little. Panning
+          // without Space now needs either the dedicated Hand tool
+          // (handMode, its own toolbar button) or middle/right-click-drag,
+          // which stays available in every mode alike — including Select
+          // and any drawing tool — same as before.
+          // Every branch spells out an explicit button array rather than
           // `true` — @xyflow/system's own button filter for `panOnDrag ===
-          // true` (as opposed to an explicit array) only allows buttons 0/1,
-          // silently dropping right-click-drag panning entirely; confirmed
-          // live via Playwright after `true` here broke right-click pan.
-          panOnDrag={isPresent ? false : isSpaceDown ? [0, 1, 2] : toolActive ? [1, 2] : [0, 1, 2]}
+          // true` (as opposed to an array) only allows buttons 0/1, silently
+          // dropping right-click-drag panning; confirmed live via
+          // Playwright after `true` here broke right-click pan.
+          panOnDrag={isPresent ? false : (isSpaceDown || handMode) ? [0, 1, 2] : [1, 2]}
           zoomOnScroll={!isPresent}
           zoomOnPinch={!isPresent}
           // Explicitly disabled — camera zoom/pan should only ever change from
@@ -4547,24 +5004,25 @@ export function Canvas({
           // programmatic setCenter calls in this file), never as a side
           // effect of double-clicking a shape to rename it.
           zoomOnDoubleClick={false}
-          // Marquee-select no longer triggers on plain drag (that's pan now,
-          // see panOnDrag above) — it's driven entirely by selectionKeyCode
-          // below instead.
-          selectionOnDrag={false}
-          // Holding Alt marquee-selects instead of panning — Shift was the
-          // obvious first choice but is already taken (resize aspect-ratio
-          // lock, and multiSelectionKeyCode below for additive click-select),
-          // and reusing it here would reintroduce the exact
-          // Shift+drag-hijacks-a-resize-into-a-marquee conflict that using
-          // Shift as this key previously caused (see the removed comment
-          // this replaced). React Flow auto-suppresses its own panOnDrag
-          // handling whenever this key is held (regardless of the panOnDrag
-          // value above), so no extra pan/select arbitration is needed here
-          // — only handleMarqueeMouseDown's own guard (below) needs updating
-          // to match, since it's a hand-rolled replacement for drags starting
-          // on a page frame rather than the raw pane background RF's own
-          // selectionOnDrag only ever covered.
-          selectionKeyCode={isPresent || toolActive ? null : 'Alt'}
+          // True whenever the Select tool is the active one (not some other
+          // tool, not Hand mode, not Space-held) — this is what makes a
+          // plain drag over the true empty pane background (outside any
+          // page) marquee-select by default, matching handleMarqueeMouseDown
+          // below's own gating for drags starting on a page's own
+          // background instead (a page frame is a real node spanning the
+          // whole page, not "the pane" by RF's own definition, so it needs
+          // its own hand-rolled equivalent — see that function's comment).
+          selectionOnDrag={!isPresent && !toolActive && !isSpaceDown}
+          // No held key needed to REACH the marquee anymore (selectionOnDrag
+          // above already covers a plain drag) — explicitly null rather
+          // than left at RF's own default ('Shift') specifically so holding
+          // Shift never suppresses panOnDrag via RF's internal
+          // `!selectionKeyPressed && panOnDrag` composition, which would
+          // otherwise block a Shift-held middle/right-click-drag pan for no
+          // reason. Additive marquee/click selection is Shift (among
+          // others) via multiSelectionKeyCode below instead — a distinct
+          // RF mechanism from this one.
+          selectionKeyCode={null}
           // Users reach for either modifier to add a shape to the current
           // selection — RF's own default only recognizes Meta/Control (never
           // Shift), so Shift-click silently replaced the selection instead
@@ -4762,6 +5220,7 @@ export function Canvas({
           onInsertContainer={handleInsertContainer}
           onOpenExport={() => setExportOpen(true)}
           onOpenShortcuts={() => setShortcutsHelpOpen(true)}
+          onOpenPreferences={() => setPreferencesOpen(true)}
         />,
         toolbarSlot,
       )}
@@ -4891,6 +5350,15 @@ export function Canvas({
       )}
 
       {!isPresent && (
+        <UxPreferencesDrawer
+          open={preferencesOpen}
+          prefs={uxPrefs}
+          onChange={updateUxPrefs}
+          onClose={() => setPreferencesOpen(false)}
+        />
+      )}
+
+      {!isPresent && (
         <ExportModal
           open={exportOpen}
           onClose={() => setExportOpen(false)}
@@ -5008,8 +5476,10 @@ export function Canvas({
           )}
           {selectedShapeIds.length >= 3 && (
             <>
-              <Tooltip title="Distribute horizontally"><Button size="small" icon={<IconDistributeH />} onClick={() => distributeSelected('horizontal')} /></Tooltip>
-              <Tooltip title="Distribute vertically"><Button size="small" icon={<IconDistributeV />} onClick={() => distributeSelected('vertical')} /></Tooltip>
+              <Tooltip title="Distribute horizontal spacing (equal gaps)"><Button size="small" icon={<IconDistributeH />} onClick={() => distributeSelected('horizontal', 'spacing')} /></Tooltip>
+              <Tooltip title="Distribute vertical spacing (equal gaps)"><Button size="small" icon={<IconDistributeV />} onClick={() => distributeSelected('vertical', 'spacing')} /></Tooltip>
+              <Tooltip title="Distribute horizontal centers (equal center spacing)"><Button size="small" icon={<IconDistributeH />} style={{ opacity: 0.75 }} onClick={() => distributeSelected('horizontal', 'centers')} /></Tooltip>
+              <Tooltip title="Distribute vertical centers (equal center spacing)"><Button size="small" icon={<IconDistributeV />} style={{ opacity: 0.75 }} onClick={() => distributeSelected('vertical', 'centers')} /></Tooltip>
             </>
           )}
           {canBooleanOp && (
@@ -5037,11 +5507,32 @@ export function Canvas({
           <Tooltip title={selectedShapeIds.length >= 2 ? 'Wrap in container (a styleable frame — background, border theme, swimlane)' : 'Insert container (a styleable frame — background, border theme, swimlane)'}>
             <Button size="small" icon={<IconContainer />} onClick={handleInsertContainer} />
           </Tooltip>
-          <Tooltip title="Bring to front"><Button size="small" icon={<IconBringToFront />} onClick={bringToFront} /></Tooltip>
-          <Tooltip title="Send to back"><Button size="small" icon={<IconSendToBack />} onClick={sendToBack} /></Tooltip>
+          <Tooltip title="Bring to front (Cmd/Ctrl+Shift+])"><Button size="small" icon={<IconBringToFront />} onClick={bringToFront} /></Tooltip>
+          <Tooltip title="Bring forward (Cmd/Ctrl+])"><Button size="small" icon={<IconMoveUp />} onClick={() => reorderSelection(-1)} /></Tooltip>
+          <Tooltip title="Send backward (Cmd/Ctrl+[)"><Button size="small" icon={<IconMoveDown />} onClick={() => reorderSelection(1)} /></Tooltip>
+          <Tooltip title="Send to back (Cmd/Ctrl+Shift+[)"><Button size="small" icon={<IconSendToBack />} onClick={sendToBack} /></Tooltip>
           <Tooltip title="Duplicate"><Button size="small" icon={<IconDuplicate />} onClick={() => { handleCopy(); void handlePaste(); }} /></Tooltip>
           <Tooltip title="Delete"><Button size="small" danger icon={<IconDelete />} onClick={deleteSelected} /></Tooltip>
         </div>
+      )}
+
+      {contextMenu && (
+        <ShapeContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          selectionCount={selectedShapeIds.length}
+          isGroup={!!selectedGroup}
+          onBringToFront={bringToFront}
+          onBringForward={() => reorderSelection(-1)}
+          onSendBackward={() => reorderSelection(1)}
+          onSendToBack={sendToBack}
+          onGroupOrUngroup={selectedGroup ? handleUngroup : handleGroup}
+          onDuplicate={() => { handleCopy(); void handlePaste(); }}
+          onCopy={handleCopy}
+          onDelete={deleteSelected}
+          onAlign={alignSelected}
+          onClose={() => setContextMenu(null)}
+        />
       )}
 
       {selectedGroup && (

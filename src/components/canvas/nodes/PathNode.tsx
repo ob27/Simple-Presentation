@@ -8,6 +8,7 @@ import { RotateHandle } from './RotateHandle';
 import { ConnectionHandles } from './ConnectionHandles';
 import { EdgeResizeHandles } from './EdgeResizeHandles';
 import { useShiftHeld } from './useShiftHeld';
+import { useAltHeld } from './useAltHeld';
 import { buildPathDWithHoles, computePathViewBox } from '../../../utils/pathAnchorGeometry';
 
 function PathNodeImpl({ id, data, selected }: NodeProps) {
@@ -38,14 +39,18 @@ function PathNodeImpl({ id, data, selected }: NodeProps) {
   const anchors = shapeData.pathAnchors ?? [];
   const closed = !!shapeData.pathClosed;
   const { shiftHeldRef } = useShiftHeld(!!selected && !locked);
+  const { altHeldRef } = useAltHeld(!!selected && !locked);
   // See useShiftHeld's own comment — snapshotted once at resize-start rather
   // than bound to the live value, so Shift toggling mid-drag can't flip
   // keepAspectRatio partway through a gesture.
   const [resizeShiftLock, setResizeShiftLock] = useState(false);
-  const handleResizeStart = useCallback(() => setResizeShiftLock(shiftHeldRef.current), [shiftHeldRef]);
+  const handleResizeStart = useCallback(() => {
+    setResizeShiftLock(shiftHeldRef.current);
+    if (shapeData.altResizeFromCenterEnabled) shapeData.onResizeAltStart?.(id, altHeldRef.current);
+  }, [shiftHeldRef, altHeldRef, shapeData, id]);
 
   const holes = shapeData.pathHoles;
-  const onRotateStart = useRotateHandle(id, rotation, shapeData.onCommit);
+  const onRotateStart = useRotateHandle(id, rotation, shapeData.onCommit, shiftHeldRef, shapeData.shiftRotateConstrainEnabled);
   const { width: vbW, height: vbH } = computePathViewBox(anchors, holes);
   const d = buildPathDWithHoles(anchors, closed, holes);
 
@@ -69,7 +74,7 @@ function PathNodeImpl({ id, data, selected }: NodeProps) {
       <NodeResizer
         isVisible={!!selected && !locked && !isDirectSelecting} minWidth={8} minHeight={8} keepAspectRatio={resizeShiftLock}
         onResizeStart={handleResizeStart}
-        lineStyle={{ borderColor: '#1677ff' }} handleStyle={{ width: 8, height: 8, borderRadius: 2 }}
+        lineStyle={{ borderColor: shapeData.isKeyObject ? '#722ed1' : '#1677ff' }} handleStyle={{ width: 8, height: 8, borderRadius: 2 }}
       />
       {!!selected && !locked && !isDirectSelecting && (
         <EdgeResizeHandles minWidth={8} minHeight={8} keepAspectRatio={resizeShiftLock} onResizeStart={handleResizeStart} />

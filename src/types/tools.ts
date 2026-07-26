@@ -5,6 +5,7 @@
 // NOT part of this set — they stay independent onClick handlers.
 export type ToolId =
   | 'select'
+  | 'hand'
   | 'directSelect'
   | 'shapes'
   | 'text'

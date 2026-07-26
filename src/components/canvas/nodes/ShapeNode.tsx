@@ -13,6 +13,7 @@ import { RotateHandle } from './RotateHandle';
 import { ConnectionHandles } from './ConnectionHandles';
 import { EdgeResizeHandles } from './EdgeResizeHandles';
 import { useShiftHeld } from './useShiftHeld';
+import { useAltHeld } from './useAltHeld';
 import { RichTextEditor } from './RichTextEditor';
 import { RichTextDisplay } from './RichTextDisplay';
 import { richTextFromLabel } from '../../../utils/richText';
@@ -203,6 +204,14 @@ export interface ShapeNodeRuntimeData {
   connectMode?: boolean;
   readOnly?: boolean;
   directSelectMode?: boolean;
+  shiftRotateConstrainEnabled?: boolean;
+  altResizeFromCenterEnabled?: boolean;
+  onResizeAltStart?: (id: string, altHeld: boolean) => void;
+  // Align-to-key-object's current anchor shape — a third accent color,
+  // distinct from both the normal per-shape selection blue and the
+  // multi-select bbox's orange, so the anchor is visually obvious while a
+  // multi-selection is active.
+  isKeyObject?: boolean;
 }
 
 function ActorFigure({ stroke, strokeWidth }: { stroke: string; strokeWidth: number }) {
@@ -434,12 +443,16 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
   const isPolygon = POLYGON_KINDS.has(shapeData.kind);
   const locked = !!shapeData.locked;
   const { shiftHeldRef } = useShiftHeld(!!selected && !locked);
+  const { altHeldRef } = useAltHeld(!!selected && !locked);
   // Snapshotted from shiftHeldRef.current at the exact moment a resize
   // starts, then held fixed for the rest of that drag — see useShiftHeld's
   // own comment for why binding the LIVE value directly caused long/thin
   // shapes to visibly jump mid-resize.
   const [resizeShiftLock, setResizeShiftLock] = useState(false);
-  const handleResizeStart = useCallback(() => setResizeShiftLock(shiftHeldRef.current), [shiftHeldRef]);
+  const handleResizeStart = useCallback(() => {
+    setResizeShiftLock(shiftHeldRef.current);
+    if (shapeData.altResizeFromCenterEnabled) shapeData.onResizeAltStart?.(id, altHeldRef.current);
+  }, [shiftHeldRef, altHeldRef, shapeData, id]);
   const effect = shapeData.effect ?? (isStickyNote ? 'shadow' : 'none');
   const effectShadow = effectBoxShadow(effect);
   // "float"/"glow" are CSS animations (see index.css), not static values — a
@@ -463,7 +476,7 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
     shapeData.onCommit?.(id, { richText: paragraphs, label: plainText });
   }
 
-  const onRotateStart = useRotateHandle(id, rotation, shapeData.onCommit);
+  const onRotateStart = useRotateHandle(id, rotation, shapeData.onCommit, shiftHeldRef, shapeData.shiftRotateConstrainEnabled);
 
   const textStyle: React.CSSProperties = {
     fontSize: shapeData.fontSize ?? 13,
@@ -508,7 +521,10 @@ function ShapeNodeImpl({ id, data, selected, width, height }: NodeProps) {
         // stacking at any point along the border it fully covers (only the
         // corners escaped this by accident, when cornerRadius rounds the
         // content div's hit-testable area away from the exact vertex).
-        lineStyle={{ borderColor: '#1677ff', zIndex: 10 }}
+        // Align-to-key-object's promoted anchor gets a distinct violet
+        // outline instead of the normal selection blue, so it stays visually
+        // obvious which shape the rest of the selection will align to.
+        lineStyle={{ borderColor: shapeData.isKeyObject ? '#722ed1' : '#1677ff', zIndex: 10 }}
         handleStyle={{ width: 8, height: 8, borderRadius: 2, zIndex: 10 }}
       />
       {selected && !locked && <EdgeResizeHandles minWidth={24} minHeight={24} keepAspectRatio={resizeShiftLock} onResizeStart={handleResizeStart} />}

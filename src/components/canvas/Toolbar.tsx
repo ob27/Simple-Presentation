@@ -3,8 +3,8 @@ import { Tooltip, Popover } from 'antd';
 import {
   IconShapes, IconPenTool, IconDirectSelect, IconConnector, IconHotspot, IconImage,
   IconLayers, IconBranchHighlight, IconAnimationPanel, IconVariables, IconExport, IconContainer,
-  IconSelect, IconComment, IconBrush, IconStylePaint, IconUndo, IconRedo, IconHelp,
-  IconRulerGrid, IconTags, IconValidation, IconSettingsGear, IconTextTool, IconMore,
+  IconSelect, IconHand, IconComment, IconBrush, IconStylePaint, IconUndo, IconRedo, IconHelp,
+  IconRulerGrid, IconTags, IconValidation, IconSettingsGear, IconTextTool, IconMore, IconPreferences,
 } from '../icons';
 import type { ToolId } from '../../types/tools';
 
@@ -29,6 +29,7 @@ interface Props {
 
   onOpenExport: () => void;
   onOpenShortcuts: () => void;
+  onOpenPreferences: () => void;
 }
 
 const BUTTON_W = 28;
@@ -90,7 +91,7 @@ export function Toolbar({
   onUndo, onRedo,
   activeTool, onSelectTool, directSelectDisabled,
   onStartPlacingHotspot, onStartPlacingText, onUploadMedia, onInsertContainer,
-  onOpenExport, onOpenShortcuts,
+  onOpenExport, onOpenShortcuts, onOpenPreferences,
 }: Props) {
   const fileRef = useRef<HTMLInputElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -117,6 +118,12 @@ export function Toolbar({
     <>
       <ToolButton title="Select — click shapes, or drag to select multiple" active={activeTool === null} onClick={() => onSelectTool('select')}>
         <IconSelect />
+      </ToolButton>
+      <ToolButton
+        title={activeTool === 'hand' ? 'Exit Hand tool (Esc)' : 'Hand tool — drag to pan the canvas (or hold Space with any tool)'}
+        active={activeTool === 'hand'} onClick={() => onSelectTool('hand')}
+      >
+        <IconHand />
       </ToolButton>
       <ToolButton
         title={directSelectDisabled ? 'Direct Selection — select a path first (A)' : activeTool === 'directSelect' ? 'Exit Direct Selection (Esc)' : 'Direct Selection — edit anchor points (A)'}
@@ -214,14 +221,18 @@ export function Toolbar({
       <ToolButton title="Keyboard shortcuts (?)" onClick={onOpenShortcuts}>
         <IconHelp />
       </ToolButton>
+      <ToolButton title="Preferences" onClick={onOpenPreferences}>
+        <IconPreferences />
+      </ToolButton>
     </>
   );
 
   // Fixed widths for the always-visible groups (never collapse) plus the
-  // dividers between them — history | select | creation | connect.
-  const coreWidth = runWidth(2) + DIVIDER_W + runWidth(2) + DIVIDER_W + runWidth(8) + DIVIDER_W + runWidth(2);
+  // dividers between them — history | select | creation | connect. select
+  // is 3 now (Select, Hand, Direct Selection).
+  const coreWidth = runWidth(2) + DIVIDER_W + runWidth(3) + DIVIDER_W + runWidth(8) + DIVIDER_W + runWidth(2);
   const panelsWidth = runWidth(5);
-  const miscWidth = runWidth(5);
+  const miscWidth = runWidth(6); // highlight/grid/tags/export/help/preferences
   const overflowButtonWidth = BUTTON_W;
 
   // Unknown width yet (first paint, before the ResizeObserver reports) —

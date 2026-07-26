@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback } from 'react';
 import type { EdgeRouting, FlowAnimation, ArrowStyle } from '../types/edges';
+import { usePersistedState } from './usePersistedState';
 
 // Personal drawing preferences — not diagram content, so localStorage
 // (global across every diagram this browser opens), same reasoning already
@@ -44,37 +45,27 @@ const DEFAULTS: ToolDefaults = {
   connector: { routing: 'straight', flowAnimation: 'none', startArrow: 'none', endArrow: 'arrowClosed' },
 };
 
-function load(): ToolDefaults {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return DEFAULTS;
-    const parsed = JSON.parse(raw);
-    return {
-      pen: { ...DEFAULTS.pen, ...parsed.pen },
-      brush: { ...DEFAULTS.brush, ...parsed.brush },
-      connector: { ...DEFAULTS.connector, ...parsed.connector },
-    };
-  } catch {
-    return DEFAULTS;
-  }
+function mergeToolDefaults(defaults: ToolDefaults, parsed: unknown): ToolDefaults {
+  const p = (parsed ?? {}) as Partial<ToolDefaults>;
+  return {
+    pen: { ...defaults.pen, ...p.pen },
+    brush: { ...defaults.brush, ...p.brush },
+    connector: { ...defaults.connector, ...p.connector },
+  };
 }
 
 export function useToolDefaults() {
-  const [defaults, setDefaults] = useState<ToolDefaults>(load);
-
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(defaults));
-  }, [defaults]);
+  const [defaults, setDefaults] = usePersistedState<ToolDefaults>(STORAGE_KEY, DEFAULTS, mergeToolDefaults);
 
   const updatePenDefaults = useCallback((patch: Partial<PenDefaults>) => {
     setDefaults(d => ({ ...d, pen: { ...d.pen, ...patch } }));
-  }, []);
+  }, [setDefaults]);
   const updateBrushDefaults = useCallback((patch: Partial<BrushDefaults>) => {
     setDefaults(d => ({ ...d, brush: { ...d.brush, ...patch } }));
-  }, []);
+  }, [setDefaults]);
   const updateConnectorDefaults = useCallback((patch: Partial<ConnectorDefaults>) => {
     setDefaults(d => ({ ...d, connector: { ...d.connector, ...patch } }));
-  }, []);
+  }, [setDefaults]);
 
   return { defaults, updatePenDefaults, updateBrushDefaults, updateConnectorDefaults };
 }

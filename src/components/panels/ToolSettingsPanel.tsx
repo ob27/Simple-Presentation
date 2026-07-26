@@ -81,6 +81,14 @@ export function ToolSettingsPanel({
       return <ConnectToolPanel defaults={connectDefaults} onChange={onConnectChange} onClose={onClose} />;
     case 'stylePaint':
       return <StylePaintToolPanel source={stylePaintSource} onClear={onStylePaintClear} onClose={onClose} />;
+    case 'hand':
+      return (
+        <ToolHintPanel
+          title="Hand tool"
+          description="Drag anywhere to pan the canvas. Hold Space with any other tool for the same thing temporarily."
+          onClose={onClose}
+        />
+      );
     case 'directSelect':
       return (
         <ToolHintPanel

@@ -2,10 +2,14 @@ import { memo, useCallback, useState } from 'react';
 import { NodeResizer, type NodeProps, type OnResizeEnd, type OnResizeStart } from '@xyflow/react';
 import { EdgeResizeHandles } from './EdgeResizeHandles';
 import { useShiftHeld } from './useShiftHeld';
+import { RotateHandle } from './RotateHandle';
 
 export interface MultiSelectOverlayNodeData extends Record<string, unknown> {
   onResizeStart?: OnResizeStart;
   onResizeEnd?: OnResizeEnd;
+  // Undefined (not just a no-op) when multiSelectRotateEnabled is off, so
+  // the handle doesn't render at all rather than rendering but doing nothing.
+  onRotateStart?: (e: React.MouseEvent) => void;
 }
 
 // A synthetic, ephemeral node (never persisted — Canvas.tsx only injects it
@@ -18,7 +22,7 @@ export interface MultiSelectOverlayNodeData extends Record<string, unknown> {
 // just anchored to an ad-hoc selection's combined bbox instead of a real
 // group's own node.
 function MultiSelectOverlayNodeImpl({ data }: NodeProps) {
-  const { onResizeStart, onResizeEnd } = data as unknown as MultiSelectOverlayNodeData;
+  const { onResizeStart, onResizeEnd, onRotateStart } = data as unknown as MultiSelectOverlayNodeData;
   const { shiftHeldRef } = useShiftHeld(true);
   const [resizeShiftLock, setResizeShiftLock] = useState(false);
   const handleResizeStart = useCallback<OnResizeStart>((e, params) => {
@@ -43,6 +47,9 @@ function MultiSelectOverlayNodeImpl({ data }: NodeProps) {
         minWidth={8} minHeight={8} keepAspectRatio={resizeShiftLock}
         onResizeStart={handleResizeStart} onResizeEnd={onResizeEnd}
       />
+      {onRotateStart && (
+        <RotateHandle onMouseDown={onRotateStart} style={{ background: '#ff7a1a', zIndex: 30, pointerEvents: 'auto' }} />
+      )}
     </div>
   );
 }

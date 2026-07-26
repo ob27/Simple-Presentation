@@ -10,6 +10,20 @@ export function IconSelect({ style, className }: IconProps) {
   );
 }
 
+// Hand tool — an open palm with four fingers and a tucked-in thumb,
+// evoking "grab the canvas and pan it" (the same glyph convention as
+// Photoshop/Affinity/Illustrator's own Hand tool).
+export function IconHand({ style, className }: IconProps) {
+  return (
+    <svg data-icon="hand" viewBox={ICON_VIEWBOX} width="1em" height="1em" style={style} className={className} fill="none" stroke="currentColor" strokeWidth={ICON_STROKE} strokeLinecap="round" strokeLinejoin="round">
+      <path d="M8 12.5V6a1.5 1.5 0 0 1 3 0v6" />
+      <path d="M11 12V4.5a1.5 1.5 0 0 1 3 0V12" />
+      <path d="M14 12V6a1.5 1.5 0 0 1 3 0v7" />
+      <path d="M17 13V9.5a1.5 1.5 0 0 1 3 0V16c0 3.5-2.5 6-6 6h-1.5c-2 0-3.2-.6-4.4-2.1L5 16.3c-.7-.9-.5-1.9.3-2.5.8-.6 1.8-.4 2.5.3L8 14.5" />
+    </svg>
+  );
+}
+
 // Shape gallery — a 2x2 cluster of distinct basic shapes (circle, square,
 // triangle, diamond), literally evoking "a grid of shapes to pick from".
 export function IconShapes({ style, className }: IconProps) {
@@ -133,6 +147,25 @@ export function IconImage({ style, className }: IconProps) {
       <rect x="3" y="4" width="18" height="16" rx="1.5" />
       <circle cx="8.5" cy="9.5" r="1.8" fill="currentColor" stroke="none" />
       <path d="M3.5 17l5-5 4 4 3-3 6.5 6.5" />
+    </svg>
+  );
+}
+
+// Preferences — three horizontal sliders, each with a knob at a different
+// x-offset. Deliberately distinct from IconSettingsGear (already claimed by
+// the Page Settings toolbar button) so the two don't collide on one glyph.
+export function IconPreferences({ style, className }: IconProps) {
+  return (
+    <svg data-icon="preferences" viewBox={ICON_VIEWBOX} width="1em" height="1em" style={style} className={className} fill="none" stroke="currentColor" strokeWidth={ICON_STROKE} strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 6h9" />
+      <path d="M17 6h3" />
+      <circle cx="14" cy="6" r="2" fill="currentColor" stroke="none" />
+      <path d="M4 12h3" />
+      <path d="M11 12h9" />
+      <circle cx="8" cy="12" r="2" fill="currentColor" stroke="none" />
+      <path d="M4 18h11" />
+      <path d="M19 18h1" />
+      <circle cx="17" cy="18" r="2" fill="currentColor" stroke="none" />
     </svg>
   );
 }
