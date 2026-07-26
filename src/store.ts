@@ -310,6 +310,16 @@ export async function updatePage(diagramId: string, pageId: string, patch: Parti
   for (const [key, value] of Object.entries(patch)) {
     resolved[key] = value === undefined ? deleteField() : value;
   }
+  // overriddenMasterShapeIds records shape ids "detached from master" —
+  // meaningful only in the context of whichever specific master a page was
+  // pointing at when the detach happened. Changing masterPageId (removing
+  // it, switching to a different master, or even reassigning the SAME
+  // master) makes any existing override list stale: it silently kept
+  // excluding a shape from re-inheriting even after the master was removed
+  // and reapplied, since nothing ever cleared it. Any masterPageId change
+  // here resets it, so a page always starts fresh with its (possibly new,
+  // possibly the same) master's full content.
+  if ('masterPageId' in patch) resolved.overriddenMasterShapeIds = deleteField();
   await updateDoc(doc(db, 'diagrams', diagramId, 'pages', pageId), resolved);
 }
 

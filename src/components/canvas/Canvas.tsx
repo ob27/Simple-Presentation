@@ -321,13 +321,23 @@ export function Canvas({
   // entirely, so clicking it never triggers that. A shape or connector
   // selected right before toggling stayed marked `selected: true` in this
   // still-shared shapeNodes/connectorEdges state even though its own page is
-  // no longer the active one, which is what made the connector routing/
-  // arrow-style popover (and, by the same bug, a shape's properties panel)
+  // no longer the active one, which is what made a shape's properties panel
   // pop up "for no reason" after switching views — it was never re-selected,
   // just never actually deselected in the first place.
+  //
+  // Separately (and this was the actual cause of the connector routing/
+  // arrow-style bar specifically, not selection at all): activeToolId isn't
+  // scoped to a view either. Leaving the connector/pen/etc. tool armed while
+  // editing a master, then toggling to Pages, kept that tool active and its
+  // ToolSettingsPanel showing on the new page too, with nothing selected.
+  // selectTool('select') is this file's own canonical "reset every mode/
+  // panel flag" call (see its own doc comment below) — reusing it here
+  // covers this and any future tool/panel flag the same way, rather than
+  // hand-listing just the one flag that happened to reproduce this time.
   useEffect(() => {
     setShapeNodes(prev => prev.map(n => n.selected ? { ...n, selected: false } : n));
     setConnectorEdges(prev => prev.map(e => e.selected ? { ...e, selected: false } : e));
+    selectTool('select');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [viewMode]);
 
