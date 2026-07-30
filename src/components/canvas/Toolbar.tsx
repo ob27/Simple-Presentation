@@ -249,7 +249,7 @@ export function Toolbar({
   if (!showMisc) overflowContent.push(<div key="misc" style={{ display: 'flex', gap: 6 }}>{misc}</div>);
 
   return (
-    <div ref={containerRef} style={{ display: 'flex', flexDirection: 'row', gap: 6, alignItems: 'center', minWidth: 0, overflow: 'hidden' }}>
+    <div ref={containerRef} style={{ display: 'flex', flexDirection: 'row', gap: 6, alignItems: 'center', minWidth: 0, width: '100%' }}>
       {history}
       <Divider />
       {selection}

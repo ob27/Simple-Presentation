@@ -349,6 +349,28 @@ export function Canvas({
   const connectorsSlices = useRef<Map<string, Map<string, DiagramEdge>>>(new Map());
   const commentsSlices = useRef<Map<string, Map<string, DiagramComment>>>(new Map());
 
+  // Track pending updateNodeInternals timeout IDs so rapid rebuilds can cancel
+  // earlier timeouts. Without this, when moves happen rapidly, each rebuild schedules
+  // new timeouts while old ones are still pending. The old timeouts fire and try to
+  // update nodes that were replaced by newer rebuilds, causing connectors to vanish.
+  const pendingUpdateNodeInternalsTimeouts = useRef<ReturnType<typeof setTimeout>[]>([]);
+
+  // Helper: cancel all pending updateNodeInternals timeouts and schedule new ones.
+  // This prevents race conditions when rebuildShapes() is called rapidly - only the
+  // LAST rebuild's timeouts will actually fire, ensuring we update the current nodes.
+  function scheduleUpdateNodeInternals(nodeIds: string[]) {
+    // Cancel all pending timeouts from previous rebuilds
+    for (const timeoutId of pendingUpdateNodeInternalsTimeouts.current) {
+      clearTimeout(timeoutId);
+    }
+    pendingUpdateNodeInternalsTimeouts.current = [];
+    // Schedule new timeouts and track their IDs
+    for (const delay of [0, 50, 150]) {
+      const timeoutId = setTimeout(() => updateNodeInternals(nodeIds), delay);
+      pendingUpdateNodeInternalsTimeouts.current.push(timeoutId);
+    }
+  }
+
   // "Latest" refs — functions embedded into node.data (onCommit, onNavigateLink)
   // get baked in inside a Firestore onSnapshot callback whose closure is pinned
   // to whichever render was active when the subscription's useEffect last ran,
@@ -613,10 +635,30 @@ export function Canvas({
     rebuildShapes();
     rebuildConnectors();
     rebuildComments();
+    // Force React Flow to re-measure ALL nodes after rebuildShapes creates new references.
+    // Same fix as applyPosition/applyPositionBatch/commitShapeUpdates - adoptUserNodes resets handleBounds/measured
+    // for all nodes when receiving new object references, causing connectors to vanish.
+    const allIds: string[] = [];
+    for (const s of shapesSlices.current.values()) {
+      for (const node of s.values()) {
+        allIds.push(node.id);
+      }
+    }
+    scheduleUpdateNodeInternals(allIds);
 
     const shapeUnsubs = pages.map(page => subscribeShapes(diagramId, page.id, nodes => {
       shapesSlices.current.set(page.id, new Map(nodes.map(n => [n.id, n])));
       rebuildShapes();
+      // Force React Flow to re-measure ALL nodes after rebuildShapes creates new references.
+      // Firestore listener fires on every echo of our own writes, and without re-measuring,
+      // connectors vanish when handleBounds/measured reset to undefined.
+      const allIds: string[] = [];
+      for (const s of shapesSlices.current.values()) {
+        for (const node of s.values()) {
+          allIds.push(node.id);
+        }
+      }
+      scheduleUpdateNodeInternals(allIds);
     }));
     const connectorUnsubs = pages.map(page => subscribeConnectors(diagramId, page.id, edges => {
       connectorsSlices.current.set(page.id, new Map(edges.map(e => [e.id, e])));
@@ -944,6 +986,20 @@ export function Canvas({
       saveShape(diagramId, pageId, toPersistableShape(node));
     }
     rebuildShapes();
+    
+    // Force React Flow to re-measure ALL nodes after rebuildShapes creates new references.
+    // rebuildShapes calls setShapeNodes with new objects for every node, which triggers
+    // React Flow's adoptUserNodes to reset handleBounds/measured to undefined for ALL nodes.
+    // Without re-measuring ALL of them, connectors touching any node return null from
+    // getEdgePosition and vanish until tab refresh. This is especially critical for
+    // multi-node drags (groups, multi-select) where children's connectors also break.
+    const allIds: string[] = [];
+    for (const slice of shapesSlices.current.values()) {
+      for (const node of slice.values()) {
+        allIds.push(node.id);
+      }
+    }
+    scheduleUpdateNodeInternals(allIds);
   }
 
   function rebuildConnectors() {
@@ -999,6 +1055,16 @@ export function Canvas({
         slice.set(id, updated);
         saveShape(diagramId, existing.data.pageId, updated);
         rebuildShapes();
+        // Force React Flow to re-measure ALL nodes after rebuildShapes creates new references.
+        // Same fix as applyPosition/applyPositionBatch/commitShapeUpdates - adoptUserNodes resets handleBounds/measured
+        // for all nodes when receiving new object references, causing connectors to vanish.
+        const allIds: string[] = [];
+        for (const s of shapesSlices.current.values()) {
+          for (const node of s.values()) {
+            allIds.push(node.id);
+          }
+        }
+        scheduleUpdateNodeInternals(allIds);
         return;
       }
     }
@@ -1037,6 +1103,16 @@ export function Canvas({
         slice.set(id, updated);
         saveShape(diagramId, existing.data.pageId, updated);
         rebuildShapes();
+        // Force React Flow to re-measure ALL nodes after rebuildShapes creates new references.
+        // Same fix as applyPosition/applyPositionBatch/commitShapeUpdates - adoptUserNodes resets handleBounds/measured
+        // for all nodes when receiving new object references, causing connectors to vanish.
+        const allIds: string[] = [];
+        for (const s of shapesSlices.current.values()) {
+          for (const node of s.values()) {
+            allIds.push(node.id);
+          }
+        }
+        scheduleUpdateNodeInternals(allIds);
         return;
       }
     }
@@ -1066,6 +1142,16 @@ export function Canvas({
         slice.set(id, updated);
         saveShape(diagramId, existing.data.pageId, updated);
         rebuildShapes();
+        // Force React Flow to re-measure ALL nodes after rebuildShapes creates new references.
+        // Same fix as applyPositionBatch/commitShapeUpdates - adoptUserNodes resets handleBounds/measured
+        // for all nodes when receiving new object references, causing connectors to vanish.
+        const allIds: string[] = [];
+        for (const s of shapesSlices.current.values()) {
+          for (const node of s.values()) {
+            allIds.push(node.id);
+          }
+        }
+        scheduleUpdateNodeInternals(allIds);
         return;
       }
     }
@@ -1091,6 +1177,17 @@ export function Canvas({
     }
     rebuildShapes();
     if (updates.length > 0) saveShapes(diagramId, updates);
+    
+    // Force React Flow to re-measure ALL nodes after rebuildShapes creates new references.
+    // Same fix as commitShapeUpdates - adoptUserNodes resets handleBounds/measured for all
+    // nodes when receiving new object references, causing connectors to vanish.
+    const allIds: string[] = [];
+    for (const slice of shapesSlices.current.values()) {
+      for (const node of slice.values()) {
+        allIds.push(node.id);
+      }
+    }
+    scheduleUpdateNodeInternals(allIds);
   }
   // Precise numeric move (the properties panel's mm-based X/Y inputs) —
   // same "lives on the node, not `.data`" reasoning as handleResizeShape.
@@ -2359,6 +2456,16 @@ export function Canvas({
         slice.set(id, updated);
         saveShape(diagramId, existing.data.pageId, updated);
         rebuildShapes();
+        // Force React Flow to re-measure ALL nodes after rebuildShapes creates new references.
+        // Same fix as applyPosition/applyPositionBatch/commitShapeUpdates - adoptUserNodes resets handleBounds/measured
+        // for all nodes when receiving new object references, causing connectors to vanish.
+        const allIds: string[] = [];
+        for (const s of shapesSlices.current.values()) {
+          for (const node of s.values()) {
+            allIds.push(node.id);
+          }
+        }
+        scheduleUpdateNodeInternals(allIds);
         return;
       }
     }
@@ -2403,17 +2510,6 @@ export function Canvas({
       }
     }
 
-    setShapeNodes(prev => applyNodeChanges(changes, [...frameNodes, ...prev]).filter(n => n.type !== 'pageFrame'));
-
-    for (const change of changes) {
-      if (change.type === 'select') {
-        if (change.id.startsWith('inherited-')) {
-          setSelectedInheritedId(change.selected ? change.id : null);
-        } else if (change.selected) {
-          setSelectedInheritedId(null);
-        }
-      }
-    }
     // Position/dimension commits from every change in THIS batch are
     // collected here and written to shapesSlices.current in one
     // commitShapeUpdates() call after the loop, not one call per shape. Two
@@ -2426,6 +2522,10 @@ export function Canvas({
     // the exact stale-slice rebuild this fix exists to close, just with a
     // narrower window (see the comment on commitShapeUpdates itself for
     // the full "why").
+    // CRITICAL: We must update the slices BEFORE calling setShapeNodes below.
+    // If a Firestore echo arrives between setShapeNodes and commitShapeUpdates,
+    // rebuildShapes() will read stale slice data and create nodes with old
+    // positions, causing brief misplacement during group moves.
     const shapeUpdates: { id: string; pageId: string; node: DiagramNode }[] = [];
     for (const change of changes) {
       if (change.type === 'position' && change.dragging === false && change.position) {
@@ -2542,7 +2642,45 @@ export function Canvas({
         }
       }
     }
-    if (shapeUpdates.length > 0) commitShapeUpdates(shapeUpdates);
+
+    // Update slices BEFORE calling setShapeNodes to prevent stale slice data
+    // from being read by rebuildShapes() if a Firestore echo arrives during
+    // the window between setShapeNodes and commitShapeUpdates.
+    if (shapeUpdates.length > 0) {
+      // Write to slices first (without calling rebuildShapes yet)
+      for (const { id, pageId, node } of shapeUpdates) {
+        let slice = shapesSlices.current.get(pageId);
+        if (!slice) { slice = new Map(); shapesSlices.current.set(pageId, slice); }
+        slice.set(id, node);
+        saveShape(diagramId, pageId, toPersistableShape(node));
+      }
+    }
+
+    // Update React Flow's internal state
+    setShapeNodes(prev => applyNodeChanges(changes, [...frameNodes, ...prev]).filter(n => n.type !== 'pageFrame'));
+
+    // Handle selection changes
+    for (const change of changes) {
+      if (change.type === 'select') {
+        if (change.id.startsWith('inherited-')) {
+          setSelectedInheritedId(change.selected ? change.id : null);
+        } else if (change.selected) {
+          setSelectedInheritedId(null);
+        }
+      }
+    }
+
+    // Now call rebuildShapes and schedule updateNodeInternals
+    if (shapeUpdates.length > 0) {
+      rebuildShapes();
+      const allIds: string[] = [];
+      for (const slice of shapesSlices.current.values()) {
+        for (const node of slice.values()) {
+          allIds.push(node.id);
+        }
+      }
+      scheduleUpdateNodeInternals(allIds);
+    }
   }, [frameNodes, shapeNodes, connectorEdges, diagramId, uxPrefs.alignToKeyObjectEnabled]);
 
   const onEdgesChange = useCallback((changes: EdgeChange[]) => {
@@ -3952,6 +4090,16 @@ export function Canvas({
     }
     rebuildShapes();
     if (updates.length > 0) saveShapes(diagramId, updates);
+    // Force React Flow to re-measure ALL nodes after rebuildShapes creates new references.
+    // Same fix as applyPosition/applyPositionBatch/commitShapeUpdates - adoptUserNodes resets handleBounds/measured
+    // for all nodes when receiving new object references, causing connectors to vanish.
+    const allIds: string[] = [];
+    for (const slice of shapesSlices.current.values()) {
+      for (const node of slice.values()) {
+        allIds.push(node.id);
+      }
+    }
+    scheduleUpdateNodeInternals(allIds);
   }
   function pushPositionHistory(before: Map<string, { x: number; y: number }>, after: Map<string, { x: number; y: number }>) {
     pushHistory({
@@ -4562,9 +4710,24 @@ export function Canvas({
   // found, reuses the exact same upload pipeline the toolbar's image-upload
   // button already goes through; falls through to the internal shape
   // clipboard when the OS clipboard carries no image.
+  // 
+  // FIXED: Now checks the app's internal shape clipboard FIRST before checking
+  // the OS clipboard. This prevents the bug where copying an image from a browser,
+  // then copying a shape with Ctrl+C, then pasting with Ctrl+V would paste the
+  // image instead of the shape. The internal clipboard should take priority when
+  // it has content.
   useEffect(() => {
     function onPaste(e: ClipboardEvent) {
       if (isTypingTarget(e.target) || isPresent) return;
+      
+      // Check app's internal shape clipboard FIRST
+      if (clipboardRef.current) {
+        e.preventDefault();
+        void handlePaste();
+        return;
+      }
+      
+      // Fall back to OS clipboard for images
       const items = e.clipboardData?.items;
       const imageItem = items && Array.from(items).find(item => item.type.startsWith('image/'));
       const file = imageItem?.getAsFile();
@@ -4902,10 +5065,13 @@ export function Canvas({
     // calls is negligible, while missing the one call that lands after the
     // reset has actually happened means this connector's edges silently
     // vanish until a full reload.
+    // Use scheduleUpdateNodeInternals instead of plain setTimeout so these
+    // timeouts get cancelled if rebuildShapes() is called (e.g., from the
+    // Firestore echo). Without this, stale timeouts from onNodeDragStop
+    // would fire after newer rebuilds have created new node references,
+    // causing brief misplacement of nodes during group moves.
     const ids = draggedNodes.map(n => n.id);
-    for (const delay of [0, 50, 150, 300]) {
-      setTimeout(() => updateNodeInternals(ids), delay);
-    }
+    scheduleUpdateNodeInternals(ids);
   }
 
   function handlePaneMouseMove(e: React.MouseEvent) {
