@@ -1,7 +1,10 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { Spin, Button, Tooltip, Input, Segmented, Dropdown } from 'antd';
-import { IconArrowLeft, IconPlayCircle, IconPresenterNotes, IconHistory, IconShare } from '../components/icons';
+import {
+  IconArrowLeft, IconPlayCircle, IconPresenterNotes, IconHistory, IconShare,
+  IconPersonFallback, IconLogout,
+} from '../components/icons';
 import { ReactFlowProvider } from '@xyflow/react';
 import {
   subscribePages, subscribeDiagram, addPage, addMasterPage, reorderPages, renameDiagram, getDiagramRole, generateViewerInvite,
@@ -12,12 +15,15 @@ import type { DiagramPage } from '../types/document';
 import { Canvas } from '../components/canvas/Canvas';
 import { NewPageModal } from '../components/NewPageModal';
 import { VersionHistoryModal } from '../components/VersionHistoryModal';
+import { CommentAvatar } from '../components/canvas/CommentAvatar';
+import { useUserProfiles, resolveDisplay } from '../utils/userProfiles';
 import { useAuth } from '../AuthContext';
 
 export function DocumentEditor() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const { user } = useAuth();
+  const { user, signOut } = useAuth();
+  const ownProfile = useUserProfiles(user ? [user.uid] : []);
   const [pages, setPages] = useState<DiagramPage[]>([]);
   const [diagramName, setDiagramName] = useState('diagram');
   const [versionHistoryOpen, setVersionHistoryOpen] = useState(false);
@@ -256,6 +262,34 @@ export function DocumentEditor() {
               </Tooltip>
             </>
           )}
+          {/* Matches Simple AIM Kanban's BoardPage header exactly (email,
+              All products, Profile, Sign out — no Settings, mirroring that
+              app's own BoardPage variant which also omits it; Settings only
+              appears on the Dashboard-level menu in both apps). */}
+          <Dropdown
+            trigger={['click']}
+            menu={{
+              items: [
+                { key: 'email', label: user ? resolveDisplay(user.uid, user.email ?? '', ownProfile).name : user, disabled: true },
+                { type: 'divider' as const },
+                { key: 'all-products', icon: <IconArrowLeft />, label: 'All products' },
+                { key: 'profile', icon: <IconPersonFallback />, label: 'Profile' },
+                { type: 'divider' as const },
+                { key: 'signout', icon: <IconLogout />, label: 'Sign out', danger: true },
+              ],
+              onClick: ({ key }) => {
+                if (key === 'all-products') window.location.href = '/';
+                if (key === 'profile') window.location.href = '/profile';
+                if (key === 'signout') signOut();
+              },
+            }}
+          >
+            <span style={{ display: 'inline-flex', cursor: 'pointer' }}>
+              {user?.email
+                ? <CommentAvatar seed={resolveDisplay(user.uid, user.email, ownProfile).avatarSeed} photoURL={ownProfile[user.uid]?.avatarPhotoURL} size={28} />
+                : <span style={{ fontSize: 13 }}>Account</span>}
+            </span>
+          </Dropdown>
         </div>
       </div>
       <div style={{ flex: 1, minHeight: 0 }}>

@@ -4,7 +4,7 @@ import { Button, Spin, Tag, Tooltip, Modal, Input, message, Dropdown } from 'ant
 import {
   IconAdd, IconLogout, IconDelete, IconShare, IconFolderAdd,
   IconFolder, IconFolderOpen, IconChevronDown, IconChevronRight, IconTeam, IconMore,
-  IconPencil, IconImage, IconFileAdd, IconSettingsGear, IconPersonFallback,
+  IconPencil, IconImage, IconFileAdd, IconSettingsGear, IconPersonFallback, IconArrowLeft,
 } from '../components/icons';
 import { useAuth } from '../AuthContext';
 import {
@@ -338,12 +338,14 @@ export function Dashboard() {
               items: [
                 { key: 'email', label: user ? resolveDisplay(user.uid, user.email ?? '', ownProfile).name : user, disabled: true },
                 { type: 'divider' as const },
+                { key: 'all-products', icon: <IconArrowLeft />, label: 'All products' },
                 { key: 'profile', icon: <IconPersonFallback />, label: 'Profile' },
-                { key: 'settings', icon: <IconSettingsGear />, label: 'Workspace settings' },
+                { key: 'settings', icon: <IconSettingsGear />, label: 'Settings' },
                 { type: 'divider' as const },
                 { key: 'signout', icon: <IconLogout />, label: 'Sign out', danger: true },
               ],
               onClick: ({ key }) => {
+                if (key === 'all-products') window.location.href = '/';
                 if (key === 'profile') window.location.href = '/profile';
                 if (key === 'settings') setWorkspaceOpen(true);
                 if (key === 'signout') signOut();

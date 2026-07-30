@@ -4446,12 +4446,37 @@ export function Canvas({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activePageId, shapeNodes, pageDimensions, pageOrigins, isPresent]);
 
+  // Dashboard project cards display this at 260-450px+ wide (aspectRatio
+  // 4/3, objectFit: cover) — rendering it at the same resolution as the
+  // small page-navigator RAIL thumbnail (THUMB_MAX_WIDTH/HEIGHT = 132,
+  // sized for a ~28px-tall rail icon) meant every card upscaled a
+  // ~132x74px source by 2-3x+ before devicePixelRatio, which is what made
+  // covers look blurry. This is sized for the card instead.
+  const COVER_MAX_WIDTH = 800;
+  const COVER_MAX_HEIGHT = 800;
+
   // A cover thumbnail can only be freshly rendered for the currently ACTIVE
   // page (onlyRenderVisibleElements keeps only that page's shapes mounted —
-  // see the comment above); for any other page this reuses whatever
-  // snapshot/persisted thumbnail already exists for it rather than forcing
-  // a page switch just to set a cover.
+  // see the comment above); for any other page (or if the fresh render
+  // fails for some other reason) this falls back to whatever snapshot/
+  // persisted thumbnail already exists for it rather than forcing a page
+  // switch just to set a cover.
   async function handleSetCoverPage(pageId: string) {
+    if (pageId === activePageId) {
+      const dims = pageDimensions.get(pageId);
+      const origin = pageOrigins.get(pageId);
+      if (dims && origin !== undefined) {
+        try {
+          const scale = Math.min(COVER_MAX_WIDTH / dims.width, COVER_MAX_HEIGHT / dims.height);
+          const dataUrl = await exportPageAsImage({ x: 0, y: origin, width: dims.width, height: dims.height }, 'png', scale);
+          const url = await uploadThumbnail(diagramId, dataUrl, 'coverThumbnails');
+          await setCoverPage(diagramId, pageId, url);
+          return;
+        } catch {
+          // Fall through to the cached-snapshot reuse below.
+        }
+      }
+    }
     const existing = pageSnapshots.get(pageId) ?? pages.find(p => p.id === pageId)?.thumbnailUrl;
     const url = existing?.startsWith('data:') ? await uploadThumbnail(diagramId, existing, 'coverThumbnails') : existing;
     await setCoverPage(diagramId, pageId, url);
