@@ -371,6 +371,28 @@ export function Canvas({
     }
   }
 
+  // onlyRenderVisibleElements (set on the <ReactFlow> element below) culls
+  // any node currently outside the viewport from React Flow's own internal
+  // tracking, not just from the DOM. Since every page lives on one
+  // continuous canvas and rebuildShapes() gives EVERY page's shapes a
+  // fresh object reference on any edit anywhere in the project (not just
+  // the active page), a node that happens to be culled at that moment
+  // never gets the re-measure every other fix above relies on -- there's
+  // nothing mounted yet to measure. It only becomes visible later, when
+  // the user pans or switches to that page, with no further rebuild event
+  // to trigger a fresh pass. Re-running the same broad, harmless/
+  // idempotent updateNodeInternals() sweep on every viewport move closes
+  // that gap: whatever just scrolled into view gets measured for real,
+  // instead of staying permanently stuck with the handleBounds it had
+  // (or didn't have) from the last time it was mounted.
+  function handleViewportMoveEnd() {
+    const allIds: string[] = [];
+    for (const slice of shapesSlices.current.values()) {
+      for (const node of slice.values()) allIds.push(node.id);
+    }
+    scheduleUpdateNodeInternals(allIds);
+  }
+
   // "Latest" refs — functions embedded into node.data (onCommit, onNavigateLink)
   // get baked in inside a Firestore onSnapshot callback whose closure is pinned
   // to whichever render was active when the subscription's useEffect last ran,
@@ -5181,6 +5203,7 @@ export function Canvas({
           onNodeDragStart={isPresent ? undefined : onNodeDragStart}
           onNodeDrag={isPresent ? undefined : onNodeDrag}
           onNodeDragStop={isPresent ? undefined : onNodeDragStop}
+          onMoveEnd={handleViewportMoveEnd}
           connectionMode={ConnectionMode.Loose}
           onlyRenderVisibleElements={!isExporting}
           minZoom={0.1}
